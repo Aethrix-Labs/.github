@@ -1,0 +1,223 @@
+# security-review.yml — central fleet workflow
+#
+# Deployed at:   Aethrix-Labs/.github:.github/workflows/security-review.yml
+# Convention:    STANDARDS.md §17 (Fleet CI)
+# Spec:          SECURITY_REVIEW_REDESIGN.md §9 (§9.0 supersedes the per-repo vend model)
+# Authoring src: sethgibson-com:/skills/security-review/ (workflow YAML lives only here)
+# Helper src:    sethgibson-com:/skills/security-review/{*.py,SKILL.md}
+#                → promoted to Aethrix-Labs/.github:.github/scripts/security-review/
+#                  per the §17.5 drift/update protocol
+#
+# This workflow is deployed once at the org level. Every in-org repo inherits
+# it via the org ruleset (required workflow). No per-repo workflow file needed.
+# Helpers are fetched at runtime via a second checkout of this repo into
+# .fleet-ci/ (§17.3). See STANDARDS.md §17.7 for the out-of-org install path.
+
+name: security-review
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+permissions:
+  contents: read
+  pull-requests: read   # harmless without PR-comment integrations; kept for future use
+
+jobs:
+  deterministic:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4              # consumer repo at $GITHUB_WORKSPACE
+        with:
+          fetch-depth: 0   # gitleaks needs full history; fetch-depth: 1 will silently scan ~nothing
+
+      - uses: actions/checkout@v4              # central repo (helpers + SKILL.md)
+        with:
+          repository: Aethrix-Labs/.github
+          path: .fleet-ci
+          ref: main
+
+      - name: Install gitleaks
+        run: |
+          set -ex
+          GITLEAKS_VERSION=8.24.3
+          URL="https://github.com/zricethezav/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          # zricethezav (the original org) hosts release artifacts; the
+          # gitleaks/gitleaks rename's redirect does NOT cover asset URLs.
+          # `curl -fsSL` fails loudly on 404 instead of silently downloading
+          # an HTML error page that tar then chokes on.
+          curl -fsSL -o gitleaks.tar.gz "$URL"
+          sudo tar -xzf gitleaks.tar.gz -C /usr/local/bin gitleaks
+          gitleaks version
+
+      - name: Run gitleaks
+        run: |
+          gitleaks detect \
+            --source . \
+            --redact \
+            --report-format sarif \
+            --report-path gitleaks.sarif \
+            --exit-code 1
+
+      - name: Semgrep
+        uses: semgrep/semgrep-action@v1   # renamed from returntocorp/semgrep-action
+        with:
+          config: p/security-audit
+
+      # --- DEP-AUDIT VARIANT (pick ONE; delete the others) ---
+
+      # npm:
+      - name: Dep audit (npm)
+        run: npm audit --json > npm-audit.json || true
+
+      # pnpm:  (also requires `- uses: pnpm/action-setup@v4` BEFORE this step)
+      # - name: Dep audit (pnpm)
+      #   run: pnpm audit --json > npm-audit.json || true
+
+      # yarn (Berry):
+      # - name: Dep audit (yarn)
+      #   run: yarn npm audit --json --recursive > npm-audit.json || true
+
+      # non-Node: delete this step AND the "Fail on critical" step below.
+      # --- end DEP-AUDIT VARIANT ---
+
+      - name: Fail on critical dep-audit findings
+        run: |
+          CRITICAL=$(jq '.metadata.vulnerabilities.critical // 0' npm-audit.json)
+          HIGH=$(jq '.metadata.vulnerabilities.high // 0' npm-audit.json)
+          echo "dep-audit: critical=$CRITICAL high=$HIGH"
+          if [ "$CRITICAL" -gt "0" ]; then
+            echo "::error::$CRITICAL critical dep-audit findings — blocking"
+            exit 1
+          fi
+
+      - name: Aggregate deterministic findings
+        if: always()
+        run: |
+          python3 .fleet-ci/.github/scripts/security-review/aggregator.py \
+            --gitleaks gitleaks.sarif \
+            --semgrep semgrep-results.json \
+            --npm-audit npm-audit.json \
+            --output deterministic-findings.json
+
+      - name: Upload deterministic artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deterministic-findings
+          path: |
+            gitleaks.sarif
+            semgrep-results.json
+            npm-audit.json
+            deterministic-findings.json
+          if-no-files-found: ignore
+
+  semantic:
+    runs-on: ubuntu-latest
+    needs: deterministic
+    if: always()   # run the semantic step even on deterministic failure — triage whatever the deterministic tools found
+    permissions:
+      contents: read
+      pull-requests: write   # write needed by pr-body-composer to PATCH the PR body via the GitHub REST API
+      id-token: write        # required by anthropics/claude-code-action@v1 for OIDC token exchange
+    steps:
+      - uses: actions/checkout@v4              # consumer repo at $GITHUB_WORKSPACE
+        with:
+          fetch-depth: 0
+
+      - uses: actions/checkout@v4              # central repo (helpers + SKILL.md)
+        with:
+          repository: Aethrix-Labs/.github
+          path: .fleet-ci
+          ref: main
+
+      - name: Download deterministic findings
+        uses: actions/download-artifact@v4
+        with:
+          name: deterministic-findings
+
+      - name: Conditional gate (§3.3)
+        id: gate
+        run: |
+          python3 .fleet-ci/.github/scripts/security-review/should-run-semantic.py \
+            --base "${{ github.event.pull_request.base.sha }}" \
+            --head "${{ github.event.pull_request.head.sha }}" \
+            --deterministic-findings deterministic-findings.json
+
+      - name: Run Claude semantic review
+        if: steps.gate.outputs.run == 'true'
+        id: semantic
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            You are running as the security-review semantic step in CI.
+
+            Read `.fleet-ci/.github/scripts/security-review/SKILL.md` and follow it
+            exactly. It defines the three semantic checks, the triage rules,
+            and the required output schema.
+
+            Runtime context:
+            - Working directory has the full repo (fetch-depth: 0).
+            - PR diff: get it with `git diff origin/${{ github.base_ref }}...HEAD`
+              or read $GITHUB_BASE_REF / $GITHUB_HEAD_REF.
+            - Deterministic-tools output: `deterministic-findings.json` is in
+              the working directory.
+            - Output: write `semantic-findings.json` in the working directory
+              matching the schema in SKILL.md exactly. The downstream step
+              parses this file to gate the workflow.
+
+            Do not ask questions. Produce the JSON.
+          claude_args: |
+            --model claude-sonnet-4-6
+            --max-turns 25
+            --allowedTools Read,Bash,Write
+
+      - name: Fail on critical semantic findings
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          if [ ! -f semantic-findings.json ]; then
+            echo "::error::semantic-findings.json not produced by Claude step"
+            exit 1
+          fi
+          CRITICAL=$(jq '.summary.critical // 0' semantic-findings.json)
+          IMPORTANT=$(jq '.summary.important // 0' semantic-findings.json)
+          ADVISORY=$(jq '.summary.advisory // 0' semantic-findings.json)
+          echo "semantic: critical=$CRITICAL important=$IMPORTANT advisory=$ADVISORY"
+          if [ "$CRITICAL" -gt "0" ]; then
+            echo "::error::$CRITICAL critical semantic findings — blocking merge"
+            exit 1
+          fi
+
+      - name: Note skipped semantic review
+        if: steps.gate.outputs.run != 'true'
+        run: |
+          echo "semantic: skipped per §3.3 conditional rules."
+          echo "${{ steps.gate.outputs.reasons }}"
+
+      - name: Compose PR body section
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          if [ "${{ steps.gate.outputs.run }}" != "true" ]; then
+            python3 .fleet-ci/.github/scripts/security-review/pr-body-composer.py \
+              --deterministic-findings deterministic-findings.json \
+              --semantic-findings semantic-findings.json \
+              --semantic-skipped \
+              --skip-reason "${{ steps.gate.outputs.reasons }}"
+          else
+            python3 .fleet-ci/.github/scripts/security-review/pr-body-composer.py \
+              --deterministic-findings deterministic-findings.json \
+              --semantic-findings semantic-findings.json
+          fi
+
+      - name: Upload semantic artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: semantic-findings
+          path: semantic-findings.json
+          if-no-files-found: ignore
