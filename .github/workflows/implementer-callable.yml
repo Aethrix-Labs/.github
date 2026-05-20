@@ -1,0 +1,95 @@
+name: implementer (callable)
+
+on:
+  workflow_call:
+    inputs:
+      action:
+        description: "next-step | address-feedback"
+        type: string
+        required: false
+        default: "next-step"
+      verify_entry_id:
+        description: "Optional verify queue entry ID from the wake mechanism"
+        type: string
+        required: false
+        default: ""
+      product_slug:
+        description: "Product slug (defaults to repo basename)"
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: write # commit + push from the implementer agent
+  pull-requests: write # gh pr create / merge
+  id-token: write # required by anthropics/claude-code-action@v1
+
+concurrency:
+  # Serialize per product — never run two implementer invocations on the same
+  # repo at once. Default `cancel-in-progress: false` so a queued second run
+  # waits rather than killing the in-flight one.
+  group: implementer-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  implementer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4 # consumer repo at $GITHUB_WORKSPACE
+        with:
+          fetch-depth: 0 # needed for full git history (commit skill reads log)
+
+      - uses: actions/checkout@v4 # central repo (SKILL.md + scripts)
+        with:
+          repository: Aethrix-Labs/.github
+          path: .fleet-ci
+          ref: main
+
+      - name: Set up gh CLI
+        # The commit skill uses `gh pr create`, `gh pr merge --auto`, etc.
+        # `gh` is preinstalled on ubuntu-latest runners; nothing to do.
+        run: gh --version
+
+      - name: Configure git for commits
+        run: |
+          git config user.name  "implementer-agent[bot]"
+          git config user.email "implementer-agent@aethrix-labs.local"
+
+      - name: Run implementer agent
+        uses: anthropics/claude-code-action@v1
+        env:
+          # Used by the commit skill's queue emission path (per STANDARDS §14
+          # multi-storage credentials). Same secret security-review uses.
+          QUEUE_SERVICE_ROLE_KEY: ${{ secrets.QUEUE_SERVICE_ROLE_KEY }}
+          # Dispatch payload passed through to the agent via env so the
+          # SKILL.md prompt can branch on action / verify_entry_id.
+          IMPLEMENTER_ACTION: ${{ inputs.action }}
+          IMPLEMENTER_VERIFY_ENTRY_ID: ${{ inputs.verify_entry_id }}
+          IMPLEMENTER_PRODUCT_SLUG: ${{ inputs.product_slug }}
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            You are running as the **implementer agent** in CI.
+
+            Read `.fleet-ci/.github/scripts/implementer/SKILL.md` and follow
+            it exactly. It defines the pre-flight guards, the flow (read
+            PLANNING.md → pick next unblocked step → implement → invoke commit
+            → exit), and the failure modes.
+
+            When ready to commit, read `.fleet-ci/.github/scripts/commit/SKILL.md`
+            and follow its 8-step flow. The commit skill handles tier
+            classification, PR body composition, queue emission, and merge
+            routing.
+
+            Runtime context:
+            - Working directory has the full consumer repo (fetch-depth: 0).
+            - Action: $IMPLEMENTER_ACTION (default "next-step").
+            - Verify entry ID: $IMPLEMENTER_VERIFY_ENTRY_ID (empty on manual triggers).
+            - Product slug: $IMPLEMENTER_PRODUCT_SLUG (or derive from $GITHUB_REPOSITORY).
+
+            Exit after ONE step. The verify gate is the loop boundary.
+            Do not chain into the next step.
+          claude_args: |
+            --model claude-sonnet-4-6
+            --max-turns 80
+            --allowedTools Read,Bash,Write,Edit,Glob,Grep
