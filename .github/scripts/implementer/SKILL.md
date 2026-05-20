@@ -78,6 +78,8 @@ The step text is everything between the checkbox and the next checkbox / heading
 
 If multiple steps look unblocked at the same indentation, take the first one (top-down order).
 
+**Check for the `*(human)*` marker.** If the identified step's text begins with `*(human)*` immediately after the checkbox (per `STANDARDS.md §4.2`), this step is a hard blocker for the agent — Seth must complete it manually before the implementer can advance. Do NOT attempt to implement, do NOT skip ahead to the next step (downstream steps almost always depend on the human action), and do NOT guess at a workaround. Branch to Step 3's human-only case.
+
 ### Step 2 — Read context
 
 Read these before implementing:
@@ -90,13 +92,13 @@ Read these before implementing:
 
 Do NOT read the whole repo. Use the acceptance criteria to scope what's relevant.
 
-### Step 3 — Implement the step
+### Step 3 — Decide what to do (implement, escalate, or human-only exit)
 
-Make the code changes the acceptance criteria call for. Apply normal engineering judgment: small focused commits-worth of work, prefer extending existing patterns to inventing new ones, follow the conventions in `/docs/CLAUDE.md` and existing similar code.
+**Case A — Normal step (no `*(human)*` marker, criteria are workable).** Make the code changes the acceptance criteria call for. Apply normal engineering judgment: small focused commits-worth of work, prefer extending existing patterns to inventing new ones, follow the conventions in `/docs/CLAUDE.md` and existing similar code.
 
 If the step requires a decision that's outside Seth's creative & strategic lane (per `STANDARDS.md §10`) and the acceptance criteria don't constrain the choice, make a reasonable call and record it in `/docs/DECISIONS.md` with a one-line rationale. The commit skill's tier classification will route to the queue if the decision is high-risk.
 
-If the step's acceptance criteria are ambiguous or unworkable as written: do NOT guess. Emit a `strategic` queue entry via direct POST to `${HUB_BASE_URL:-https://sethgibson.com}/api/v1/queue/entries` describing the ambiguity, then exit (no commit). Packet shape per `STANDARDS.md §8`:
+**Case B — Acceptance criteria ambiguous or unworkable as written.** Do NOT guess. Emit a `strategic` queue entry via direct POST to `${HUB_BASE_URL:-https://sethgibson.com}/api/v1/queue/entries` describing the ambiguity, then exit (no commit). Packet shape per `STANDARDS.md §8`:
 
 ```json
 {
@@ -111,6 +113,30 @@ If the step's acceptance criteria are ambiguous or unworkable as written: do NOT
   "recommendation": "<best-guess interpretation, optional>"
 }
 ```
+
+**Case C — Step is marked `*(human)*` (detected in Step 1).** The step requires Seth's manual action; the agent cannot advance. Do NOT implement, do NOT skip to the next step. Emit a `strategic` queue entry per `STANDARDS.md §4.2` + §8, then exit cleanly (no commit). Packet shape:
+
+```json
+{
+  "request_id": "<sha256 of repo + planning-step-id + 'human-action'>",
+  "entry_type": "strategic",
+  "risk_tier": "medium",
+  "agent_name": "implementer",
+  "title": "[<slug>] PLANNING step <id> needs your manual action",
+  "goal": "Advance PLANNING.md past step <id>",
+  "attempts": ["Identified step <id> as next unblocked step; step is marked *(human)* per STANDARDS §4.2"],
+  "ask": "<full step text including acceptance criteria, copied verbatim from PLANNING.md>",
+  "recommendation": "Complete the manual action, then check off the step in PLANNING.md and commit. Implementer cannot advance past this step until that is done; downstream steps likely depend on it."
+}
+```
+
+Log a final line and exit:
+
+```
+implementer: step <id> requires human action per STANDARDS §4.2; emitted strategic queue entry <id>. Exiting.
+```
+
+Skip Steps 4–6.
 
 ### Step 4 — Run tests
 
@@ -162,7 +188,8 @@ For MVP: this flow is **not implemented**. If invoked with `action: "address-fee
 | --- | --- |
 | Guard 1–3 trip | Exit cleanly with `::warning::` or `::notice::` log line. No queue entry. |
 | Guard 4 trips (when implemented) | Same as above. |
-| Step implementation fails (cannot determine what to do) | Emit `strategic` queue entry per Step 3 ambiguity flow; exit cleanly. |
+| Next step is marked `*(human)*` (`STANDARDS §4.2`) | Emit `strategic` queue entry per Step 3 Case C; exit cleanly. No commit, no attempt to skip ahead. |
+| Step implementation fails (cannot determine what to do) | Emit `strategic` queue entry per Step 3 Case B ambiguity flow; exit cleanly. |
 | Tests fail in code this step touched and agent can't fix | Continue to commit; note in PR body `## Notes`. The commit skill's CI-red handling flips would-be-auto-merge to MEDIUM queue. |
 | Tests fail in unrelated code | Note in `## Notes`; continue. Same CI-red flow if CI catches it. |
 | Commit skill exits cleanly (auto-merged or queued) | Implementer exits success. |
@@ -181,7 +208,8 @@ The agent does NOT enforce concurrency. The central workflow does, via `concurre
 ## What this skill does NOT do
 
 - **Multiple PLANNING steps per run.** One step per invocation; exits after commit. The verify gate is the loop boundary.
-- **Decide tech-stack or major architecture.** Those are HIGH tier per `§9` elevation rules and always queue. If a step's acceptance criteria require such a decision, emit a `strategic` queue entry and exit (per Step 3 ambiguity flow).
+- **Skip past `*(human)*`-marked steps.** Those are hard blockers per `STANDARDS §4.2`. Emit `strategic` queue entry (Step 3 Case C) and exit; do not advance to the next unchecked step. If Seth wants out-of-order execution, he reorders PLANNING.
+- **Decide tech-stack or major architecture.** Those are HIGH tier per `§9` elevation rules and always queue. If a step's acceptance criteria require such a decision, emit a `strategic` queue entry and exit (per Step 3 Case B ambiguity flow).
 - **Modify PLANNING.md itself beyond checking off the completed step.** That happens in the commit skill's post-merge cleanup (Step 6a). Restructuring or re-prioritizing PLANNING is Seth's lane.
 - **Make creative or strategic calls.** Per `STANDARDS.md §10` — those queue as `strategic` entries. The agent prepares; Seth decides.
 - **Wait for queue entry resolution.** The skill exits after commit; the wake mechanism (when built) is what resumes the loop.
