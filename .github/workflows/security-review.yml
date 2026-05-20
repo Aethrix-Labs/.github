@@ -21,17 +21,17 @@ on:
 
 permissions:
   contents: read
-  pull-requests: read   # harmless without PR-comment integrations; kept for future use
+  pull-requests: read # harmless without PR-comment integrations; kept for future use
 
 jobs:
   deterministic:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4              # consumer repo at $GITHUB_WORKSPACE
+      - uses: actions/checkout@v4 # consumer repo at $GITHUB_WORKSPACE
         with:
-          fetch-depth: 0   # gitleaks needs full history; fetch-depth: 1 will silently scan ~nothing
+          fetch-depth: 0 # gitleaks needs full history; fetch-depth: 1 will silently scan ~nothing
 
-      - uses: actions/checkout@v4              # central repo (helpers + SKILL.md)
+      - uses: actions/checkout@v4 # central repo (helpers + SKILL.md)
         with:
           repository: Aethrix-Labs/.github
           path: .fleet-ci
@@ -60,9 +60,9 @@ jobs:
             --exit-code 1
 
       - name: Semgrep
-        uses: semgrep/semgrep-action@v1   # renamed from returntocorp/semgrep-action
-        with:
-          config: p/security-audit
+        run: |
+          python3 -m pip install semgrep
+          semgrep --config p/security-audit --json --output semgrep-results.json || true
 
       # --- DEP-AUDIT VARIANT (pick ONE; delete the others) ---
 
@@ -115,17 +115,17 @@ jobs:
   semantic:
     runs-on: ubuntu-latest
     needs: deterministic
-    if: always()   # run the semantic step even on deterministic failure — triage whatever the deterministic tools found
+    if: always() # run the semantic step even on deterministic failure — triage whatever the deterministic tools found
     permissions:
       contents: read
-      pull-requests: write   # write needed by pr-body-composer to PATCH the PR body via the GitHub REST API
-      id-token: write        # required by anthropics/claude-code-action@v1 for OIDC token exchange
+      pull-requests: write # write needed by pr-body-composer to PATCH the PR body via the GitHub REST API
+      id-token: write # required by anthropics/claude-code-action@v1 for OIDC token exchange
     steps:
-      - uses: actions/checkout@v4              # consumer repo at $GITHUB_WORKSPACE
+      - uses: actions/checkout@v4 # consumer repo at $GITHUB_WORKSPACE
         with:
           fetch-depth: 0
 
-      - uses: actions/checkout@v4              # central repo (helpers + SKILL.md)
+      - uses: actions/checkout@v4 # central repo (helpers + SKILL.md)
         with:
           repository: Aethrix-Labs/.github
           path: .fleet-ci
@@ -173,8 +173,19 @@ jobs:
             --max-turns 25
             --allowedTools Read,Bash,Write
 
+      - name: Emit security-review queue entry (semantic failure)
+        if: failure() && steps.semantic.outcome == 'failure' && steps.gate.outputs.run == 'true'
+        env:
+          QUEUE_SERVICE_ROLE_KEY: ${{ secrets.QUEUE_SERVICE_ROLE_KEY }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          COMMIT_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          python3 .fleet-ci/.github/scripts/security-review/queue-emit.py \
+            --semantic-failed \
+            --fail-reason "Semantic step failed; see workflow run for details"
+
       - name: Fail on critical semantic findings
-        if: steps.gate.outputs.run == 'true'
+        if: success() && steps.gate.outputs.run == 'true'
         run: |
           if [ ! -f semantic-findings.json ]; then
             echo "::error::semantic-findings.json not produced by Claude step"
@@ -221,3 +232,14 @@ jobs:
           name: semantic-findings
           path: semantic-findings.json
           if-no-files-found: ignore
+
+      - name: Emit security-review queue entry
+        if: always()
+        env:
+          QUEUE_SERVICE_ROLE_KEY: ${{ secrets.QUEUE_SERVICE_ROLE_KEY }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          COMMIT_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          python3 .fleet-ci/.github/scripts/security-review/queue-emit.py \
+            --deterministic-findings deterministic-findings.json \
+            --semantic-findings semantic-findings.json
