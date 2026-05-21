@@ -87,10 +87,30 @@ Any match → tier = HIGH, rationale = `"must-escalate match: <pattern>"`. Stop.
 
 Output: a single `tier ∈ {low, medium, high}` plus a one-line rationale string. Both flow into the PR body and the queue packet.
 
-### Step 4: Branch, commit, push, open PR
+### Step 4: Branch, update canonical docs inline, commit, push, open PR
+
+**4a. Branch.**
 
 ```bash
 git checkout -b <branch-name>
+```
+
+**Branch name:** kebab-case, short and descriptive. Examples: `add-google-sso`, `fix-auth-redirect`, `dashboard-layout`.
+
+**If already on a feature branch** (not `main`): confirm with Seth before creating another branch on top.
+
+**4b. Update the canonical docs inline as part of this same commit.** Doc updates that describe what just shipped MUST land in the same PR as the code change — not as a separate post-merge cleanup PR. Atomicity (the code and the docs claiming it shipped revert together), review surface (Seth sees the agent's claims about what changed alongside the diff), and PLANNING-authority-at-merge-time all favor inline. This is what the agent does in practice; the pattern is documented here so the next product onboarding doesn't relearn it.
+
+The four docs to consider, in order:
+
+- **`PLANNING.md`** — flip the completed step's checkbox to `[x]`. If multiple sub-bullets were the step's acceptance criteria, flip those too. Be conservative — only check off what was actually fully completed by this PR. Partial → leave unchecked and add `*(partial — X done)*` in the step body.
+- **`LIFECYCLE.md`** — bump `last_updated:` to today's date. Update `next_milestone:` to whatever's next in `PLANNING.md`. If the next step is marked `*(human)*` per `STANDARDS §4.2`, propagate the `(human)` annotation into `next_milestone:` so the hub dashboard surfaces the manual-action state at a glance. Body sections only if state materially shifted.
+- **`CHANGELOG.md`** — prepend a new entry with today's date and a short title. Include both a `**User-facing:**` section (what end-users notice — omit if pure infra) and a `**Developer:**` section (what changed in the repo, in terms a maintainer cares about). Match the existing file's date and heading conventions if one exists.
+- **`PRODUCT.md`** — only update if this PR changed user-facing product knowledge (in-app FAQ, help docs, agent-readable feature descriptions). Per `SKILL_AUDIT §3.9` this is `PRODUCT.md`'s scope. Pure scaffolding / infra / refactors don't touch it. `ARCHITECTURE.md` updates remain out-of-scope (gap G13 — flag material architecture changes in `## Notes` of the PR body instead).
+
+**4c. Commit and push.**
+
+```bash
 git add -A
 git commit -m "<type>: <short imperative summary>
 
@@ -98,13 +118,9 @@ git commit -m "<type>: <short imperative summary>
 git push -u origin <branch-name>
 ```
 
-**Branch name:** kebab-case, short and descriptive. Examples: `add-google-sso`, `fix-auth-redirect`, `dashboard-layout`.
-
-**If already on a feature branch** (not `main`): confirm with Seth before creating another branch on top.
-
 **Conventional commit style:** check `git log --oneline -5`. If the repo uses `feat:`/`fix:`/`chore:`/etc., follow that. Otherwise plain imperative summary.
 
-**Open the PR:**
+**4d. Open the PR.**
 
 ```bash
 gh pr create --base main \
@@ -117,7 +133,7 @@ PR labels (applied at open per `COMMIT_REDESIGN.md §7.1`):
 
 - `tier:low` / `tier:medium` / `tier:high` — from Step 3.
 - `stage:<value>` — mirrored from `LIFECYCLE.md`.
-- `commit-pending-merge` — always; the merge poller queries on this.
+- `commit-pending-merge` — always; the merge fire-back loop queries on this.
 - `auto-merge` — only when Step 5 says auto-merge is allowed.
 
 ### PR body composition (per `COMMIT_REDESIGN.md §8`)
@@ -229,7 +245,7 @@ Packet shape (matches `STANDARDS.md §8` + the M3 API contract):
 **On non-2xx, or `QUEUE_SERVICE_ROLE_KEY` missing:** fall back to legacy behavior — leave the PR open, tell Seth approval is needed in-chat, do not auto-merge:
 
 > PR #<n> needs your approval (stage: <stage>, tier: <tier>). **[Review on GitHub](<pr-url>)**
-> Queue write failed (<reason>) — let me know when you've merged it and I'll run post-merge cleanup.
+> Queue write failed (<reason>) — let me know when you've merged it.
 
 **Route C — block (exception):**
 
@@ -252,48 +268,9 @@ For adversary-loop non-convergence or other hard failures, emit an `exception` e
 
 The PR is NOT opened in this case. The diff stays on the local branch.
 
-### Step 6: Resume on merge (post-merge cleanup)
+### Step 6: Trigger staging deploy (auto-merge path only)
 
-Triggered either by:
-
-- Direct continuation when Step 5 took the auto-merge path and the merge fired during the polling window.
-- The merge fire-back poller invoking the skill in "resume mode" with the merged PR's number, when Step 5 took the queue route or the auto-merge polling window expired.
-
-```bash
-git checkout main
-git pull origin main
-```
-
-Then update the four canonical docs (each is a separate concern; failures on any one are recoverable, not fatal):
-
-**6a. PLANNING.md.** Read it; mark steps completed by this PR as done. Use the diff to identify what was done. Be conservative — only check off items you're confident were fully completed. Partial → leave unchecked and add `*(partial — X done)*`.
-
-```
-- [ ] M3.5 — Foo  →  - [x] M3.5 — Foo
-```
-
-If nothing clearly matches, leave PLANNING.md unchanged.
-
-**6b. Run `doc-sync` skill.** Per `SKILL_AUDIT.md §3.9`, scope is user-facing `PRODUCT.md` content (in-app FAQ, help docs, agent-readable product knowledge). `ARCHITECTURE.md` is NOT in scope for `doc-sync` (gap G13 in `STANDARDS.md §11.1` — ownership TBD). If the diff materially changes architecture, flag it in `## Notes` of the PR body for human follow-up.
-
-**6c. Run `changelog-generator` skill.** Prepends a new entry to `CHANGELOG.md` with user-facing and developer-facing sections.
-
-**6d. Refresh LIFECYCLE.md.** Always update `last_updated:` to today's date. Update `next_milestone:` if a milestone just completed. Body sections only if state materially shifted.
-
-### Step 7: Commit and push post-merge cleanup
-
-```bash
-git add docs/PLANNING.md docs/PRODUCT.md docs/CHANGELOG.md docs/LIFECYCLE.md
-# (adjust paths if any of these live at repo root rather than /docs/)
-git commit -m "chore: post-merge cleanup — <one-line summary of what shipped>"
-git push
-```
-
-Confirm:
-
-> Done! Back on `main`, docs updated, `LIFECYCLE.md` refreshed, everything pushed.
-
-### Step 8: Trigger staging deploy
+This step only fires when Step 5 took the auto-merge path AND the merge completed within the polling window. The queue route exits at Step 5 Route B and the merge fire-back loop owns merge + deploy from there (see below).
 
 Read `DEPLOYMENT.md`:
 
@@ -302,7 +279,7 @@ Read `DEPLOYMENT.md`:
 
 Confirm:
 
-> Staging deploy triggered — `<staging-url>`. Let me know when you've verified staging and want to promote to production.
+> Staging deploy triggered — `<staging-url>`. Verify gate (`STANDARDS §9`) emits a verify queue entry on staging-deploy success.
 
 **If `DEPLOYMENT.md` doesn't exist:**
 
@@ -312,14 +289,25 @@ Confirm:
 
 ---
 
-## Merge fire-back (out-of-process)
+## Doc updates are inline (no post-merge cleanup phase)
 
-The skill emits the queue entry and exits at Step 5 Route B. The post-merge resume (Steps 6–8) is triggered by an out-of-process loop:
+Earlier versions of this skill had a Steps 6-7 post-merge cleanup phase that updated `PLANNING.md`, ran `doc-sync` for `PRODUCT.md`, ran `changelog-generator` for `CHANGELOG.md`, and refreshed `LIFECYCLE.md` — on a separate commit pushed after merge. That phase has been folded into Step 4 (inline updates as part of the same PR). Rationale: atomicity, review surface, PLANNING authority at merge time, no separate post-merge PR clutter. Validated end-to-end on the first implementer-driven PR (puzzle-pop PR #6, M0.1, 2026-05-20).
 
-- **v0:** Fleet-level scheduled task fires every ~15 min, queries GitHub for PRs with label `commit-pending-merge` across `~/products/*`, and on each merged PR invokes a Claude Code subagent in that repo to run Steps 6–8 in "resume mode."
-- **v1:** GitHub webhook → hub endpoint → invoke resume subagent. Lower latency; built when webhook infra exists.
+This means `changelog-generator` and `doc-sync` are no longer fired as separate skills in the post-merge phase — their work is composed inline by the agent during commit. They remain available as standalone skills for ad-hoc invocation if needed, but the commit flow doesn't call them.
 
-Implementation of the poller / webhook is out of scope for this SKILL.md — it's a separate piece of fleet infrastructure tracked in `STANDARDS.md §11.2`. The skill is forward-compatible: it tags PRs with the right labels and emits the right queue packets, so the poller can find them when it ships.
+---
+
+## Merge fire-back loop (out-of-process)
+
+When Step 5 takes the queue route, the skill emits the `approval` packet and exits. The PR sits on GitHub with the `commit-pending-merge` label, ready for Seth's queue approval. The bridge between "Seth approves the queue entry" and "GitHub merges the PR" is the **merge fire-back loop** — out-of-process fleet infrastructure tracked in `STANDARDS §11.2`. The loop's scope (post the 2026-05-20 simplification driven by the inline-doc-update pattern):
+
+1. Detect approved queue entries whose artifact PR is still labeled `commit-pending-merge`.
+2. Call GitHub's merge API on the PR.
+3. Optionally trigger staging deploy per the consumer repo's `DEPLOYMENT.md` (most fleet products auto-deploy on push to main via CD, in which case this is a no-op).
+
+There's no post-merge doc cleanup to run — doc updates landed inline. v0 is a Cloudflare Cron Trigger + Worker handler that polls the queue and GitHub; v1 is a webhook from the hub. Tracked as a single row in `§11.2`.
+
+Until the loop ships, queue-routed PRs require manual merge after Seth approves the queue entry. The skill is forward-compatible (right labels, right packets) so when the loop lands, in-flight PRs get picked up without re-running this skill.
 
 ---
 
@@ -332,13 +320,13 @@ Implementation of the poller / webhook is out of scope for this SKILL.md — it'
 | Already on a feature branch | Confirm before branching again. |
 | Push conflict | `git pull --rebase origin <branch>` then re-push. |
 | `gh` not installed | Construct the PR URL from `git remote get-url origin` and present as a clickable link. Auto-merge route falls back to "queue for approval" (no auto-merge possible without `gh` or GitHub API access). |
-| Auto-merge 3-min timeout | Skill exits cleanly; merge poller picks up the post-merge resume when CI eventually completes. |
+| Auto-merge 3-min timeout | Skill exits cleanly; merge fire-back loop merges when CI eventually completes. No post-merge resume needed — doc updates already landed inline at Step 4. |
 | `LIFECYCLE.md` missing or `stage:` unparseable | Default to `stage: production`; add "LIFECYCLE.md repair needed" to PR body's `## Notes`. |
 | Adversary loop doesn't converge within a reasonable cap | Emit `exception` queue entry per Step 5 Route C; no PR opened. (Cap is gap G14 — apply judgment.) |
 | CI red on a would-be-auto-merge diff | Flip to MEDIUM queue entry per Step 5; name the failing check in `attempts`. |
 | Hub queue API non-2xx | Fall back to legacy in-chat approval; warn that queue write was skipped. |
 | `QUEUE_SERVICE_ROLE_KEY` missing | Same fallback; tell Seth to set the secret. |
-| Post-merge step (6–8) failure | Emit `exception` queue entry per failed step; partial progress preserved. Re-running the skill in the same repo state will re-attempt cleanly. |
+| Inline doc-update at Step 4 fails (PLANNING / LIFECYCLE / CHANGELOG / PRODUCT) | Stop before opening PR; emit `exception` queue entry naming the failed doc, with the partial branch state preserved. Re-running the skill on the same branch will re-attempt cleanly. |
 
 ---
 
