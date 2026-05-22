@@ -36,6 +36,7 @@ From the consumer repo:
 From the central checkout at `.fleet-ci/`:
 
 - `.fleet-ci/.github/scripts/commit/SKILL.md` — Read this when ready to commit; follow its 8-step flow.
+- `.fleet-ci/.github/scripts/pre-commit-reviewer/SKILL.md` — Read this when ready to run the adversary review loop (Step 4.5 below).
 
 ---
 
@@ -59,7 +60,7 @@ Check `/docs/PLANNING.md`, then `/PLANNING.md`. Missing both → exit with `::wa
 
 Grep PLANNING.md for `- [ ]` or `* [ ]`. Zero matches → exit with `::notice::implementer: all PLANNING.md steps complete`. This is the natural end-state for the product's current milestone; no error, just done.
 
-**Guard 4 — No unresolved verify entries on this product** *(deferred until hub GET endpoint exists).*
+**Guard 4 — No unresolved verify entries on this product** _(deferred until hub GET endpoint exists)._
 
 When the hub exposes `GET /api/v1/queue/entries?product=<slug>&status=open&entry_type=verify`, this guard reads it. Any unresolved verify entry → exit with `::warning::implementer: unresolved verify entry blocks advance; resolve at <hub-url> first`. For MVP: skip this guard. Operator discipline (Seth doesn't click "Run workflow" until staging verified) substitutes.
 
@@ -69,7 +70,14 @@ When the hub exposes `GET /api/v1/queue/entries?product=<slug>&status=open&entry
 
 ### Step 1 — Identify the next step
 
-Read PLANNING.md from top to bottom. Find the first `- [ ]` or `* [ ]` line that is:
+**Scope the read.** On long-lived products `PLANNING.md` accumulates many milestones. Don't read top-to-bottom blindly — that wastes tokens on completed work the agent doesn't need to reason about. Read in two passes:
+
+1. **The milestone-overview table** at the top of `PLANNING.md` (if present) — gives you the lay of the land in ~10 lines.
+2. **The first milestone with unchecked steps** (the active milestone). Identify it by scanning `## M<n>` headings top-down and stopping at the first one that contains at least one `- [ ]` or `* [ ]` line below it.
+
+Skip fully-completed milestones entirely — their content is preserved in git history; you don't need it to advance the next step. If `PLANNING.md` has been compacted (older milestones moved to `PLANNING_ARCHIVE.md` per the deferred `planning-compactor` convention), the file you read is already scoped; no behavior change needed.
+
+**Find the next step.** Within the active milestone, find the first `- [ ]` or `* [ ]` line that is:
 
 1. Inside a milestone section (`## M<n>` heading)
 2. Not preceded by an explicit `**Blocked by:**` annotation referencing an unchecked dependency
@@ -124,7 +132,9 @@ If the step requires a decision that's outside Seth's creative & strategic lane 
   "agent_name": "implementer",
   "title": "[<slug>] PLANNING step <id> needs your manual action",
   "goal": "Advance PLANNING.md past step <id>",
-  "attempts": ["Identified step <id> as next unblocked step; step is marked *(human)* per STANDARDS §4.2"],
+  "attempts": [
+    "Identified step <id> as next unblocked step; step is marked *(human)* per STANDARDS §4.2"
+  ],
   "ask": "<full step text including acceptance criteria, copied verbatim from PLANNING.md>",
   "recommendation": "Complete the manual action, then check off the step in PLANNING.md and commit. Implementer cannot advance past this step until that is done; downstream steps likely depend on it."
 }
@@ -143,6 +153,49 @@ Skip Steps 4–6.
 If the repo has a test runner (`package.json` `scripts.test`, `pytest.ini`, etc.), run it. If tests fail and the failure is in code this step touched, fix it before continuing. If tests fail in unrelated code, note the failure in the PR body's `## Notes` section and continue — the commit skill's CI-red handling will queue it appropriately.
 
 If no test infrastructure exists, skip this step. Don't create test files speculatively — that's the `test-writer` skill's job, invoked separately.
+
+### Step 4.5 — Run the adversary review loop
+
+Orchestrate the `pre-commit-reviewer` skill in an iterative loop. The reviewer is **stateless per invocation**; you (the implementer) own the loop state and the convergence decision.
+
+Read `.fleet-ci/.github/scripts/pre-commit-reviewer/SKILL.md` once at the start to understand its contract. Each iteration is one fresh review pass — feed it the current diff plus, on iterations ≥ 2, any pushback rationales from the prior iteration.
+
+**Generate the `run_id` once at run start** (e.g., `sha256(repo + step_id + git rev-parse HEAD)`); reuse it across all iterations and the implementer's own activity records.
+
+**Loop, max 3 iterations:**
+
+1. Invoke the reviewer per its SKILL.md — pass `run_id`, `iteration_number`, `step_id`, and (if iteration ≥ 2) `prior_findings` + `implementer_pushbacks`.
+2. Parse the reviewer's JSON output (`schema_version: 1`).
+3. Branch on `outcome`:
+   - **`clean`** → exit loop. Continue to Step 5 (commit).
+   - **`signoff-with-caveats`** → exit loop. Carry the caveats forward to Step 5; they land in the PR body's `## Adversary review` section and on the activity record. Continue to commit.
+   - **`needs-fixes`** → for each blocking finding, decide:
+     - **Fix in place** — make the code change the finding calls for. Default action.
+     - **Push back** — record a `{ finding_id, rationale }` entry. Push back only when you have a concrete reason (e.g., "this is intentionally out of scope per PRD §3.2," not "this seems fine"). Pushbacks without concrete rationale are wastes of the iteration budget.
+   - If you fixed at least one thing, increment `iteration_number` and re-invoke (loop iterates).
+   - If you pushed back on everything without fixing, increment and re-invoke with the pushbacks — the reviewer adjudicates.
+4. **Cap-hit:** if `iteration_number` reaches 3 and `outcome` is still `needs-fixes`, exit the loop and emit an `exception` queue entry per `STANDARDS.md §8`:
+
+```json
+{
+  "request_id": "<sha256 of run_id + 'adversary-cap-hit'>",
+  "entry_type": "exception",
+  "risk_tier": "high",
+  "agent_name": "implementer",
+  "title": "[<slug>] Adversary loop failed to converge on step <id>",
+  "goal": "Implement <step text>",
+  "attempts": [
+    "Ran <n> adversary review iterations; final blocking findings: <count>"
+  ],
+  "ask": "Adjudicate the unresolved blocking findings and the implementer's pushbacks; decide override / rework / abandon",
+  "artifacts": [{ "artifact_type": "github-pr", "url": "<not-yet-created>" }],
+  "recommendation": "Review the activity trail entries for run_id <run_id> for full iteration history"
+}
+```
+
+Then exit (no commit). Do NOT push code to a PR when the adversary loop cap-hits — the unresolved blocking findings are the point of the gate.
+
+**Activity-trail writes by this step:** the reviewer writes one record per iteration on its own (per `pre-commit-reviewer/SKILL.md`). The implementer doesn't double-write the review records, but does record loop-bracketing events as part of its own activity-trail writes (see "Activity trail writes" near the end of this skill).
 
 ### Step 5 — Invoke the `commit` skill
 
@@ -182,20 +235,75 @@ For MVP: this flow is **not implemented**. If invoked with `action: "address-fee
 
 ---
 
+## Activity trail writes
+
+The implementer brackets its own run with two activity records per `STANDARDS.md` Agent Activity Trail section. The reviewer (Step 4.5) writes its own per-iteration records; this skill does NOT double-write those.
+
+**Run-start record** — written immediately after Step 1 identifies a workable next step (after Case A/B/C branching is decided, before Step 2 reads context):
+
+```bash
+curl -X POST "${HUB_BASE_URL:-https://sethgibson.com}/api/v1/activity/entries" \
+  -H "Content-Type: application/json" \
+  -H "x-service-role-key: $QUEUE_SERVICE_ROLE_KEY" \
+  -H "User-Agent: aethrix-fleet-ci/1.0 (implementer)" \
+  -d '{
+    "request_id": "<sha256 of run_id + \"run-started\">",
+    "product_slug": "<repo basename>",
+    "agent_name": "implementer",
+    "action": "run-started",
+    "run_id": "<run_id>",
+    "payload": {
+      "step_id": "<M2.7>",
+      "step_text": "<full step text>",
+      "case": "A" | "B" | "C",
+      "github_run_id": "$GITHUB_RUN_ID",
+      "github_sha": "$GITHUB_SHA"
+    }
+  }'
+```
+
+**Run-completed record** — written at exit, regardless of outcome:
+
+```json
+{
+  "request_id": "<sha256 of run_id + 'run-completed'>",
+  "product_slug": "<repo basename>",
+  "agent_name": "implementer",
+  "action": "run-completed",
+  "run_id": "<run_id>",
+  "payload": {
+    "step_id": "<M2.7>",
+    "outcome": "committed" | "queued-for-approval" | "blocked-strategic" | "blocked-human" | "blocked-adversary-cap-hit" | "blocked-tests" | "guard-tripped",
+    "iterations_used": <0-3>,
+    "pr_url": "<url or null>",
+    "queue_entry_id": "<id if any queue entry was emitted, else null>"
+  }
+}
+```
+
+Write the run-completed record on EVERY exit path — Cases B/C exits, cap-hit exits, guard trips, successful commits. The Agent Activity Trail UI relies on a paired start/complete to render run duration correctly.
+
+Graceful failure on activity writes follows the same pattern as `pre-commit-reviewer/SKILL.md`: missing key or non-2xx → log `::warning::`, continue. Activity writes are observability, not gates.
+
+---
+
 ## Failure modes
 
-| Failure | Behavior |
-| --- | --- |
-| Guard 1–3 trip | Exit cleanly with `::warning::` or `::notice::` log line. No queue entry. |
-| Guard 4 trips (when implemented) | Same as above. |
-| Next step is marked `*(human)*` (`STANDARDS §4.2`) | Emit `strategic` queue entry per Step 3 Case C; exit cleanly. No commit, no attempt to skip ahead. |
-| Step implementation fails (cannot determine what to do) | Emit `strategic` queue entry per Step 3 Case B ambiguity flow; exit cleanly. |
-| Tests fail in code this step touched and agent can't fix | Continue to commit; note in PR body `## Notes`. The commit skill's CI-red handling flips would-be-auto-merge to MEDIUM queue. |
-| Tests fail in unrelated code | Note in `## Notes`; continue. Same CI-red flow if CI catches it. |
-| Commit skill exits cleanly (auto-merged or queued) | Implementer exits success. |
-| Commit skill emits exception entry | Implementer exits success — the exception entry is the right surface for the failure, not a duplicate workflow failure. |
-| `claude-code-action` itself errors | The workflow's error handling fires; if a queue entry for that case is wanted, the central workflow's `if: failure()` path emits one (like security-review's pattern). |
-| `QUEUE_SERVICE_ROLE_KEY` missing | Commit skill's graceful fallback fires (in-chat approval message — visible only in workflow logs, not actionable in CI). The implementer skill itself doesn't fail; the operator notices via the missing queue entry. |
+| Failure                                                  | Behavior                                                                                                                                                                                                                                             |
+| -------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Guard 1–3 trip                                           | Exit cleanly with `::warning::` or `::notice::` log line. No queue entry, no activity record (run hadn't started).                                                                                                                                   |
+| Guard 4 trips (when implemented)                         | Same as above.                                                                                                                                                                                                                                       |
+| Next step is marked `*(human)*` (`STANDARDS §4.2`)       | Emit `strategic` queue entry per Step 3 Case C; write `run-completed` record with `outcome: "blocked-human"`; exit cleanly. No commit, no attempt to skip ahead.                                                                                     |
+| Step implementation fails (cannot determine what to do)  | Emit `strategic` queue entry per Step 3 Case B; write `run-completed` with `outcome: "blocked-strategic"`; exit.                                                                                                                                     |
+| Tests fail in code this step touched and agent can't fix | Continue to commit; note in PR body `## Notes`. The commit skill's CI-red handling flips would-be-auto-merge to MEDIUM queue. `run-completed` outcome is `"queued-for-approval"` or `"committed"` depending on commit gate.                          |
+| Tests fail in unrelated code                             | Note in `## Notes`; continue. Same CI-red flow if CI catches it.                                                                                                                                                                                     |
+| Adversary loop returns `clean` or `signoff-with-caveats` | Continue to Step 5 (commit).                                                                                                                                                                                                                         |
+| Adversary loop cap-hits (`needs-fixes` on iteration 3)   | Emit `exception` queue entry per Step 4.5; write `run-completed` with `outcome: "blocked-adversary-cap-hit"`; exit. No commit.                                                                                                                       |
+| Reviewer SKILL.md missing from `.fleet-ci/`              | Log `::warning::implementer: pre-commit-reviewer SKILL.md missing; skipping adversary loop` and proceed to Step 5. This is a CI configuration failure; don't gate work on it. Operator notices via the missing review records in the activity trail. |
+| Commit skill exits cleanly (auto-merged or queued)       | Implementer exits success; `run-completed` outcome is `"committed"` or `"queued-for-approval"`.                                                                                                                                                      |
+| Commit skill emits exception entry                       | Implementer exits success — the exception entry is the right surface for the failure, not a duplicate workflow failure. `run-completed` outcome is `"queued-for-approval"`.                                                                          |
+| `claude-code-action` itself errors                       | The workflow's error handling fires; if a queue entry for that case is wanted, the central workflow's `if: failure()` path emits one (like security-review's pattern). `run-completed` may not write — workflow-level failure, not skill-level.      |
+| `QUEUE_SERVICE_ROLE_KEY` missing                         | Commit skill's graceful fallback fires; reviewer and implementer activity writes both skip with `::warning::`. The skill itself doesn't fail; the operator notices via missing queue entry and missing activity records.                             |
 
 ---
 
