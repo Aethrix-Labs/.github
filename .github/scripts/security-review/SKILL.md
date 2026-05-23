@@ -135,10 +135,51 @@ Write `semantic-findings.json` in the same shape as the aggregator's `determinis
 
 This skill runs in two contexts, both governed by `SECURITY_REVIEW_REDESIGN.md`:
 
-- **CI (autonomous)** — invoked by `.github/workflows/security-review.yml` via `claude-code-action` using `CLAUDE_CODE_OAUTH_TOKEN` (auth per `STANDARDS.md §14`). Conditional execution per spec `§3.3` — the workflow decides whether to invoke based on diff scope and deterministic findings. Output is `semantic-findings.json`. The downstream PR body composer (pending, `§11.2`) renders the unified report. No interactive prompts during execution.
-- **On-demand (interactive)** — invoked as a Claude Code subagent (spec `§10`). Runs unconditionally; no `§3.3` gating. Output is still `semantic-findings.json`; the invoking host session renders the JSON for the user and may offer auto-fix on Critical/Important issues. Auto-fix is the host's responsibility, not this skill's.
+- **CI (autonomous)** — invoked by the central workflow at `Aethrix-Labs/.github:.github/workflows/security-review.yml` (per `STANDARDS.md §17`) via `claude-code-action` using `CLAUDE_CODE_OAUTH_TOKEN` (auth per `STANDARDS.md §14`). Conditional execution per spec `§3.3` — the workflow decides whether to invoke based on diff scope and deterministic findings. Output is `semantic-findings.json`. Downstream of this skill: the PR body composer (`pr-body-composer.py`) renders the unified report into the PR body, and the queue emitter (`queue-emit.py`, this skill's companion helper) writes an `exception` entry to the hub's decision queue when a Critical finding is present or the semantic step itself failed. No interactive prompts during execution.
+- **On-demand (interactive)** — invoked as a Claude Code subagent (spec `§10`). Runs unconditionally; no `§3.3` gating. Output is still `semantic-findings.json`; the invoking host session renders the JSON for the user and may offer auto-fix on Critical/Important issues. Auto-fix is the host's responsibility, not this skill's. Queue emission is also the host's responsibility in this mode (the CI helper isn't invoked on-demand).
 
 Neither surface waits for user input mid-run. The interactive flow happens *after* the skill completes, in the host session.
+
+---
+
+## Queue emission (CI only)
+
+`queue-emit.py` (companion helper at `/skills/security-review/queue-emit.py`) writes an `exception` entry to the hub's decision queue (`POST /api/v1/queue/entries` per M3) when a scenario warrants Seth's attention. Default is silent — clean runs produce no entry.
+
+Two scenarios fire:
+
+| Scenario | Entry | Risk tier | Rationale |
+|---|---|---|---|
+| Any Critical finding (deterministic or semantic) | `exception` | high | Critical findings block merge per `§4`; the queue entry surfaces the block. |
+| Semantic step was required by `§3.3` but failed (Claude API error, OAuth token issue, etc.) | `exception` | medium | Per `§12`. Re-run the workflow or investigate token/quota. |
+
+**Scenarios that DON'T emit:**
+
+- Clean runs (no findings, or only Important/Advisory).
+- Important/Advisory findings only — they go to the PR body via `pr-body-composer.py`. Per the open question in `SECURITY_REVIEW_REDESIGN.md §13`, "Information-type queue entries" is deferred until a pattern emerges.
+- Semantic step legitimately skipped per `§3.3` conditional gate.
+- Tool config crashes (Semgrep failed, etc.) — flagged as Advisory in PR body; not queue-worthy.
+
+**Idempotency.** `request_id = sha256(repo + PR# + commit_sha + scenario_key)`. Re-runs on the same commit produce the same `request_id`; the M3 API dedups server-side. New commits to the same PR get fresh entries — findings can change with new code.
+
+**Auth.** `QUEUE_SERVICE_ROLE_KEY` must be set as an `Aethrix-Labs` org-level GitHub Secret (per `STANDARDS.md §14` "Local agent credentials" → multi-storage credentials). Missing key → script logs `::warning::` and exits 0. Queue infrastructure hiccups never fail the workflow.
+
+**Workflow invocation pattern** (canonical workflow YAML lives at `Aethrix-Labs/.github` per `§17.4`):
+
+```yaml
+- name: Emit security-review queue entry
+  if: always()
+  env:
+    QUEUE_SERVICE_ROLE_KEY: ${{ secrets.QUEUE_SERVICE_ROLE_KEY }}
+    PR_NUMBER: ${{ github.event.pull_request.number }}
+    COMMIT_SHA: ${{ github.event.pull_request.head.sha }}
+  run: |
+    python3 .fleet-ci/.github/scripts/security-review/queue-emit.py \
+      --deterministic-findings deterministic-findings.json \
+      --semantic-findings semantic-findings.json
+```
+
+For the semantic-failed case, add `--semantic-failed --fail-reason "<error>"` and gate it on `if: failure()` of the semantic step (workflow detail).
 
 ---
 

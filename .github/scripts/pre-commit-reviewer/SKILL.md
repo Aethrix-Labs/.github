@@ -216,15 +216,15 @@ Model selection per `STANDARDS.md §14` "Per-agent assignments":
 
 ## Failure modes
 
-| Failure                                                             | Behavior                                                                                                                                         |
-| ------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `QUEUE_SERVICE_ROLE_KEY` missing                                    | Output JSON returned to caller as normal; activity write skipped with `::warning::` log.                                                         |
-| Activity write returns non-2xx                                      | Same — log warning, return output JSON, don't fail.                                                                                              |
-| Required ref doc missing (`PRD.md`, `PLANNING.md`)                  | Run the checks that don't require it; record skipped areas in `areas_skipped`. Don't synthesize findings against missing context.                |
-| Diff is empty                                                       | Output `{ outcome: "clean", findings: [], ... }` and exit. Don't fabricate findings; clean is clean.                                             |
-| Diff is enormous (>2k lines changed)                                | Note in `findings` as a non-blocking observation ("Diff is unusually large; consider splitting"); still run checks. Do NOT short-circuit.        |
-| Caller passes malformed `prior_findings` or `implementer_pushbacks` | Treat as if absent; proceed with iteration as if iteration 1. Log a `::warning::`.                                                               |
-| Conflicting PRD and PLANNING (PRD says X, PLANNING says ~X)         | Surface the conflict as a blocking finding under area `planning`; implementer escalates to a `strategic` queue entry per its own ambiguity flow. |
+| Failure | Behavior |
+| --- | --- |
+| `QUEUE_SERVICE_ROLE_KEY` missing | Output JSON returned to caller as normal; activity write skipped with `::warning::` log. |
+| Activity write returns non-2xx | Same — log warning, return output JSON, don't fail. |
+| Required ref doc missing (`PRD.md`, `PLANNING.md`) | Run the checks that don't require it; record skipped areas in `areas_skipped`. Don't synthesize findings against missing context. |
+| Diff is empty | Output `{ outcome: "clean", findings: [], ... }` and exit. Don't fabricate findings; clean is clean. |
+| Diff is enormous (>2k lines changed) | Note in `findings` as a non-blocking observation ("Diff is unusually large; consider splitting"); still run checks. Do NOT short-circuit. |
+| Caller passes malformed `prior_findings` or `implementer_pushbacks` | Treat as if absent; proceed with iteration as if iteration 1. Log a `::warning::`. |
+| Conflicting PRD and PLANNING (PRD says X, PLANNING says ~X) | Surface the conflict as a blocking finding under area `planning`; implementer escalates to a `strategic` queue entry per its own ambiguity flow. |
 
 ---
 
