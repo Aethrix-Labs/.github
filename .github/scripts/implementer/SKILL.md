@@ -86,7 +86,11 @@ The step text is everything between the checkbox and the next checkbox / heading
 
 If multiple steps look unblocked at the same indentation, take the first one (top-down order).
 
-**Check for the `*(human)*` marker.** If the identified step's text begins with `*(human)*` immediately after the checkbox (per `STANDARDS.md §4.2`), this step is a hard blocker for the agent — Seth must complete it manually before the implementer can advance. Do NOT attempt to implement, do NOT skip ahead to the next step (downstream steps almost always depend on the human action), and do NOT guess at a workaround. Branch to Step 3's human-only case.
+**Check for the `*(human)*` marker.** If the identified step's text begins with `*(human)*` immediately after the checkbox (per `STANDARDS.md §4.2`), this step is a hard blocker for the agent — Seth must complete it manually before the implementer can advance. Do NOT attempt to implement, do NOT skip ahead to the next step (downstream steps almost always depend on the human action), and do NOT guess at a workaround. Branch to Step 3's human-only case (Case C).
+
+**Scan acceptance criteria for unmarked human-only work.** Even when the step itself lacks the `*(human)*` marker, the criteria below the checkbox may include sub-bullets that match `STANDARDS §4.2`'s "When to mark" criteria — interactive OAuth flows (`wrangler login`, `gh auth login`, `gcloud auth login`), local-machine verification (`verify ... runs locally`, "test on physical device," "open in browser"), third-party dashboard configuration ("create account at," "enable in Settings →"), payments, identity verification, App Store / external review waits, physical actions. If the criteria match any of these patterns and the step has no `*(human)*` marker, this is **mid-step discovery caught early** per `STANDARDS §4.2` "Mid-step discovery" subsection — branch to Step 3's Case D (split-and-continue or stop-and-ask) rather than walking into a partial-completion trap.
+
+Treat this scan as a heuristic, not a rule engine. The goal is to catch obvious cases at the earliest point; the Case D flow at Step 3 still catches anything the scan misses.
 
 ### Step 2 — Read context
 
@@ -147,6 +151,62 @@ implementer: step <id> requires human action per STANDARDS §4.2; emitted strate
 ```
 
 Skip Steps 4–6.
+
+**Case D — Mid-step discovery of unmarked human-only work (per `STANDARDS §4.2` "Mid-step discovery").** Triggers when either (a) Step 1's heuristic scan flagged this step upfront, OR (b) during implementation you realize part of the acceptance criteria matches the §4.2 "When to mark" criteria (interactive OAuth, local-machine verification, third-party dashboard config, payments, external review waits, physical actions). Critical rule: **do NOT mark the parent step `[x]` based on partial work** — PLANNING.md is the only durable surface for "what's next," and misrepresenting completion there causes downstream runs to fail far from the cause.
+
+Two sub-cases:
+
+**Case D1 — Clean split (default).** Use this when you can cleanly identify which acceptance criteria bullets are agent-doable vs. human-only.
+
+1. Do the agent-doable work normally (per Case A's engineering judgment).
+2. Edit `PLANNING.md` inline in this same PR (per the inline-doc-update convention resolved 2026-05-20):
+   - Append a parenthetical to the parent step's text: `(split mid-implementation per STANDARDS §4.2; criteria <list> moved to M<n>.<x>a/b/...)`.
+   - Insert new `*(human)*` sub-steps immediately after the parent step, named `M<n>.<x>a`, `M<n>.<x>b`, etc. Each sub-step's text restates the human-only criterion as a discrete action.
+   - Mark the parent step `[x]` — its remaining (agent-doable) scope is complete.
+3. Continue to Step 4 (tests) and Step 4.5 (adversary loop) normally.
+4. After invoking `commit` (Step 5), emit an additional `strategic` queue entry pointing at the new sub-steps. This is in addition to whatever queue/auto-merge action `commit` takes for the PR itself — different ask, different recipient mental model:
+
+```json
+{
+  "request_id": "<sha256 of repo + parent-step-id + 'mid-step-split'>",
+  "entry_type": "strategic",
+  "risk_tier": "medium",
+  "agent_name": "implementer",
+  "product_slug": "<repo basename, if available>",
+  "title": "[<slug>] PLANNING step <parent-id> split mid-implementation — <n> human sub-steps need your action",
+  "goal": "Complete the human-only criteria split out from <parent-id>",
+  "attempts": ["Implemented agent-doable scope of <parent-id> in PR #<n>", "Split human-only criteria into <list of new sub-step IDs> per STANDARDS §4.2 mid-step discovery"],
+  "ask": "Complete the new *(human)* sub-steps (<list>); check them off in PLANNING.md. Next implementer run will block on these per Case C until they're done.",
+  "recommendation": "Review the split in PR #<n>; if the partition is wrong, edit PLANNING.md to restore the parent step and reopen scope as needed before the next implementer run."
+}
+```
+
+**Case D2 — Ambiguous split (fallback).** Use this when you cannot cleanly partition the criteria — they're entangled, or you can't tell what's agent-doable without guessing. Do NOT commit anything. Same shape as Case B:
+
+```json
+{
+  "request_id": "<sha256 of repo + parent-step-id + 'mid-step-ambiguous-split'>",
+  "entry_type": "strategic",
+  "risk_tier": "medium",
+  "agent_name": "implementer",
+  "product_slug": "<repo basename, if available>",
+  "title": "[<slug>] PLANNING step <parent-id> mixes agent-doable and human-only work; how should I split it?",
+  "goal": "Implement <parent step text>",
+  "attempts": ["Identified human-only criteria via STANDARDS §4.2 heuristics: <list>", "Could not cleanly partition — criteria appear entangled"],
+  "ask": "Restructure <parent-id> in PLANNING.md to separate agent-doable scope from *(human)* sub-steps; re-run implementer once the split is committed.",
+  "recommendation": "<best-guess partition if you have one, else omit>"
+}
+```
+
+Log a final line and exit:
+
+```
+implementer: step <parent-id> needs split per STANDARDS §4.2; emitted strategic queue entry <id>. Exiting without commit.
+```
+
+Skip Steps 4–6.
+
+**Choosing between D1 and D2.** Default to D1. Fall back to D2 only when the partition is genuinely unclear — entangled phrasing, criteria that depend on each other in ways that can't be cleanly separated, or doubt about whether a criterion is human-only. When in doubt, prefer D2; it's better to stop and ask than to restructure PLANNING.md the wrong way and force Seth to unwind it.
 
 ### Step 4 — Run tests
 
