@@ -89,6 +89,8 @@ Output: a single `tier ∈ {low, medium, high}` plus a one-line rationale string
 
 ### Step 4: Branch, update canonical docs inline, commit, push, open PR
 
+> **Step 4 must complete before Step 5 starts.** Step 5 reads Step 4's output bundle (`<TIER>`, `<RATIONALE>`, `<STAGE>`, `<PR_NUMBER>`, `<PR_URL>`, `<CI_STATUS>`, `<MUST_ESCALATE_HIT>`, `<ADVERSARY_CONVERGED>`). Do not skip ahead — Step 5's first action is a guard that fails loudly if these are missing.
+
 **4a. Branch.**
 
 ```bash
@@ -120,21 +122,49 @@ git push -u origin <branch-name>
 
 **Conventional commit style:** check `git log --oneline -5`. If the repo uses `feat:`/`fix:`/`chore:`/etc., follow that. Otherwise plain imperative summary.
 
-**4d. Open the PR.**
+**4d. Open the PR with the three always-on labels.**
+
+Apply `tier:<TIER>`, `stage:<STAGE>`, and `commit-pending-merge` at open time, unconditionally. These three are audit/visibility labels, not routing artifacts — they apply on every PR this skill opens regardless of the eventual route. The fourth label (`auto-merge`) is applied later in Step 5 only if the decision tree lands on Route A.
 
 ```bash
 gh pr create --base main \
-  --title "<commit message summary>" \
-  --body "$(compose_pr_body)" \
-  --label "tier:<tier>,stage:<stage>,commit-pending-merge$(auto_merge_label)"
+  --title "<COMMIT_TITLE>" \
+  --body "<PR_BODY>" \
+  --label "tier:<TIER>" \
+  --label "stage:<STAGE>" \
+  --label "commit-pending-merge"
 ```
 
-PR labels (applied at open per `COMMIT_REDESIGN.md §7.1`):
+Capture the returned PR URL and number; both feed Step 5.
 
-- `tier:low` / `tier:medium` / `tier:high` — from Step 3.
-- `stage:<value>` — mirrored from `LIFECYCLE.md`.
-- `commit-pending-merge` — always; the merge fire-back loop queries on this.
-- `auto-merge` — only when Step 5 says auto-merge is allowed.
+**4e. Capture CI status.**
+
+```bash
+gh pr checks <PR_NUMBER> --json bucket,name,state
+```
+
+Reduce to a single value: `failed` if any required check has bucket `fail`; otherwise `pending` if any check is still running; otherwise `pass`. Record as `<CI_STATUS>`.
+
+**4f. Emit the Step 4 output bundle** (Step 5 reads these by name; do not proceed without them):
+
+| Name | Source | Example |
+| --- | --- | --- |
+| `<TIER>` | Step 3 output | `low` |
+| `<RATIONALE>` | Step 3 output | `matrix row: code — non-functional` |
+| `<STAGE>` | `LIFECYCLE.md` | `in-development` |
+| `<MUST_ESCALATE_HIT>` | Step 3a result | `false` |
+| `<ADVERSARY_CONVERGED>` | Step 2 result | `true` |
+| `<CI_STATUS>` | Step 4e | `pending` |
+| `<PR_NUMBER>` | Step 4d return | `42` |
+| `<PR_URL>` | Step 4d return | `https://github.com/.../pull/42` |
+| `<PR_TITLE>` | Step 4c commit summary | `feat: add SSO redirect` |
+| `<PRODUCT_SLUG>` | repo name or `LIFECYCLE.md` | `puzzle-pop` |
+| `<PLANNING_ANCHOR_URL>` | derived from `PLANNING.md` step ref | `https://github.com/.../PLANNING.md#m07` |
+| `<ADVERSARY_SUMMARY>` | Step 2 result string | `converged, no findings` |
+| `<TESTS_SUMMARY>` | `test-writer` output or `none` | `3 added, 0 untestable` |
+| `<RECOMMENDATION>` | composed from Step 2 + 4e | `Approve — all checks green` |
+
+**If `<ADVERSARY_CONVERGED> == false`,** Step 4d/4e/4f beyond this point are skipped (no PR is opened on Route C). In that case the bundle only requires `<TIER>`, `<RATIONALE>`, `<STAGE>`, `<MUST_ESCALATE_HIT>`, `<ADVERSARY_CONVERGED>`, `<PRODUCT_SLUG>`; the PR-related fields are absent by design. Step 5's guard accounts for this.
 
 ### PR body composition (per `COMMIT_REDESIGN.md §8`)
 
@@ -172,101 +202,160 @@ Fixed section order, conditional inclusion. Plain Markdown.
 
 ### Step 5: Gate — auto-merge, queue, or block
 
-Apply the (tier × stage) gating table from `STANDARDS.md §9`:
+This step is **mechanical**. Walk the decision tree top-down to a single terminal route, then run that route's pre-written command block, substituting placeholders only. Do not compose new shell commands. Do not re-interpret the §9 table — the tree below is the §9 table, pre-walked.
 
-| Stage | Auto-merge | Queue for approval |
-| --- | --- | --- |
-| `idea`, `mvp`, `in-development`, `graduated`, `deprecated` | All tiers | None |
-| `beta` | low, medium | high |
-| `production` | low | medium, high |
+**5a. Guard — verify Step 4 outputs exist.**
 
-**Overrides (in order):**
+Before touching the decision tree, confirm the bundle is set. The required set depends on whether the adversary loop converged:
 
-1. **CI red** → flip to MEDIUM queue entry. Never auto-merge red CI. Name the failing check in the packet.
-2. **Must-escalate match** → always queue at HIGH regardless of stage.
-3. **Adversary loop exception** → exception queue entry (different type), no merge attempt.
+- **Always required** (every run): `<TIER>`, `<RATIONALE>`, `<STAGE>`, `<MUST_ESCALATE_HIT>`, `<ADVERSARY_CONVERGED>`, `<PRODUCT_SLUG>`.
+- **Additionally required when `<ADVERSARY_CONVERGED> == true`** (i.e., Step 4d/4e ran and a PR exists): `<CI_STATUS>`, `<PR_NUMBER>`, `<PR_URL>`, `<PR_TITLE>`, `<PLANNING_ANCHOR_URL>`, `<ADVERSARY_SUMMARY>`, `<TESTS_SUMMARY>`, `<RECOMMENDATION>`.
 
-**Route A — auto-merge:**
+If any required name is missing, **stop immediately** and emit:
 
-```bash
-gh pr merge <pr-number> --auto --squash
+> Step 5 guard failed — Step 4 outputs missing: `<list-of-missing-names>`. Re-run Step 4 before proceeding.
+
+Do not pick a route. Do not attempt a merge or queue write. Missing outputs mean Step 4 didn't finish; pressing on produces exactly the brittleness the §11.3 entry resolves.
+
+**5b. Decision tree — terminate on the first matching branch.**
+
+Walk top-down. The first matching condition is the terminal route. Do not "average" branches or look further down the tree.
+
+```
+1. Is <ADVERSARY_CONVERGED> == false?
+     YES → Route C  (exception: adversary loop did not converge)
+
+2. Is <MUST_ESCALATE_HIT> == true?
+     YES → Route B  (queue, tier forced to HIGH per §9)
+
+3. Is <CI_STATUS> == failed?
+     YES → Route B  (queue, tier forced to MEDIUM per §9 / §7 override)
+
+4. (CI is pass or pending; no must-escalate; adversary converged.)
+   Branch on <STAGE>:
+
+     <STAGE> in {idea, mvp, in-development, graduated, deprecated}
+         → Route A  (auto-merge, any tier)
+
+     <STAGE> == beta
+         <TIER> in {low, medium} → Route A
+         <TIER> == high          → Route B
+
+     <STAGE> == production
+         <TIER> == low                  → Route A
+         <TIER> in {medium, high}       → Route B
+
+     <STAGE> unrecognized
+         → Route B  (fail up per §9 stage-default rule; note in packet)
 ```
 
-The `auto-merge` label tells branch protection to fire on green CI. Poll merge state every ~30s up to ~3 min:
+Every leaf is one of {Route A, Route B, Route C}. There are no ambiguous cases.
+
+**5c. Apply the `auto-merge` label iff Route A.**
+
+Mechanical, runs immediately after the route is decided. Skip if the route is B or C.
 
 ```bash
-gh pr view <pr-number> --json state,mergedAt
+gh pr edit <PR_NUMBER> --add-label "auto-merge"
 ```
 
-- Merged → proceed to Step 6.
-- 3-min timeout → tell Seth CI is slow, present the PR link, offer to keep waiting or pause. Skill exits cleanly; the merge poller (fleet-level cron, see "Merge fire-back" below) will pick it up later.
+**5d. Run the route's pre-written command block.** Substitute placeholders only.
 
-**Route B — queue for approval:**
+---
 
-POST an `approval` entry to the hub's queue and exit. The skill does NOT wait. The merge fire-back loop (out-of-process, see "Merge fire-back" below) resumes Step 6 when the entry is approved and merged.
+**Route A — auto-merge** (pre-written; substitute `<PR_NUMBER>` only):
+
+```bash
+gh pr merge <PR_NUMBER> --auto --squash
+```
+
+Then poll merge state for up to ~3 minutes (six iterations, ~30s each):
+
+```bash
+gh pr view <PR_NUMBER> --json state,mergedAt
+```
+
+- `state == MERGED` → proceed to Step 6.
+- 3-min timeout → tell Seth CI is slow, present `<PR_URL>`, exit cleanly. The merge fire-back loop will pick the PR up when CI finishes.
+
+---
+
+**Route B — queue for approval** (pre-written; substitute placeholders only):
 
 ```bash
 curl -X POST "${HUB_BASE_URL:-https://sethgibson.com}/api/v1/queue/entries" \
   -H "Content-Type: application/json" \
   -H "x-service-role-key: ${QUEUE_SERVICE_ROLE_KEY}" \
-  -d "$(compose_queue_packet)"
-```
-
-Packet shape (matches `STANDARDS.md §8` + the M3 API contract):
-
-```json
+  -d @- <<'JSON'
 {
-  "request_id": "<sha256 of pr_url — idempotent on re-run>",
+  "request_id": "<SHA256_OF_PR_URL>",
   "entry_type": "approval",
-  "risk_tier": "<low|medium|high>",
+  "risk_tier": "<TIER_FOR_PACKET>",
   "agent_name": "commit",
-  "title": "[<product-slug>] Ship PR #<n>: <PR title>",
-  "goal": "Ship PR #<n>: <PR title>",
+  "title": "[<PRODUCT_SLUG>] Ship PR #<PR_NUMBER>: <PR_TITLE>",
+  "goal": "Ship PR #<PR_NUMBER>: <PR_TITLE>",
   "attempts": [
-    "Adversary loop: <converged | findings noted in PR>",
-    "CI: <green | red — <failing check>>",
-    "Tests: <count added | none>"
+    "Adversary loop: <ADVERSARY_SUMMARY>",
+    "CI: <CI_STATUS_SUMMARY>",
+    "Tests: <TESTS_SUMMARY>"
   ],
   "ask": "Approve this PR for merge?",
-  "recommendation": "Approve — all checks green, no escalations. | <specifics if not>",
+  "recommendation": "<RECOMMENDATION>",
   "artifacts": [
-    { "label": "PR", "href": "<pr-url>", "artifact_type": "github-pr" },
-    { "label": "PLANNING step", "href": "<planning-anchor-url>", "artifact_type": "planning-step" }
+    { "label": "PR", "href": "<PR_URL>", "artifact_type": "github-pr" },
+    { "label": "PLANNING step", "href": "<PLANNING_ANCHOR_URL>", "artifact_type": "planning-step" }
   ]
 }
+JSON
 ```
 
-**Note on `product_id`:** the API expects a hub-side `products.id` (UUID), not a slug. v0 omits the field and encodes the product slug in `title` (the `[<slug>]` prefix above). A `§11.1` follow-up tracks adding slug→ID resolution at the hub so future packets can populate it properly.
+Placeholder rules for Route B:
 
-**On 2xx:** queue write succeeded. Tell Seth (or the calling agent):
+- `<TIER_FOR_PACKET>` = `high` if `<MUST_ESCALATE_HIT> == true`; else `medium` if reached via the CI-failed branch; else `<TIER>` unchanged.
+- `<SHA256_OF_PR_URL>` = `sha256(<PR_URL>)` — idempotent on re-run.
+- `<CI_STATUS_SUMMARY>` = `green` if `<CI_STATUS> == pass`; `pending` if `pending`; `red — <failing-check-name>` if `failed`.
+- `<ADVERSARY_SUMMARY>`, `<TESTS_SUMMARY>`, `<RECOMMENDATION>` = short summary strings carried from Steps 2 and 4.
+- `<PR_TITLE>`, `<PRODUCT_SLUG>`, `<PR_NUMBER>`, `<PR_URL>`, `<PLANNING_ANCHOR_URL>` = from Step 4 outputs.
 
-> PR #<n> opened and queued for approval — `<queue-entry-url>`. Skill exiting; resume runs after merge.
+**Note on `product_id`:** the API expects a hub-side `products.id` (UUID), not a slug. v0 omits the field and encodes the product slug in `title` (the `[<PRODUCT_SLUG>]` prefix). Slug→ID resolution at the hub is tracked as a `§11.1` follow-up.
 
-**On non-2xx, or `QUEUE_SERVICE_ROLE_KEY` missing:** fall back to legacy behavior — leave the PR open, tell Seth approval is needed in-chat, do not auto-merge:
+**On 2xx:** tell Seth (or the calling agent):
 
-> PR #<n> needs your approval (stage: <stage>, tier: <tier>). **[Review on GitHub](<pr-url>)**
-> Queue write failed (<reason>) — let me know when you've merged it.
+> PR #<PR_NUMBER> opened and queued for approval — `<PR_URL>`. Skill exiting; merge fire-back loop resumes after Seth approves.
 
-**Route C — block (exception):**
+**On non-2xx, or `QUEUE_SERVICE_ROLE_KEY` missing:** fall back to legacy in-chat approval; leave the PR open; do not auto-merge:
 
-For adversary-loop non-convergence or other hard failures, emit an `exception` entry instead of `approval`:
+> PR #<PR_NUMBER> needs your approval (stage: `<STAGE>`, tier: `<TIER>`). **[Review on GitHub](<PR_URL>)**
+> Queue write failed (`<reason>`) — let me know when you've merged it.
 
-```json
+---
+
+**Route C — block (exception)** (pre-written; substitute placeholders only):
+
+The PR is NOT opened in Route C — the diff stays on the local branch. Step 4d/4e are skipped when Step 2 already failed convergence; emit the exception entry directly.
+
+```bash
+curl -X POST "${HUB_BASE_URL:-https://sethgibson.com}/api/v1/queue/entries" \
+  -H "Content-Type: application/json" \
+  -H "x-service-role-key: ${QUEUE_SERVICE_ROLE_KEY}" \
+  -d @- <<'JSON'
 {
-  "request_id": "<sha256 of branch-name + timestamp>",
+  "request_id": "<SHA256_OF_BRANCH_PLUS_TIMESTAMP>",
   "entry_type": "exception",
-  "risk_tier": "<from Step 3>",
+  "risk_tier": "<TIER>",
   "agent_name": "commit",
-  "title": "[<product-slug>] commit blocked: <one-line cause>",
-  "goal": "<what the agent was trying to do>",
-  "attempts": [...],
-  "ask": "<what Seth needs to decide / clarify>",
-  "recommendation": "<optional>",
-  "artifacts": [ ... branch link, diff link, adversary report link ... ]
+  "title": "[<PRODUCT_SLUG>] commit blocked: <ONE_LINE_CAUSE>",
+  "goal": "<WHAT_AGENT_WAS_TRYING_TO_DO>",
+  "attempts": ["<ATTEMPT_BULLET>", "..."],
+  "ask": "<WHAT_SETH_NEEDS_TO_DECIDE>",
+  "recommendation": "<OPTIONAL>",
+  "artifacts": [
+    { "label": "Branch", "href": "<BRANCH_URL>", "artifact_type": "github-branch" },
+    { "label": "Adversary report", "href": "<ADVERSARY_REPORT_URL>", "artifact_type": "adversary-report" }
+  ]
 }
+JSON
 ```
-
-The PR is NOT opened in this case. The diff stays on the local branch.
 
 ### Step 6: Trigger staging deploy (auto-merge path only)
 
