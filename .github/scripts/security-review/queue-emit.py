@@ -216,7 +216,7 @@ def _compose_semantic_fail_packet(
         "recommendation": (
             "Retry once. If it fails again, check the CLAUDE_CODE_OAUTH_TOKEN "
             "status per STANDARDS §14 OAuth token rotation and the Anthropic "
-            "subscription's Agent SDK credit pool."
+            "subscription quota / usage-credit wallet (per §14 Billing buckets)."
         ),
         "artifacts": _artifacts(server_url, repo, pr_number, run_id),
     }
@@ -252,6 +252,14 @@ def _post_entry(hub_url: str, service_role_key: str, packet: dict) -> tuple[int,
         headers={
             "Content-Type": "application/json",
             "x-service-role-key": service_role_key,
+            # Explicit User-Agent — Python urllib's default `Python-urllib/3.x`
+            # gets caught by Cloudflare Bot Fight Mode (error 1010). Surfaced
+            # 2026-05-20 on the first implementer-loop fire on puzzle-pop PR #6
+            # — security-review's queue-emit got 1010'd while the commit skill's
+            # Node-based POST went through cleanly. Setting an identifiable UA
+            # avoids the heuristic without needing a Cloudflare rule change.
+            # See STANDARDS §11.3 milestone entry, drift #3.
+            "User-Agent": "aethrix-fleet-ci/1.0 (security-review queue-emit)",
         },
     )
     # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
