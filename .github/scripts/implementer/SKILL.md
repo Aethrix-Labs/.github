@@ -262,20 +262,32 @@ Then exit (no commit). Do NOT push code to a PR when the adversary loop cap-hits
 Read `.fleet-ci/.github/scripts/commit/SKILL.md` and follow its 8-step flow. The commit skill handles:
 
 - Tier classification (must-escalate parse + matrix + elevations)
+- Inline canonical-doc updates at Step 4b (`PLANNING.md`, `LIFECYCLE.md`, `CHANGELOG.md`, `PRODUCT.md`) — folded into the same commit as the code change. No separate post-merge cleanup phase.
 - Branch / commit / push / open PR with the right body composition + labels
 - Auto-merge (pre-prod) or queue for approval (post-prod) per the (tier × stage) gating table
-- Post-merge cleanup (the merge fire-back loop handles this asynchronously when it ships; until then, the auto-merge path runs cleanup inline)
+
+The implementer does NOT pre-update those docs itself — the commit skill owns Step 4b. Pass the step ID through so commit can flip the right PLANNING checkbox.
 
 **Pass the step ID to the commit skill** so the PR body's `## PLANNING.md step` section is populated correctly. Concretely: in the PR body's Summary, include "Closes step M<n>.<x>" so the commit skill's PR-body composer can pick it up.
 
+**Pass the implementer's `run_id` to the commit skill** (export as `IMPLEMENTER_RUN_ID` env var before invoking) so commit's four mid-flight activity records stitch into the same logical run as the implementer's `run-started` / `run-completed` bracket. Commit's records are required mid-flight observability per `STANDARDS §9` "Commit-skill exit contract" — when the implementer dies inside Step 5 (max-turns, crash), commit's `commit-started` / `tier-classified` / `pr-opened` / `commit-exited` records localize the failure to a phase boundary.
+
 ### Step 6 — Exit
 
-After commit fires (whether it auto-merged or queued for approval), this skill is done. **Do NOT loop into the next step.** The verify gate is the loop boundary.
+When the commit skill returns its terminal `exit_reason` (`auto_merge_initiated`, `queued`, `exception_emitted`, or `fallback_in_chat`), this skill is done. **Do NOT loop into the next step. Do NOT wait for the PR to actually merge, for CI to go green, or for staging deploy to succeed.** Those are all out-of-process per `STANDARDS §9` "Commit-skill exit contract" — GitHub's native auto-merge, branch protection, CD, and the merge fire-back loop (`§11.2`) own them. The verify gate is the loop boundary.
+
+Forbidden in this step (and anywhere in the implementer):
+
+- `gh pr view --json state,mergedAt` polling loops.
+- `gh pr checks <PR>` re-reads after Step 4e captured `<CI_STATUS>`.
+- `sleep` + retry on any merge-or-deploy signal.
+
+Each of those calls is one SDK turn. Polling for events that aren't this agent's responsibility is what burned puzzle-pop M1.7's 80-turn budget (2026-05-24) — see `STANDARDS §9`.
 
 Log a final line:
 
 ```
-implementer: step M<n>.<x> complete; PR <url>; gate=<auto-merge|queue>. Exiting.
+implementer: step M<n>.<x> complete; PR <url>; gate=<auto-merge|queue|exception|fallback>. Exiting.
 ```
 
 ---
@@ -378,7 +390,7 @@ The agent does NOT enforce concurrency. The central workflow does, via `concurre
 - **Multiple PLANNING steps per run.** One step per invocation; exits after commit. The verify gate is the loop boundary.
 - **Skip past `*(human)*`-marked steps.** Those are hard blockers per `STANDARDS §4.2`. Emit `strategic` queue entry (Step 3 Case C) and exit; do not advance to the next unchecked step. If Seth wants out-of-order execution, he reorders PLANNING.
 - **Decide tech-stack or major architecture.** Those are HIGH tier per `§9` elevation rules and always queue. If a step's acceptance criteria require such a decision, emit a `strategic` queue entry and exit (per Step 3 Case B ambiguity flow).
-- **Modify PLANNING.md itself beyond checking off the completed step.** That happens in the commit skill's post-merge cleanup (Step 6a). Restructuring or re-prioritizing PLANNING is Seth's lane.
+- **Modify PLANNING.md itself beyond what's needed for the completed step.** The commit skill's Step 4b owns inline doc updates (flipping the completed checkbox, refreshing LIFECYCLE/CHANGELOG/PRODUCT). Restructuring or re-prioritizing PLANNING is Seth's lane.
 - **Make creative or strategic calls.** Per `STANDARDS.md §10` — those queue as `strategic` entries. The agent prepares; Seth decides.
 - **Wait for queue entry resolution.** The skill exits after commit; the wake mechanism (when built) is what resumes the loop.
 - **Self-debug claude-code-action infrastructure issues.** Token expiry, quota exhaustion, etc. surface as workflow failures; the operator (or a future ops agent) handles them.
