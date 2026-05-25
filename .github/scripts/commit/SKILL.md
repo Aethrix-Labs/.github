@@ -388,15 +388,13 @@ This means `changelog-generator` and `doc-sync` are no longer fired as separate 
 
 ## Merge fire-back loop (out-of-process)
 
-When Step 5 takes the queue route, the skill emits the `approval` packet and exits. The PR sits on GitHub with the `commit-pending-merge` label, ready for Seth's queue approval. The bridge between "Seth approves the queue entry" and "GitHub merges the PR" is the **merge fire-back loop** — out-of-process fleet infrastructure tracked in `STANDARDS §11.2`. The loop's scope (post the 2026-05-20 simplification driven by the inline-doc-update pattern):
+When Step 5 takes the queue route, the skill emits the `approval` packet and exits. The PR sits on GitHub with the `commit-pending-merge` label, ready for Seth's queue approval. The merge fire-back loop (a `*/15 * * * *` Cloudflare Cron Trigger in the hub Worker) bridges "Seth approves the queue entry" → "GitHub merges the PR" via two passes each tick:
 
-1. Detect approved queue entries whose artifact PR is still labeled `commit-pending-merge`.
-2. Call GitHub's merge API on the PR.
-3. Optionally trigger staging deploy per the consumer repo's `DEPLOYMENT.md` (most fleet products auto-deploy on push to main via CD, in which case this is a no-op).
+**Pass 1 — queue-entry-driven (primary path).** Queries D1 for `approval` entries at `status=resolved`, `resolution_kind IN ('approved','approved-with-changes')`; fetches the `github-pr` artifact; verifies `commit-pending-merge` label; calls GitHub merge API; removes label on 2xx; emits `exception` entry on 405 (MFB.2); removes label silently on 422 (already merged).
 
-There's no post-merge doc cleanup to run — doc updates landed inline. v0 is a Cloudflare Cron Trigger + Worker handler that polls the queue and GitHub; v1 is a webhook from the hub. Tracked as a single row in `§11.2`.
+**Pass 2 — label-driven safety net (MFB.1).** Iterates all registered products, calls `GET /repos/:owner/:repo/issues?labels=commit-pending-merge` per repo, skips any PR URL already handled by pass 1. For each remaining stranded PR: reads its `tier:*` + `stage:*` labels, applies the `STANDARDS §9` gating table — if auto-merge eligible, calls `processPr` (same path as pass 1); if not, emits a post-hoc `approval` queue entry so the PR surfaces in the decision queue. The entry-driven path keeps priority; the safety net catches PRs where this skill's Steps 4+5 dropped the routing entirely. See `STANDARDS §11.1` (commit Steps 4+5 brittleness) for root-cause context; MFB.1 is the defense-in-depth layer.
 
-Until the loop ships, queue-routed PRs require manual merge after Seth approves the queue entry. The skill is forward-compatible (right labels, right packets) so when the loop lands, in-flight PRs get picked up without re-running this skill.
+There's no post-merge doc cleanup to run — doc updates landed inline at Step 4.
 
 ---
 

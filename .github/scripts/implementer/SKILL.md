@@ -52,13 +52,13 @@ git status --porcelain
 
 Output non-empty → there's uncommitted work in the repo. Exit with `::warning::implementer: working tree not clean; refusing to run`. Should never happen on a fresh checkout but worth checking in case the workflow is invoked on a non-default ref.
 
-**Guard 2 — PLANNING.md exists.**
+**Guard 2 — A work surface exists.**
 
-Check `/docs/PLANNING.md`, then `/PLANNING.md`. Missing both → exit with `::warning::implementer: no PLANNING.md found; nothing to do`.
+Check for `/docs/BACKLOG.md` (per `STANDARDS §4.3`) AND `/docs/PLANNING.md` (then `/PLANNING.md`). Missing both → exit with `::warning::implementer: no BACKLOG.md or PLANNING.md found; nothing to do`. Either one alone is sufficient — products may have only PLANNING.md (no in-the-wild reports yet) or only BACKLOG.md (post-launch fixes mode); both is the normal state.
 
-**Guard 3 — At least one unchecked step exists.**
+**Guard 3 — At least one unchecked item exists across either surface.**
 
-Grep PLANNING.md for `- [ ]` or `* [ ]`. Zero matches → exit with `::notice::implementer: all PLANNING.md steps complete`. This is the natural end-state for the product's current milestone; no error, just done.
+Grep BACKLOG.md (`## Open` section only — ignore `## Closed`) and PLANNING.md for `- [ ]` or `* [ ]`. Zero matches across both → exit with `::notice::implementer: all backlog items and PLANNING.md steps complete`. This is the natural end-state for the product's current scope; no error, just done.
 
 **Guard 4 — No unresolved verify entries on this product** *(deferred until hub GET endpoint exists).*
 
@@ -68,7 +68,25 @@ When the hub exposes `GET /api/v1/queue/entries?product=<slug>&status=open&entry
 
 ## The flow
 
-### Step 1 — Identify the next step
+### Step 1 — Identify the next work item
+
+**Backlog-first priority (per `STANDARDS §4.3`).** Before reading `PLANNING.md`, check `/docs/BACKLOG.md`:
+
+1. If the file exists, read its `## Open` section.
+2. Find the first `- [ ]` line in that section (top of the list = oldest entry, per `STANDARDS §4.3` ordering).
+3. Check for the `*(human)*` marker — if present, branch to Step 3 Case C with the backlog item's ID (`BL-<n>`) substituted for the step ID throughout the case's packet shape. Otherwise, this is the next work item; continue to "Read the item body" below.
+
+If `BACKLOG.md` doesn't exist OR `## Open` is empty, fall through to PLANNING.md milestone selection.
+
+**Read the item body (BACKLOG.md case).** The body is the indented bullets / paragraphs / embedded screenshots beneath the `- [ ]` line, up to the next `- [ ]` or `##` heading. Treat the body as the acceptance criteria for Step 3 Case A. The `BL-<n>` ID takes the place of the PLANNING step ID in all downstream Step 3 / Step 5 / activity-trail references.
+
+**Backlog-item elevation check.** Backlog items are tier-low by convention (per `STANDARDS §4.3`). During implementation, if you discover the item is actually tier-medium-or-higher (needs a feature flag, schema migration, multi-step coordination, public-API change), do NOT silently widen scope. Branch to Step 3 Case B with `ask: "Backlog item <BL-id> is larger than tier-low; recommend elevating to a PLANNING.md milestone step (or splitting). Exiting without commit."`, exit cleanly, leave the item un-closed in BACKLOG.md.
+
+If the backlog path produced a work item, **skip directly to Step 2**. The PLANNING-specific milestone scan below applies only when BACKLOG.md was empty.
+
+---
+
+**PLANNING.md fallback.** Reached only when BACKLOG.md has no open items.
 
 **Scope the read.** On long-lived products `PLANNING.md` accumulates many milestones. Don't read top-to-bottom blindly — that wastes tokens on completed work the agent doesn't need to reason about. Read in two passes:
 
@@ -268,7 +286,12 @@ Read `.fleet-ci/.github/scripts/commit/SKILL.md` and follow its 8-step flow. The
 
 The implementer does NOT pre-update those docs itself — the commit skill owns Step 4b. Pass the step ID through so commit can flip the right PLANNING checkbox.
 
-**Pass the step ID to the commit skill** so the PR body's `## PLANNING.md step` section is populated correctly. Concretely: in the PR body's Summary, include "Closes step M<n>.<x>" so the commit skill's PR-body composer can pick it up.
+**Pass the work item ID to the commit skill** so the PR body's closing section is populated correctly:
+
+- PLANNING.md step: include "Closes step M<n>.<x>" in the PR body's Summary; commit's Step 4b flips the checkbox in PLANNING.md.
+- BACKLOG.md item: include "Closes backlog item BL-<n>" in the PR body's Summary; commit's Step 4b moves the item from BACKLOG.md `## Open` to `## Closed` with date + PR number (per `STANDARDS §4.3` item shape).
+
+**Note (2026-05-25):** commit's Step 4b backlog-awareness ships as part of hub M15 (per-product bug/feedback submission). Until that lands, an implementer run that closes a backlog item leaves the BACKLOG.md item un-flipped — log `::warning::implementer: backlog item closure requires commit skill M15 update; BACKLOG.md update skipped` and proceed. The item will need a manual move from `## Open` to `## Closed` after the PR merges.
 
 **Pass the implementer's `run_id` to the commit skill** (export as `IMPLEMENTER_RUN_ID` env var before invoking) so commit's four mid-flight activity records stitch into the same logical run as the implementer's `run-started` / `run-completed` bracket. Commit's records are required mid-flight observability per `STANDARDS §9` "Commit-skill exit contract" — when the implementer dies inside Step 5 (max-turns, crash), commit's `commit-started` / `tier-classified` / `pr-opened` / `commit-exited` records localize the failure to a phase boundary.
 
@@ -387,7 +410,7 @@ The agent does NOT enforce concurrency. The central workflow does, via `concurre
 
 ## What this skill does NOT do
 
-- **Multiple PLANNING steps per run.** One step per invocation; exits after commit. The verify gate is the loop boundary.
+- **Multiple work items per run.** One PLANNING.md step OR one BACKLOG.md item per invocation; exits after commit. The verify gate is the loop boundary. Never mixes the two queues in a single run (per `STANDARDS §4.3` "Implementer priority rule").
 - **Skip past `*(human)*`-marked steps.** Those are hard blockers per `STANDARDS §4.2`. Emit `strategic` queue entry (Step 3 Case C) and exit; do not advance to the next unchecked step. If Seth wants out-of-order execution, he reorders PLANNING.
 - **Decide tech-stack or major architecture.** Those are HIGH tier per `§9` elevation rules and always queue. If a step's acceptance criteria require such a decision, emit a `strategic` queue entry and exit (per Step 3 Case B ambiguity flow).
 - **Modify PLANNING.md itself beyond what's needed for the completed step.** The commit skill's Step 4b owns inline doc updates (flipping the completed checkbox, refreshing LIFECYCLE/CHANGELOG/PRODUCT). Restructuring or re-prioritizing PLANNING is Seth's lane.
