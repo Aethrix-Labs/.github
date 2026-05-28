@@ -85,6 +85,16 @@ on:
         type: string
         required: false
         default: ""
+      session_id:
+        description: "Autonomous session ID from the hub play-button loop (M21). Empty on manual triggers."
+        type: string
+        required: false
+        default: ""
+      hub_url:
+        description: "Hub base URL for posting tick-reports (M21). Defaults to https://sethgibson.com."
+        type: string
+        required: false
+        default: "https://sethgibson.com"
 
 permissions:
   contents: write          # commit + push from the implementer agent
@@ -128,11 +138,15 @@ jobs:
           # Used by the commit skill's queue emission path (per STANDARDS §14
           # multi-storage credentials). Same secret security-review uses.
           QUEUE_SERVICE_ROLE_KEY: ${{ secrets.QUEUE_SERVICE_ROLE_KEY }}
+          # M21: tick-report auth token (separate from QUEUE_SERVICE_ROLE_KEY per m2m convention).
+          AUTONOMOUS_TICK_TOKEN: ${{ secrets.AUTONOMOUS_TICK_TOKEN }}
           # Dispatch payload passed through to the agent via env so the
-          # SKILL.md prompt can branch on action / verify_entry_id.
+          # SKILL.md prompt can branch on action / verify_entry_id / session_id.
           IMPLEMENTER_ACTION: ${{ inputs.action }}
           IMPLEMENTER_VERIFY_ENTRY_ID: ${{ inputs.verify_entry_id }}
           IMPLEMENTER_PRODUCT_SLUG: ${{ inputs.product_slug }}
+          IMPLEMENTER_SESSION_ID: ${{ inputs.session_id }}
+          IMPLEMENTER_HUB_URL: ${{ inputs.hub_url }}
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           prompt: |
@@ -199,6 +213,16 @@ on:
         type: string
         required: false
         default: ""
+      session_id:
+        description: "Autonomous session ID from hub play button (M21). Leave blank for manual triggers."
+        type: string
+        required: false
+        default: ""
+      hub_url:
+        description: "Hub base URL for tick-report POST (M21). Defaults to production hub."
+        type: string
+        required: false
+        default: "https://sethgibson.com"
 
 permissions:
   contents: write          # required so the callee can commit + push
@@ -212,6 +236,8 @@ jobs:
     with:
       action: ${{ inputs.action }}
       verify_entry_id: ${{ inputs.verify_entry_id }}
+      session_id: ${{ inputs.session_id }}
+      hub_url: ${{ inputs.hub_url }}
 ```
 
 **Notes:**

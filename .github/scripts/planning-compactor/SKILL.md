@@ -7,7 +7,7 @@ description: "Use this skill when a product's PLANNING.md has grown long and ful
 
 Cuts fully-completed milestones out of `docs/PLANNING.md` and appends them to `docs/PLANNING_ARCHIVE.md`, keeping the working planning doc focused on what's actually in flight. Also re-renders the milestone overview table so it reflects only the milestones that remain.
 
-**Spec source:** `STANDARDS.md §4.2` (PLANNING format) + `STANDARDS.md §9` "Milestone-close semantics" (the H2-milestone / H3-step / checkbox parsing contract this skill relies on).
+**Spec source:** `STANDARDS.md §4.2` (PLANNING format) + `STANDARDS.md §9` "Milestone-close semantics" (the `## M<n>` H2 + flat top-level checkbox parsing contract this skill relies on).
 
 **Why this skill exists.** `PLANNING.md` accumulates as a product matures. The implementer agent reads it on every step; humans scroll it whenever planning. Past ~600 lines, both readers suffer. The fix is mechanical: cut shipped milestones, keep them queryable in an archive file, leave the in-flight work in place. The skill exists because doing this by hand is tedious and easy to get wrong on a 700+ line file.
 
