@@ -38,7 +38,7 @@ Output:
 
 Reference docs the parser relies on:
   - STANDARDS.md §4.2 — PLANNING.md format
-  - STANDARDS.md §9   — H2-milestone / H3-step / checkbox parsing contract
+  - STANDARDS.md §9   — `## M<n>` H2-milestone / flat-checkbox-step parsing contract
 """
 
 from __future__ import annotations
