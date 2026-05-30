@@ -335,6 +335,7 @@ if [ -n "$IMPLEMENTER_SESSION_ID" ] && [ -n "$AUTONOMOUS_TICK_TOKEN" ]; then
       \"run_id\": \"$GITHUB_RUN_ID\",
       \"outcome\": \"$TICK_OUTCOME\",
       \"run_url\": \"${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}\",
+      \"pr_url\": \"$TICK_PR_URL\",
       \"work_item_id\": \"$TICK_WORK_ITEM_ID\",
       \"queue_entry_id\": \"$TICK_QUEUE_ENTRY_ID\"
     }" \
@@ -342,7 +343,7 @@ if [ -n "$IMPLEMENTER_SESSION_ID" ] && [ -n "$AUTONOMOUS_TICK_TOKEN" ]; then
 fi
 ```
 
-Set `TICK_OUTCOME` (from the table below), `TICK_WORK_ITEM_ID` (the step/BL-ID picked in Step 1), and `TICK_QUEUE_ENTRY_ID` (the queue entry ID emitted by the commit skill, if any — commit skill logs this as `queue_entry_id: <id>`). Omit `queue_entry_id` and `work_item_id` from the JSON if empty.
+Set `TICK_OUTCOME` (from the table below), `TICK_WORK_ITEM_ID` (the step/BL-ID picked in Step 1), `TICK_PR_URL` (the PR URL from the commit skill — same URL logged in the run-completed record; empty string if no PR was opened), and `TICK_QUEUE_ENTRY_ID` (the queue entry ID emitted by the commit skill, if any — commit skill logs this as `queue_entry_id: <id>`). Omit `pr_url`, `queue_entry_id`, and `work_item_id` from the JSON if empty.
 
 Log a final line:
 

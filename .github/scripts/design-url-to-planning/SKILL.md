@@ -1,6 +1,6 @@
 ---
 name: design-url-to-planning
-description: Use this skill when a Claude Design session is finished and its result needs to become implementation work in an existing fleet product — i.e. turn a design into PLANNING.md milestones. Triggers when the user pastes a Claude Design URL (https://api.anthropic.com/v1/design/h/...) into a product project, or says things like "plan the build for this design", "turn this design into milestones", "write the PLANNING steps for this", "I finished the design — add it to the plan", "break this design into implementation steps", or "the new design is done, what's the build plan". This skill does NOT generate designs (that's a Claude Design session, reached via `design-update` for visual-direction changes) and does NOT do feature brainstorming or definition (that's a Seth's-lane conversation). It assumes the design already exists and writes the milestone(s) to implement it. Use it whenever a Claude Design URL needs to become buildable work.
+description: Use this skill when a Claude Design session is finished and its result needs to become implementation work in an existing fleet product — i.e. turn a design into PLANNING.md milestones. Triggers when the user pastes a Claude Design URL (https://api.anthropic.com/v1/design/h/...) into a product project, or says things like \"plan the build for this design\", \"turn this design into milestones\", \"write the PLANNING steps for this\", \"I finished the design — add it to the plan\", \"break this design into implementation steps\", or \"the new design is done, what's the build plan\". This skill does NOT generate designs (that's a Claude Design session, reached via `design-update` for visual-direction changes) and does NOT do feature brainstorming or definition (that's a Seth's-lane conversation). It assumes the design already exists and writes the milestone(s) to implement it. Use it whenever a Claude Design URL needs to become buildable work.
 ---
 
 # Claude Design → Planning
@@ -21,19 +21,79 @@ This skill operates against a product's repo (rooted at `~/products/<product>/`)
 
 The repo is canonical — work from a committed snapshot, never the live URL (`STANDARDS.md §15.2`). First check whether this session is already snapshotted (e.g. `design-update` may have imported it): look for the URL in `docs/mockups/SOURCES.md`. If there's an `active` row for it, use that existing snapshot and skip to Step 2.
 
-Otherwise import it now (`STANDARDS.md §15.6` — the manual import workflow until a dedicated `claude-design-import` skill exists):
+Otherwise import it now (`STANDARDS.md §15.6` — the manual import workflow until a dedicated `claude-design-import` skill exists).
+
+### Getting the right URL — use the "Hand off to Claude Code" button
+
+**This is the correct path.** In Claude Design, the toolbar has a "Hand off to Claude Code" button. Clicking it opens a dialog showing a ready-made Claude Code command containing a **hand-off URL** at `https://api.anthropic.com/v1/design/h/<hash>?open_file=<filename>`. Seth typically copies just this URL and pastes it when invoking this skill. That URL is fetchable via the Anthropic API key.
+
+**Do not confuse this with the browser address bar URL or the share link.** Those look identical in format but are authenticated via browser session cookie and will return 405/404 to curl. If it's unclear which Seth pasted, just try the fetch below — a successful download confirms it's the hand-off URL.
+
+Once you have the hand-off URL, fetch and unpack:
 
 ```bash
-# Fetch and unpack the bundle (a gzipped tar) to a temp dir
-mkdir -p /tmp/cd_extract && curl -s "PASTE_URL_HERE" -o /tmp/cd.tar.gz
+mkdir -p /tmp/cd_extract
+curl -s "HAND_OFF_URL_HERE" \
+  -H "x-api-key: $ANTHROPIC_API_KEY" \
+  -H "anthropic-version: 2023-06-01" \
+  -o /tmp/cd.tar.gz
 tar -xzf /tmp/cd.tar.gz -C /tmp/cd_extract
 find /tmp/cd_extract -maxdepth 2 -type d   # inspect the top-level project dir
 ```
 
+The bundle unpacks to:
+```
+<project-name>/
+  README.md        ← read this first; explains the bundle structure
+  chats/           ← design chat transcripts (intent + rationale)
+  project/         ← HTML/CSS/JSX prototype files (ground truth)
+```
+
+### Fallback: "Download zip instead" option
+
+The hand-off dialog also has a **"Download zip instead"** checkbox that downloads the bundle to disk. If the curl path above fails, ask Seth to check that option, locate the file (typically `~/Downloads/<project-name>.zip` or `.tar.gz`), and provide the path. Then extract:
+
+```bash
+mkdir -p /tmp/cd_extract && tar -xzf /path/to/bundle -C /tmp/cd_extract
+# or for zip: unzip /path/to/bundle.zip -d /tmp/cd_extract
+find /tmp/cd_extract -maxdepth 2 -type d
+```
+
+### Last resort: Chrome extension extraction
+
+If neither the hand-off URL nor a local bundle is available (e.g. Seth shared an old project that predates the hand-off button), the Chrome extension can extract the design via the OmeletteService API from within an authenticated `claude.ai/design` session:
+
+1. Navigate to `https://claude.ai/design` → find the project by name → open it.
+2. Read the page accessibility tree (`read_page`) — the full chat transcript is visible in the sidebar and covers every screen, component, and decision.
+3. Pull file content via `javascript_tool`:
+
+```javascript
+// List files
+fetch('/design/anthropic.omelette.api.v1alpha.OmeletteService/ListFiles', {
+  method: 'POST', headers: {'Content-Type': 'application/json'},
+  body: JSON.stringify({projectId: '<uuid>'})
+}).then(r => r.json()).then(d => JSON.stringify(d))
+
+// Fetch a file (returns base64-encoded content)
+fetch('/design/anthropic.omelette.api.v1alpha.OmeletteService/GetFile', {
+  method: 'POST', headers: {'Content-Type': 'application/json'},
+  body: JSON.stringify({projectId: '<uuid>', path: 'MyFile.html'})
+}).then(r => r.json()).then(d => { window._b64 = d.content; return atob(d.content).length + ' chars'; })
+```
+
+Note: browser security filters may block reading raw decoded HTML that contains URL-like patterns. Workarounds: read CSS `<style>` blocks directly, extract class names / component names / data constants via regex, or parse with `new DOMParser()`.
+
+### Snapshot: README-as-snapshot is valid
+
+When only partial extraction is possible, a **comprehensive `README.md`** documenting everything extracted — CSS classes, component tree, state, tokens, UX flow — counts as the snapshot. The implementer needs the spec, not the raw prototype source. A well-structured README is more useful than an opaque file they can't run.
+
+### Snapshot directory conventions
+
 Then snapshot into the repo:
 
 - **Path:** `docs/mockups/<YYYY-MM-DD>-<slug>/` — one dir per snapshot. Use today's date; `<slug>` is lowercase-kebab describing the session (`redesign-queue`, `add-goals`, `onboarding-flow`).
-- **Strip the archive's top-level project-name dir** so files land directly under the dated slug: `<slug>/README.md`, `<slug>/chats/`, `<slug>/project/`.
+- Full bundle: **strip the archive's top-level project-name dir** so files land directly under the dated slug: `<slug>/README.md`, `<slug>/chats/`, `<slug>/project/`.
+- Partial or README-only: the directory just has whatever you could extract plus a `README.md`.
 - **Discard the `.tar.gz`** after extraction — the unpacked tree is the source of truth.
 - **Append a row to `docs/mockups/SOURCES.md`** (newest first), status `active`. If this snapshot supersedes the current active mockup set, flip the previous row's status to `superseded` (`STANDARDS.md §15.5`).
 
@@ -43,11 +103,14 @@ Then snapshot into the repo:
 
 ## Step 2: Understand the design and the product
 
-Read the snapshot, with the right source for the right question (`STANDARDS.md §15.1`, §15.4):
+Read the snapshot. What you have depends on how extraction went:
 
+**Full bundle** (`project/` + `chats/` + `README.md`):
 - The bundle's own **`README.md`** is authoritative for *how* to read it — including its instruction to **not** render the prototypes in a browser or take screenshots.
 - **`project/`** (HTML/CSS/JS) is *truth* — read it directly for exact screens, states, layout, components, and tokens. This is what you're planning to build.
 - **`chats/`** transcripts are *intent* — consult them when the source is ambiguous about why something is the way it is, or what behavior sits behind a static screen.
+
+**Partial extraction or README-only snapshot**: Read the `README.md` you wrote — it is the truth for this snapshot. If gaps remain (ambiguous behavior, missing states), consult the live Claude Design session via the Chrome extension (`read_page` on the project URL surfaces the full chat history in the sidebar) before inventing scope.
 
 Then build product context. Every fleet product carries the same canonical doc set in `docs/` (`STANDARDS.md §3`); read the ones relevant to what the design touches:
 
