@@ -18,7 +18,7 @@ Decides the tech stack for a single product. Reads the PRD, evaluates candidate 
 The skill blocks before running if any of these are missing:
 
 1. **`docs/PRD.md` with a Publish form section.** The PRD must declare the deployment target — one of: web app, mobile app, SaaS, agent, automation — plus tenancy and distribution qualifiers when relevant (e.g., "web app, single-user, internal-only"). Vocabulary per `STANDARDS.md §11.3` (G3 resolution). Without this, candidates can't be scoped.
-2. **`FLEET_TECH.md`**, read from the fleet command center repo at `~/products/sethgibson-com/docs/FLEET_TECH.md` (Windows: `C:\Users\wgibs\products\sethgibson-com\docs\FLEET_TECH.md`). Path convention per `STANDARDS.md §2.1`. Read it fully on every run — hard defaults, soft conventions, opt-ins, parked surfaces, and per-product inventory all live here.
+2. **`FLEET_TECH.md`**, read from the fleet command center repo at `~/products/docs/FLEET_TECH.md` (Windows: `C:\Users\wgibs\products\docs\FLEET_TECH.md`). Path convention per `STANDARDS.md §2.1`. Read it fully on every run — hard defaults, soft conventions, opt-ins, parked surfaces, and per-product inventory all live here.
 3. **`docs/LIFECYCLE.md`** for the target product (if the repo exists yet). Used for the `monetized` flag and stage context. New products being scaffolded won't have this yet — that's fine; default `monetized: false`, stage `idea`.
 
 If `PRD.md` is missing or has no Publish form section, stop and ask Seth to address it. Don't guess the form factor — the rest of the workflow depends on it. If `FLEET_TECH.md` can't be located, escalate as a fleet-infra access issue; don't proceed without it.
