@@ -1,6 +1,7 @@
 ---
 name: implementer
-description: "Use this skill when an agent (typically the central implementer workflow) needs to advance a product's PLANNING.md by one step — read PLANNING, pick the next unblocked unchecked step, implement it, run tests, and invoke the `commit` skill to wrap up. Always exits after one step; the verify gate is the loop boundary. Triggers in CI on `workflow_dispatch` (manual or hub-mediated wake) and is not typically invoked on-demand by Seth — for one-off code work, just use Claude Code directly."
+description: "Use this skill when an agent (typically the central implementer workflow) needs to advance a product's PLANNING.md by one step — read PLANNING, pick the next unblocked unchecked step, implement it, run tests, and invoke the `commit` skill to wrap up. Honors a hub-directed target (M25) when supplied; otherwise picks BACKLOG-first. Always exits after one step; the verify gate is the loop boundary. Triggers in CI on `workflow_dispatch` (manual or hub-mediated wake) and is not typically invoked on-demand by Seth — for one-off code work, just use Claude Code directly."
+canonical_source: fleet-command-center/skills/implementer/SKILL.md
 ---
 
 # Implementer Skill
@@ -22,6 +23,8 @@ From the workflow's dispatch payload:
 - `product_slug` — repo name (defaults to `$GITHUB_REPOSITORY` basename).
 - `session_id` — optional. The autonomous session ID from the hub play-button loop (M21). Empty on manual triggers. When set, a tick-report POST is sent at exit (see Step 6).
 - `hub_url` — optional. Hub base URL for tick-report POST (default: `https://sethgibson.com`). Set by the hub's `dispatchImplementer` call.
+- `target_kind` — optional (M25). The hub picker's **directed target kind**: `"backlog"` or `"milestone"`. Read from `$IMPLEMENTER_TARGET_KIND`. Empty on legacy callers and manual triggers — empty means "no directed target; pick BACKLOG-first as before." When set, Step 1 binds work-picking to the target instead of scanning BACKLOG-first.
+- `target_ref` — optional (M25). The directed target's ref: `BL-<n>` for a backlog item, `M<n>` for a milestone. Read from `$IMPLEMENTER_TARGET_REF`. Only meaningful when `target_kind` is set.
 
 From the workflow environment:
 
@@ -82,6 +85,26 @@ Send tick-report at exit if `session_id` is set (see Step 6).
 ## The flow
 
 ### Step 1 — Identify the next work item
+
+**Directed-target check first (M25).** Before the BACKLOG-first scan, read `$IMPLEMENTER_TARGET_KIND` / `$IMPLEMENTER_TARGET_REF`.
+
+- **Both empty** (legacy callers, manual Actions-UI triggers, no-target hub dispatch) → there is no directed target. Skip the rest of this subsection and use the **Backlog-first priority** logic below, exactly as before. This is the unchanged default.
+- **`target_kind` set** → the hub has bound this session to a specific target. **Honor it; do NOT run the BACKLOG-first scan.** The target selects both the surface and the item directly:
+
+  **`target_kind == "milestone"`** (`target_ref` is `M<n>`):
+  1. Locate the `## <target_ref>` heading in `/docs/PLANNING.md` (or `/PLANNING.md`). If the milestone heading doesn't exist (renamed / removed since the picker enumerated it), treat as "no work" — log `::notice::implementer: directed milestone <target_ref> not found; nothing to do` and exit cleanly with tick-outcome `guard-tripped` (the orchestrator's target-scoped check will mark the session `done`). Do not fall back to BACKLOG-first — a directed dispatch must never silently pick something else.
+  2. Within that milestone, find the **first** `- [ ]` / `* [ ]` step that is (a) not preceded by an unresolved `**Blocked by:**` annotation and (b) does not begin with `*(human)*` — same qualifying rules as the PLANNING.md fallback below. That step is the work item.
+  3. If the milestone has **no** qualifying step (all done, all blocked, or all `*(human)*`), log `::notice::implementer: directed milestone <target_ref> has no unblocked step; nothing to do` and exit cleanly with tick-outcome `guard-tripped`. (The picker only offers milestones with ≥1 unblocked step and the start route 422s stale targets, but a step can be consumed between enumeration and dispatch — handle it defensively, never by diverting to another target.)
+  4. Apply the same `*(human)*` marker check and the acceptance-criteria human-only scan as the normal path (branch to Step 3 Case C / Case D when they fire). Then continue to **Step 2**.
+
+  **`target_kind == "backlog"`** (`target_ref` is `BL-<n>`):
+  1. In `/docs/BACKLOG.md` `## Open`, find the `- [ ]` item whose ID is `<target_ref>`. If it's gone (already closed / not found), log `::notice::implementer: directed backlog item <target_ref> not found in ## Open; nothing to do` and exit cleanly with tick-outcome `guard-tripped`.
+  2. If the item's text begins with `*(human)*` → branch to Step 3 Case C with `<target_ref>` substituted for the step ID. Otherwise read its body as the acceptance criteria (same "Read the item body" rules as below) and treat it as the work item.
+  3. The **backlog-item elevation check** (below) still applies. Then continue to **Step 2**.
+
+  **One step per invocation is unchanged.** Even for a milestone target, this skill implements exactly the *next* unblocked step and exits. "A milestone advances up to the cap of 3" is the **orchestrator's** behavior (it re-dispatches the same sticky target for the next tick per `AUTONOMOUS_DEV.md §5`), not this skill's. The skill never loops within a milestone.
+
+  **Sticky target — never re-derive.** The target comes only from the dispatch inputs. Do not re-pick BACKLOG-first "because a backlog item looks more urgent." The hub owns *which* target; this skill owns *how* to implement the next step of it. A backlog item appearing mid-milestone-run is invisible to a milestone-targeted run by construction (you never scan BACKLOG when a milestone target is set).
 
 **Backlog-first priority (per `STANDARDS §4.3`).** Before reading `PLANNING.md`, check `/docs/BACKLOG.md`:
 
@@ -389,6 +412,8 @@ curl -X POST "${HUB_BASE_URL:-https://sethgibson.com}/api/v1/activity/entries" \
       "step_id": "<M2.7>",
       "step_text": "<full step text>",
       "case": "A" | "B" | "C",
+      "target_kind": "<milestone|backlog|null>",
+      "target_ref": "<M<n>|BL-<n>|null>",
       "github_run_id": "$GITHUB_RUN_ID",
       "github_sha": "$GITHUB_SHA"
     }
