@@ -95,6 +95,16 @@ on:
         type: string
         required: false
         default: "https://sethgibson.com"
+      target_kind:
+        description: "Directed target kind from the hub picker (M25): 'backlog' | 'milestone'. Empty = BACKLOG-first auto-pick (legacy / manual triggers)."
+        type: string
+        required: false
+        default: ""
+      target_ref:
+        description: "Directed target ref (M25): BL-<n> for a backlog item, M<n> for a milestone. Empty when target_kind is empty."
+        type: string
+        required: false
+        default: ""
 
 permissions:
   contents: write          # commit + push from the implementer agent
@@ -147,6 +157,9 @@ jobs:
           IMPLEMENTER_PRODUCT_SLUG: ${{ inputs.product_slug }}
           IMPLEMENTER_SESSION_ID: ${{ inputs.session_id }}
           IMPLEMENTER_HUB_URL: ${{ inputs.hub_url }}
+          # M25: directed target (empty = BACKLOG-first, unchanged).
+          IMPLEMENTER_TARGET_KIND: ${{ inputs.target_kind }}
+          IMPLEMENTER_TARGET_REF: ${{ inputs.target_ref }}
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           prompt: |
@@ -167,6 +180,10 @@ jobs:
             - Action: $IMPLEMENTER_ACTION (default "next-step").
             - Verify entry ID: $IMPLEMENTER_VERIFY_ENTRY_ID (empty on manual triggers).
             - Product slug: $IMPLEMENTER_PRODUCT_SLUG (or derive from $GITHUB_REPOSITORY).
+            - Directed target (M25): $IMPLEMENTER_TARGET_KIND / $IMPLEMENTER_TARGET_REF.
+              When set, work THAT target per SKILL.md Step 1 (milestone -> next
+              unblocked step; backlog -> that item). When empty, pick BACKLOG-first
+              as before.
 
             Exit after ONE step. The verify gate is the loop boundary.
             Do not chain into the next step.
@@ -223,6 +240,16 @@ on:
         type: string
         required: false
         default: "https://sethgibson.com"
+      target_kind:
+        description: "Directed target kind from hub picker (M25): 'backlog' | 'milestone'. Leave blank for BACKLOG-first manual triggers."
+        type: string
+        required: false
+        default: ""
+      target_ref:
+        description: "Directed target ref (M25): BL-<n> or M<n>. Leave blank when target_kind is blank."
+        type: string
+        required: false
+        default: ""
 
 permissions:
   contents: write          # required so the callee can commit + push
@@ -238,6 +265,8 @@ jobs:
       verify_entry_id: ${{ inputs.verify_entry_id }}
       session_id: ${{ inputs.session_id }}
       hub_url: ${{ inputs.hub_url }}
+      target_kind: ${{ inputs.target_kind }}
+      target_ref: ${{ inputs.target_ref }}
 ```
 
 **Notes:**
@@ -247,6 +276,7 @@ jobs:
 - **Repo-level Actions settings caveat.** If `<product-repo>` → Settings → Actions → General → "Workflow permissions" is set to "Read repository contents and packages permissions" (default), the block above is sufficient — workflow-level grants up to the configured ceiling work. If it's set to read-only with no bump path, the block won't help; bump the repo (or org) setting first.
 - `@main` ref means the product picks up central updates automatically on next dispatch. Pin to a tag if a product needs to freeze.
 - The `action: choice` dropdown is for Seth's manual triggers from the Actions UI. The wake mechanism (when built) passes the field programmatically; both surfaces use the same workflow.
+- **`target_kind` / `target_ref` (M25, 2026-06-02)** are the hub's directed-target inputs. The hub's `dispatchImplementer` passes them; manual Actions-UI triggers leave them blank, which reproduces BACKLOG-first auto-pick exactly. Backward-compatible by design — a stub that hasn't been re-vended yet (no `target_*` inputs) just can't receive a target, so it stays BACKLOG-first rather than breaking. The hub cutover (M25.5+) is gated on every active stub carrying these inputs.
 
 ---
 
