@@ -28,6 +28,16 @@ on:
         type: string
         required: false
         default: "https://sethgibson.com"
+      target_kind:
+        description: "Directed target kind from the hub picker (M25): 'backlog' | 'milestone'. Empty = BACKLOG-first auto-pick (legacy / manual triggers)."
+        type: string
+        required: false
+        default: ""
+      target_ref:
+        description: "Directed target ref (M25): BL-<n> for a backlog item, M<n> for a milestone. Empty when target_kind is empty."
+        type: string
+        required: false
+        default: ""
 
 permissions:
   contents: write # commit + push from the implementer agent
@@ -80,6 +90,9 @@ jobs:
           IMPLEMENTER_PRODUCT_SLUG: ${{ inputs.product_slug }}
           IMPLEMENTER_SESSION_ID: ${{ inputs.session_id }}
           IMPLEMENTER_HUB_URL: ${{ inputs.hub_url }}
+          # M25: directed target (empty = BACKLOG-first, unchanged).
+          IMPLEMENTER_TARGET_KIND: ${{ inputs.target_kind }}
+          IMPLEMENTER_TARGET_REF: ${{ inputs.target_ref }}
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           prompt: |
