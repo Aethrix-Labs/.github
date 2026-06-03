@@ -244,3 +244,53 @@ jobs:
           python3 .fleet-ci/.github/scripts/security-review/queue-emit.py \
             --deterministic-findings deterministic-findings.json \
             --semantic-findings semantic-findings.json
+
+  # M26.3 (DECISIONS.md 2026-06-03) — CI-green trigger for the low-risk
+  # autonomous self-merge path. The fleet's CI topology has security-review as
+  # a SEPARATE org-level required workflow (not a check inside the implementer's
+  # own run), so a low-risk PR is NOT mergeable at tick-report time. The hub
+  # therefore holds the session in `paused-merge` and waits for a CI-completion
+  # event to release it (AUTONOMOUS_DEV.md §3 step 5 "event-released" shape;
+  # MERGE_FLOW_SPEC.md §5 option (a)). This job is that event: when the required
+  # workflow goes green it pings the hub, which correlates the PR to a waiting
+  # `paused-merge` session and fires the synchronous `mergePr()`.
+  #
+  # `needs: [deterministic, semantic]` + the default success() gate means this
+  # job runs ONLY when both gating jobs succeeded — i.e. the required workflow
+  # is green. A critical dep-audit or semantic finding fails its job, so this
+  # never fires on a red PR. A legitimately-skipped semantic review (§3.3 gate)
+  # still leaves the semantic job green, so green-with-skip correctly pings.
+  merge-ready:
+    runs-on: ubuntu-latest
+    needs: [deterministic, semantic]
+    if: success()
+    permissions:
+      contents: read
+    steps:
+      - name: Notify hub that the PR is merge-ready
+        env:
+          # m2m bearer — same scoped secret M21 uses for tick-reports
+          # (STANDARDS §14; OAuth = user context, m2m secret = system context).
+          AUTONOMOUS_TICK_TOKEN: ${{ secrets.AUTONOMOUS_TICK_TOKEN }}
+          HUB_URL: https://sethgibson.com
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: |
+          # Best-effort by design: the PR is green and merge-worthy regardless
+          # of whether this ping lands. A non-2xx or transport failure is
+          # recovered by the hub's defensive `paused-merge` reconcile — so this
+          # step must NEVER fail the required workflow (no `set -e`, no exit 1).
+          if [ -z "$AUTONOMOUS_TICK_TOKEN" ]; then
+            echo "::warning::AUTONOMOUS_TICK_TOKEN not set — skipping merge-ready ping"
+            exit 0
+          fi
+          code=$(curl -sS -m 15 -o /tmp/merge-ready.out -w '%{http_code}' \
+            -X POST "$HUB_URL/api/autonomous/merge-ready" \
+            -H "Authorization: Bearer $AUTONOMOUS_TICK_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"pr_url\":\"$PR_URL\"}") \
+            || { echo "::warning::merge-ready ping could not reach the hub — reconcile will recover"; exit 0; }
+          echo "merge-ready → HTTP $code for $PR_URL"
+          cat /tmp/merge-ready.out 2>/dev/null || true
+          if [ "$code" -ge 400 ]; then
+            echo "::warning::merge-ready returned HTTP $code — hub reconcile will recover"
+          fi
