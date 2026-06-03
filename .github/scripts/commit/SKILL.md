@@ -1,34 +1,58 @@
 ---
 name: commit
-description: "Use this skill whenever the user wants to save their work to version control — even if they phrase it casually. Triggers on: \"commit\", \"commit my changes\", \"ship this\", \"push this up\", \"create a PR\", \"open a pull request\", \"let's save this\", \"wrap this up\", or anything suggesting they want their current changes in git. Reads `LIFECYCLE.md` stage + classifies the diff's risk tier to decide whether to auto-merge, queue for approval at the hub, or block. Always use this skill for any git commit or PR action, even if the request seems simple."
+description: "Use this skill when the implementer agent in CI has a completed work item ready to ship — classify the diff's risk tier, fold canonical-doc updates into the same commit, open the PR, and route to auto-merge, hub-queue approval, or exception. Invoked by the implementer's Step 6 inside the autonomous loop; CI-only. NOT for manual or interactive commits — for those use `simple-commit` or work directly in Claude Code."
+canonical_source: fleet-command-center/skills/commit/SKILL.md
 ---
 
 # Commit Skill
 
-The gate between work and version history. Runs autonomously: the implementation agent invokes this when a `PLANNING.md` step is complete and tests pass. Also runs on manual trigger from Seth ("commit", "ship it", etc.).
+The gate between work and version history. CI-only: invoked by the implementer agent (its Step 6) when a work item's changes are complete and tests have run. There is no interactive mode — the skill never asks a real-time question; all human interaction happens via the hub's decision queue per `STANDARDS.md §7`.
 
-Wraps a feature in a PR, classifies the diff's risk, and routes to one of three outcomes:
+Wraps the diff in a PR, classifies its risk, and routes to one of three outcomes:
 
-- **Auto-merge** on green CI (pre-prod stages, or low-tier in beta, or low-tier in production)
-- **Queue for approval** at the hub (medium/high-tier post-prod, or must-escalate match)
-- **Block** with an exception queue entry (CI red, adversary loop didn't converge, etc.)
+- **Auto-merge** (pre-prod stages, or low-tier in beta, or low-tier in production) — apply the `auto-merge` label and exit; the hub merges when CI goes green.
+- **Queue for approval** at the hub (medium/high-tier post-prod, or must-escalate match).
+- **Block** with an exception queue entry (adversary non-convergence, doc-update failure, etc.).
 
-The skill never asks Seth a real-time question. All interaction is via the hub's decision queue per `STANDARDS.md §7`.
-
-References: `STANDARDS.md §7` (queue spec), `§8` (escalation packet), `§9` (risk matrix + gating table + must-escalate), `§17` (fleet CI centralization), `COMMIT_REDESIGN.md` (full design spec).
+References: `STANDARDS.md §7` (queue spec), `§8` (escalation packet), `§9` (risk matrix + gating table + must-escalate + exit contract), `§17` (fleet CI centralization), `COMMIT_REDESIGN.md` (original design spec). Packet and activity-record templates: `.fleet-ci/.github/scripts/commit/PACKETS.md` — SKILL.md names variants, PACKETS.md holds the JSON.
 
 ---
 
-## Prerequisites
+## Inputs
 
-- `git` and `gh` (GitHub CLI) available and authenticated.
-- Repo has `/docs/LIFECYCLE.md` with a `stage:` header per `STANDARDS.md §4`.
-- For queue emission: `QUEUE_SERVICE_ROLE_KEY` env var must be set to the hub's service-role secret. The hub URL defaults to `https://sethgibson.com` — override with `HUB_BASE_URL` if needed.
-- If `QUEUE_SERVICE_ROLE_KEY` is missing AND the diff routes to "queue for approval", fall through to the legacy "wait for confirmation in chat" behavior and emit a warning that the queue write was skipped.
+From the calling implementer:
+
+- The completed diff on the working tree (uncommitted, on `main` of a fresh checkout).
+- The work item ID (`M<n>.<x>` or `BL-<n>`) — drives the PR body's closing line and Step 4b's checkbox/backlog flip.
+- `<ADVERSARY_CONVERGED>` / `<ADVERSARY_SUMMARY>` — the adversary loop result. The implementer owns and has already run the loop (its Step 5); this skill never re-runs it.
+- `<TESTS_SUMMARY>` — test results from the implementer's Step 4, or `none`.
+- `$IMPLEMENTER_RUN_ID` env var — stitches this skill's four activity records into the implementer's run bracket.
+
+From the environment:
+
+- `git` and `gh` available and authenticated (CI runner standard).
+- `/docs/LIFECYCLE.md` with a `stage:` header per `STANDARDS.md §4`.
+- `$QUEUE_SERVICE_ROLE_KEY` — queue + activity writes. Hub URL defaults to `https://sethgibson.com`; override with `HUB_BASE_URL`.
+
+## Exit contract (per `STANDARDS §9`)
+
+This skill terminates with exactly one `exit_reason`, reported back to the calling implementer (which logs it in its run-completed record and tick-report):
+
+| `exit_reason`          | Meaning                                                               |
+| ---------------------- | --------------------------------------------------------------------- |
+| `auto_merge_initiated` | Route A: PR open + `auto-merge` label applied; hub merges on CI green |
+| `queued`               | Route B: PR open + approval packet emitted (or label-sweep fallback)  |
+| `exception_emitted`    | Route C: no PR; exception packet emitted                              |
+
+Alongside the exit reason, report `<PR_URL>` and `queue_entry_id` (when any queue entry was emitted) — the implementer forwards both.
+
+It also writes four mid-flight activity records — `commit-started`, `tier-classified`, `pr-opened`, `commit-exited` — at the points marked in the steps below. Templates in `PACKETS.md` § Activity records. Activity writes are observability, not gates: on failure, log `::warning::` and continue.
 
 ---
 
 ## Steps
+
+> Write the **`commit-started`** activity record on entry.
 
 ### Step 1: Inspect
 
@@ -40,9 +64,8 @@ git diff main...HEAD 2>/dev/null || git diff HEAD
 
 Read the diff carefully — you'll use it for the branch name, commit message, tier classification, and PR body.
 
-**If the working tree looks off,** stop and tell Seth:
-- No changes staged or unstaged → nothing to commit.
-- Untracked files that look unintentional → list them; ask before including.
+- **No changes staged or unstaged** → nothing to commit. This is a caller error (the implementer claimed work exists). Emit the **`exception`** packet per `PACKETS.md` with cause "no diff to commit" and exit `exception_emitted`.
+- **Untracked files present** → they're part of the implementer's work product on a fresh CI checkout; include them. If something looks anomalous (build artifacts, secrets-shaped filenames), exclude it, note the exclusion in the PR body's `## Notes`, and let the must-escalate / tier classification catch anything sensitive.
 
 Also read up front (cached for later steps):
 
@@ -52,14 +75,14 @@ head -10 docs/LIFECYCLE.md 2>/dev/null || head -10 LIFECYCLE.md
 
 Extract `stage:` and `monetized:` from the frontmatter header. Missing or unparseable → default to `stage: production`, `monetized: true` (fail up). Note this in the PR body as "LIFECYCLE.md repair needed."
 
-### Step 2: Adversary loop
+### Step 2: Consume the adversary result
 
-Invoke the `pre-commit-reviewer` skill (or `@quality-gate` subagent if available) to review the diff:
+The implementer already ran the adversary loop (its Step 5) before invoking this skill. Do NOT re-run `pre-commit-reviewer`. Consume:
 
-- All checks pass → continue automatically.
-- Findings returned → record them for the PR body's `## Adversary review` section (Step 4). For autonomous runs, iterate with the implementer agent until findings are addressed; if convergence isn't reached within a reasonable cap, emit an exception queue entry per Step 5 Route C and stop. The formal convergence rule is open gap G14 in `STANDARDS.md §11.1` — apply judgment until the spec lands.
+- `<ADVERSARY_CONVERGED>` — `false` means the loop cap-hit; the implementer normally exits before reaching this skill in that case, but if it arrives here, it routes to Route C at Step 5.
+- `<ADVERSARY_SUMMARY>` — lands in the PR body's `## Adversary review` section and the approval packet.
 
-> **Note:** `security-review` runs in CI (per `STANDARDS.md §17` — central workflow at `Aethrix-Labs/.github`). Don't invoke it here. Its findings appear in the PR body via the security-review composer; this skill consumes them at Step 4.
+> **Note:** `security-review` runs in CI (per `STANDARDS.md §17` — central workflow at `Aethrix-Labs/.github`). Don't invoke it here. Its findings appear in the PR body via the security-review composer's sentinel (Step 4).
 
 ### Step 3: Classify risk tier
 
@@ -87,9 +110,11 @@ Any match → tier = HIGH, rationale = `"must-escalate match: <pattern>"`. Stop.
 
 Output: a single `tier ∈ {low, medium, high}` plus a one-line rationale string. Both flow into the PR body and the queue packet.
 
+> Write the **`tier-classified`** activity record.
+
 ### Step 4: Branch, update canonical docs inline, commit, push, open PR
 
-> **Step 4 must complete before Step 5 starts.** Step 5 reads Step 4's output bundle (`<TIER>`, `<RATIONALE>`, `<STAGE>`, `<PR_NUMBER>`, `<PR_URL>`, `<CI_STATUS>`, `<MUST_ESCALATE_HIT>`, `<ADVERSARY_CONVERGED>`). Do not skip ahead — Step 5's first action is a guard that fails loudly if these are missing.
+> **Step 4 must complete before Step 5 starts.** Step 5 reads Step 4's output bundle. Do not skip ahead — Step 5's first action is a guard that fails loudly if the bundle is missing.
 
 **4a. Branch.**
 
@@ -99,11 +124,11 @@ git checkout -b <branch-name>
 
 **Branch name:** kebab-case, short and descriptive. Examples: `add-google-sso`, `fix-auth-redirect`, `dashboard-layout`.
 
-**If already on a feature branch** (not `main`): confirm with Seth before creating another branch on top.
+In CI the working tree is always a fresh checkout of `main`. If HEAD is somehow not `main`, something upstream is broken — emit the **`exception`** packet with cause "unexpected HEAD at commit time" and exit `exception_emitted`.
 
-**4b. Update the canonical docs inline as part of this same commit.** Doc updates that describe what just shipped MUST land in the same PR as the code change — not as a separate post-merge cleanup PR. Atomicity (the code and the docs claiming it shipped revert together), review surface (Seth sees the agent's claims about what changed alongside the diff), and PLANNING-authority-at-merge-time all favor inline. This is what the agent does in practice; the pattern is documented here so the next product onboarding doesn't relearn it.
+**4b. Update the canonical docs inline as part of this same commit.** Doc updates that describe what just shipped MUST land in the same PR as the code change — atomicity (code and docs revert together), review surface, and PLANNING-authority-at-merge-time all favor inline. (`changelog-generator` and `doc-sync` are not invoked; their work is composed inline here.)
 
-The four docs to consider, in order:
+The docs to consider, in order:
 
 - **`PLANNING.md`** — flip the completed step's checkbox to `[x]`. If multiple sub-bullets were the step's acceptance criteria, flip those too. Be conservative — only check off what was actually fully completed by this PR. Partial → leave unchecked and add `*(partial — X done)*` in the step body.
 - **`LIFECYCLE.md`** — bump `last_updated:` to today's date. Update `next_milestone:` to whatever's next in `PLANNING.md`. If the next step is marked `*(human)*` per `STANDARDS §4.2`, propagate the `(human)` annotation into `next_milestone:` so the hub dashboard surfaces the manual-action state at a glance. Body sections only if state materially shifted.
@@ -138,34 +163,36 @@ gh pr create --base main \
 
 Capture the returned PR URL and number; both feed Step 5.
 
+> Write the **`pr-opened`** activity record.
+
 **4e. Capture CI status.**
 
 ```bash
 gh pr checks <PR_NUMBER> --json bucket,name,state
 ```
 
-Reduce to a single value: `failed` if any required check has bucket `fail`; otherwise `pending` if any check is still running; otherwise `pass`. Record as `<CI_STATUS>`.
+Reduce to a single value: `failed` if any required check has bucket `fail`; otherwise `pending` if any check is still running; otherwise `pass`. Record as `<CI_STATUS>`. One read only — never re-poll.
 
 **4f. Emit the Step 4 output bundle** (Step 5 reads these by name; do not proceed without them):
 
-| Name | Source | Example |
-| --- | --- | --- |
-| `<TIER>` | Step 3 output | `low` |
-| `<RATIONALE>` | Step 3 output | `matrix row: code — non-functional` |
-| `<STAGE>` | `LIFECYCLE.md` | `in-development` |
-| `<MUST_ESCALATE_HIT>` | Step 3a result | `false` |
-| `<ADVERSARY_CONVERGED>` | Step 2 result | `true` |
-| `<CI_STATUS>` | Step 4e | `pending` |
-| `<PR_NUMBER>` | Step 4d return | `42` |
-| `<PR_URL>` | Step 4d return | `https://github.com/.../pull/42` |
-| `<PR_TITLE>` | Step 4c commit summary | `feat: add SSO redirect` |
-| `<PRODUCT_SLUG>` | repo name or `LIFECYCLE.md` | `puzzle-pop` |
+| Name                    | Source                              | Example                                  |
+| ----------------------- | ----------------------------------- | ---------------------------------------- |
+| `<TIER>`                | Step 3 output                       | `low`                                    |
+| `<RATIONALE>`           | Step 3 output                       | `matrix row: code — non-functional`      |
+| `<STAGE>`               | `LIFECYCLE.md`                      | `in-development`                         |
+| `<MUST_ESCALATE_HIT>`   | Step 3a result                      | `false`                                  |
+| `<ADVERSARY_CONVERGED>` | Step 2 (from implementer)           | `true`                                   |
+| `<CI_STATUS>`           | Step 4e                             | `pending`                                |
+| `<PR_NUMBER>`           | Step 4d return                      | `42`                                     |
+| `<PR_URL>`              | Step 4d return                      | `https://github.com/.../pull/42`         |
+| `<PR_TITLE>`            | Step 4c commit summary              | `feat: add SSO redirect`                 |
+| `<PRODUCT_SLUG>`        | repo name or `LIFECYCLE.md`         | `puzzle-pop`                             |
 | `<PLANNING_ANCHOR_URL>` | derived from `PLANNING.md` step ref | `https://github.com/.../PLANNING.md#m07` |
-| `<ADVERSARY_SUMMARY>` | Step 2 result string | `converged, no findings` |
-| `<TESTS_SUMMARY>` | `test-writer` output or `none` | `3 added, 0 untestable` |
-| `<RECOMMENDATION>` | composed from Step 2 + 4e | `Approve — all checks green` |
+| `<ADVERSARY_SUMMARY>`   | Step 2 (from implementer)           | `converged, no findings`                 |
+| `<TESTS_SUMMARY>`       | implementer input or `none`         | `3 added, 0 untestable`                  |
+| `<RECOMMENDATION>`      | composed from Step 2 + 4e           | `Approve — all checks green`             |
 
-**If `<ADVERSARY_CONVERGED> == false`,** Step 4d/4e/4f beyond this point are skipped (no PR is opened on Route C). In that case the bundle only requires `<TIER>`, `<RATIONALE>`, `<STAGE>`, `<MUST_ESCALATE_HIT>`, `<ADVERSARY_CONVERGED>`, `<PRODUCT_SLUG>`; the PR-related fields are absent by design. Step 5's guard accounts for this.
+**If `<ADVERSARY_CONVERGED> == false`,** Steps 4a–4f are skipped entirely (no PR is opened on Route C). The bundle then only requires `<TIER>`, `<RATIONALE>`, `<STAGE>`, `<MUST_ESCALATE_HIT>`, `<ADVERSARY_CONVERGED>`, `<PRODUCT_SLUG>`; the PR-related fields are absent by design. Step 5's guard accounts for this.
 
 ### PR body composition (per `COMMIT_REDESIGN.md §8`)
 
@@ -173,29 +200,38 @@ Fixed section order, conditional inclusion. Plain Markdown.
 
 ```markdown
 ## Summary
-<One paragraph: what this PR does and why.>
+
+<One paragraph: what this PR does and why. Include "Closes step M<n>.<x>" or "Closes backlog item BL-<n>".>
 
 ## PLANNING.md step
+
 - [x] M<n>.<step> — <step text>
-<Link to the PLANNING.md anchor. Omit section if commit isn't implementation-loop-triggered.>
+      <Link to the PLANNING.md anchor. Omit section for backlog-item commits.>
 
 ## Risk tier
+
 **<tier>** — <rationale string from Step 3>
 
 ## Adversary review
-<pre-commit-reviewer findings summary. Omit if loop didn't run or returned clean.>
+
+<ADVERSARY_SUMMARY + any caveats carried from the implementer's loop. Omit if returned clean.>
 
 ## Security review
+
 <!-- security-review:start --><!-- security-review:end -->
+
 <Sentinel for the central security-review workflow's PR body composer per STANDARDS.md §17. The composer fills this in post-CI; leave the empty sentinels here.>
 
 ## Tests
-<test-writer output summary: tests added, coverage delta, untestable gaps. Omit if test-writer didn't run.>
+
+<TESTS_SUMMARY: tests added, coverage delta, untestable gaps. Omit if no tests ran.>
 
 ## Rollback
+
 <Concrete revert instructions. Required for medium/high tier. Omit for low.>
 
 ## Notes
+
 <Anything Seth would want to know. Optional.>
 ```
 
@@ -203,24 +239,16 @@ Fixed section order, conditional inclusion. Plain Markdown.
 
 ### Step 5: Gate — auto-merge, queue, or block
 
-This step is **mechanical**. Walk the decision tree top-down to a single terminal route, then run that route's pre-written command block, substituting placeholders only. Do not compose new shell commands. Do not re-interpret the §9 table — the tree below is the §9 table, pre-walked.
+This step is **mechanical**. Walk the decision tree top-down to a single terminal route, then run that route's pre-written actions, substituting placeholders only. Do not compose new shell commands. Do not re-interpret the §9 table — the tree below is the §9 table, pre-walked.
 
 **5a. Guard — verify Step 4 outputs exist.**
 
-Before touching the decision tree, confirm the bundle is set. The required set depends on whether the adversary loop converged:
-
 - **Always required** (every run): `<TIER>`, `<RATIONALE>`, `<STAGE>`, `<MUST_ESCALATE_HIT>`, `<ADVERSARY_CONVERGED>`, `<PRODUCT_SLUG>`.
-- **Additionally required when `<ADVERSARY_CONVERGED> == true`** (i.e., Step 4d/4e ran and a PR exists): `<CI_STATUS>`, `<PR_NUMBER>`, `<PR_URL>`, `<PR_TITLE>`, `<PLANNING_ANCHOR_URL>`, `<ADVERSARY_SUMMARY>`, `<TESTS_SUMMARY>`, `<RECOMMENDATION>`.
+- **Additionally required when `<ADVERSARY_CONVERGED> == true`** (a PR exists): `<CI_STATUS>`, `<PR_NUMBER>`, `<PR_URL>`, `<PR_TITLE>`, `<PLANNING_ANCHOR_URL>`, `<ADVERSARY_SUMMARY>`, `<TESTS_SUMMARY>`, `<RECOMMENDATION>`.
 
-If any required name is missing, **stop immediately** and emit:
-
-> Step 5 guard failed — Step 4 outputs missing: `<list-of-missing-names>`. Re-run Step 4 before proceeding.
-
-Do not pick a route. Do not attempt a merge or queue write. Missing outputs mean Step 4 didn't finish; pressing on produces exactly the brittleness the §11.3 entry resolves.
+If any required name is missing, **stop immediately**: log `::error::commit: Step 5 guard failed — Step 4 outputs missing: <list>`, emit the **`exception`** packet with that cause, and exit `exception_emitted`. Do not pick a route. Missing outputs mean Step 4 didn't finish; pressing on produces exactly the brittleness the §11.3 entry resolves.
 
 **5b. Decision tree — terminate on the first matching branch.**
-
-Walk top-down. The first matching condition is the terminal route. Do not "average" branches or look further down the tree.
 
 ```
 1. Is <ADVERSARY_CONVERGED> == false?
@@ -252,177 +280,69 @@ Walk top-down. The first matching condition is the terminal route. Do not "avera
 
 Every leaf is one of {Route A, Route B, Route C}. There are no ambiguous cases.
 
-**5c. Apply the `auto-merge` label iff Route A.**
+**5c. Run the route's actions.**
 
-Mechanical, runs immediately after the route is decided. Skip if the route is B or C.
+---
+
+**Route A — auto-merge.**
 
 ```bash
 gh pr edit <PR_NUMBER> --add-label "auto-merge"
 ```
 
-**5d. Run the route's pre-written command block.** Substitute placeholders only.
+That's the whole route. Do NOT call `gh pr merge`, and do NOT poll merge state — merge execution belongs to the hub: when CI goes green, the central security-review workflow's `merge-ready` job pings the hub, which runs `mergePr()` and advances the orchestrator. Exit reason: **`auto_merge_initiated`**.
 
 ---
 
-**Route A — auto-merge** (pre-written; substitute `<PR_NUMBER>` only):
+**Route B — queue for approval.**
 
-```bash
-gh pr merge <PR_NUMBER> --auto --squash
-```
+Emit the **`approval`** packet per `PACKETS.md`. Exit reason: **`queued`**, with `queue_entry_id` from the response.
 
-Then poll merge state for up to ~3 minutes (six iterations, ~30s each):
-
-```bash
-gh pr view <PR_NUMBER> --json state,mergedAt
-```
-
-- `state == MERGED` → proceed to Step 6.
-- 3-min timeout → tell Seth CI is slow, present `<PR_URL>`, exit cleanly. The merge fire-back loop will pick the PR up when CI finishes.
+**On non-2xx or `QUEUE_SERVICE_ROLE_KEY` missing:** log `::warning::commit: queue write failed (<reason>); PR #<PR_NUMBER> left with commit-pending-merge label for the hourly label sweep (MFB.1)`. The PR stays open and labeled; the hub's label-driven safety net surfaces it in the decision queue. Still exit **`queued`** (with `queue_entry_id: null`).
 
 ---
 
-**Route B — queue for approval** (pre-written; substitute placeholders only):
+**Route C — block (exception).**
 
-```bash
-curl -X POST "${HUB_BASE_URL:-https://sethgibson.com}/api/v1/queue/entries" \
-  -H "Content-Type: application/json" \
-  -H "x-service-role-key: ${QUEUE_SERVICE_ROLE_KEY}" \
-  -d @- <<'JSON'
-{
-  "request_id": "<SHA256_OF_PR_URL>",
-  "entry_type": "approval",
-  "risk_tier": "<TIER_FOR_PACKET>",
-  "agent_name": "commit",
-  "title": "[<PRODUCT_SLUG>] Ship PR #<PR_NUMBER>: <PR_TITLE>",
-  "goal": "Ship PR #<PR_NUMBER>: <PR_TITLE>",
-  "attempts": [
-    "Adversary loop: <ADVERSARY_SUMMARY>",
-    "CI: <CI_STATUS_SUMMARY>",
-    "Tests: <TESTS_SUMMARY>"
-  ],
-  "ask": "Approve this PR for merge?",
-  "recommendation": "<RECOMMENDATION>",
-  "artifacts": [
-    { "label": "PR", "href": "<PR_URL>", "artifact_type": "github-pr" },
-    { "label": "PLANNING step", "href": "<PLANNING_ANCHOR_URL>", "artifact_type": "planning-step" }
-  ]
-}
-JSON
-```
+Emit the **`exception`** packet per `PACKETS.md`. No PR is opened; the diff stays on the local branch (pushed to the remote branch if 4c completed, otherwise local-only — name the branch in the packet either way). Exit reason: **`exception_emitted`**.
 
-Placeholder rules for Route B:
+### Step 6: Exit
 
-- `<TIER_FOR_PACKET>` = `high` if `<MUST_ESCALATE_HIT> == true`; else `medium` if reached via the CI-failed branch; else `<TIER>` unchanged.
-- `<SHA256_OF_PR_URL>` = `sha256(<PR_URL>)` — idempotent on re-run.
-- `<CI_STATUS_SUMMARY>` = `green` if `<CI_STATUS> == pass`; `pending` if `pending`; `red — <failing-check-name>` if `failed`.
-- `<ADVERSARY_SUMMARY>`, `<TESTS_SUMMARY>`, `<RECOMMENDATION>` = short summary strings carried from Steps 2 and 4.
-- `<PR_TITLE>`, `<PRODUCT_SLUG>`, `<PR_NUMBER>`, `<PR_URL>`, `<PLANNING_ANCHOR_URL>` = from Step 4 outputs.
+> Write the **`commit-exited`** activity record.
 
-**Note on `product_id`:** the API expects a hub-side `products.id` (UUID), not a slug. v0 omits the field and encodes the product slug in `title` (the `[<PRODUCT_SLUG>]` prefix). Slug→ID resolution at the hub is tracked as a `§11.1` follow-up.
-
-**On 2xx:** tell Seth (or the calling agent):
-
-> PR #<PR_NUMBER> opened and queued for approval — `<PR_URL>`. Skill exiting; merge fire-back loop resumes after Seth approves.
-
-**On non-2xx, or `QUEUE_SERVICE_ROLE_KEY` missing:** fall back to legacy in-chat approval; leave the PR open; do not auto-merge:
-
-> PR #<PR_NUMBER> needs your approval (stage: `<STAGE>`, tier: `<TIER>`). **[Review on GitHub](<PR_URL>)**
-> Queue write failed (`<reason>`) — let me know when you've merged it.
+Report the terminal `exit_reason`, `<PR_URL>` (or null), and `queue_entry_id` (or null) back to the calling implementer, then stop. Do not wait for merge, CI, deploy, or queue resolution — all out-of-process per `STANDARDS §9` "Commit-skill exit contract."
 
 ---
 
-**Route C — block (exception)** (pre-written; substitute placeholders only):
+## Out-of-process merge (context, not instructions)
 
-The PR is NOT opened in Route C — the diff stays on the local branch. Step 4d/4e are skipped when Step 2 already failed convergence; emit the exception entry directly.
-
-```bash
-curl -X POST "${HUB_BASE_URL:-https://sethgibson.com}/api/v1/queue/entries" \
-  -H "Content-Type: application/json" \
-  -H "x-service-role-key: ${QUEUE_SERVICE_ROLE_KEY}" \
-  -d @- <<'JSON'
-{
-  "request_id": "<SHA256_OF_BRANCH_PLUS_TIMESTAMP>",
-  "entry_type": "exception",
-  "risk_tier": "<TIER>",
-  "agent_name": "commit",
-  "title": "[<PRODUCT_SLUG>] commit blocked: <ONE_LINE_CAUSE>",
-  "goal": "<WHAT_AGENT_WAS_TRYING_TO_DO>",
-  "attempts": ["<ATTEMPT_BULLET>", "..."],
-  "ask": "<WHAT_SETH_NEEDS_TO_DECIDE>",
-  "recommendation": "<OPTIONAL>",
-  "artifacts": [
-    { "label": "Branch", "href": "<BRANCH_URL>", "artifact_type": "github-branch" },
-    { "label": "Adversary report", "href": "<ADVERSARY_REPORT_URL>", "artifact_type": "adversary-report" }
-  ]
-}
-JSON
-```
-
-### Step 6: Trigger staging deploy (auto-merge path only)
-
-This step only fires when Step 5 took the auto-merge path AND the merge completed within the polling window. The queue route exits at Step 5 Route B and the merge fire-back loop owns merge + deploy from there (see below).
-
-Read `DEPLOYMENT.md`:
-
-- Platform auto-deploys on push to main (Cloudflare Pages, Vercel, etc.) → note the staging URL; no command needed.
-- Manual deploy required → run the staging deploy command from `DEPLOYMENT.md`.
-
-Confirm:
-
-> Staging deploy triggered — `<staging-url>`. Verify gate (`STANDARDS §9`) emits a verify queue entry on staging-deploy success.
-
-**If `DEPLOYMENT.md` doesn't exist:**
-
-> No DEPLOYMENT.md found — skipping staging deploy. Run the `deploy` skill to set up the deployment config.
-
-**If staging deploy fails:** emit an `exception` queue entry per Step 5 Route C with the deploy logs as an artifact. Don't proceed silently.
-
----
-
-## Doc updates are inline (no post-merge cleanup phase)
-
-Earlier versions of this skill had a Steps 6-7 post-merge cleanup phase that updated `PLANNING.md`, ran `doc-sync` for `PRODUCT.md`, ran `changelog-generator` for `CHANGELOG.md`, and refreshed `LIFECYCLE.md` — on a separate commit pushed after merge. That phase has been folded into Step 4 (inline updates as part of the same PR). Rationale: atomicity, review surface, PLANNING authority at merge time, no separate post-merge PR clutter. Validated end-to-end on the first implementer-driven PR (puzzle-pop PR #6, M0.1, 2026-05-20).
-
-This means `changelog-generator` and `doc-sync` are no longer fired as separate skills in the post-merge phase — their work is composed inline by the agent during commit. They remain available as standalone skills for ad-hoc invocation if needed, but the commit flow doesn't call them.
-
----
-
-## Merge fire-back loop (out-of-process)
-
-When Step 5 takes the queue route, the skill emits the `approval` packet and exits. The PR sits on GitHub with the `commit-pending-merge` label, ready for Seth's queue approval. The merge fire-back loop (a `*/15 * * * *` Cloudflare Cron Trigger in the hub Worker) bridges "Seth approves the queue entry" → "GitHub merges the PR" via two passes each tick:
-
-**Pass 1 — queue-entry-driven (primary path).** Queries D1 for `approval` entries at `status=resolved`, `resolution_kind IN ('approved','approved-with-changes')`; fetches the `github-pr` artifact; verifies `commit-pending-merge` label; calls GitHub merge API; removes label on 2xx; emits `exception` entry on 405 (MFB.2); removes label silently on 422 (already merged).
-
-**Pass 2 — label-driven safety net (MFB.1).** Iterates all registered products, calls `GET /repos/:owner/:repo/issues?labels=commit-pending-merge` per repo, skips any PR URL already handled by pass 1. For each remaining stranded PR: reads its `tier:*` + `stage:*` labels, applies the `STANDARDS §9` gating table — if auto-merge eligible, calls `processPr` (same path as pass 1); if not, emits a post-hoc `approval` queue entry so the PR surfaces in the decision queue. The entry-driven path keeps priority; the safety net catches PRs where this skill's Steps 4+5 dropped the routing entirely. See `STANDARDS §11.1` (commit Steps 4+5 brittleness) for root-cause context; MFB.1 is the defense-in-depth layer.
-
-There's no post-merge doc cleanup to run — doc updates landed inline at Step 4.
+Merge execution lives in the hub Worker (`mergePr()`, holding `GITHUB_MERGE_TOKEN`), reached by two event-driven paths: **path A** — CI green on an `auto-merge`-labeled PR → the central workflow's `merge-ready` ping → `mergePr()`; **path B** — Seth approves the queue entry → the approval handler calls `mergePr()` synchronously. An hourly label-driven sweep (MFB.1) reconciles any PR stranded with `commit-pending-merge` (e.g. a dropped queue write). Post-merge deploy is CD on push to main; the verify gate emits a verify queue entry on staging-deploy success.
 
 ---
 
 ## Error handling
 
-| Failure | Behavior |
-| --- | --- |
-| No changes to commit | Tell Seth; stop. Don't create an empty branch. |
-| Untracked files looking unintentional | List them; ask before `git add -A`. |
-| Already on a feature branch | Confirm before branching again. |
-| Push conflict | `git pull --rebase origin <branch>` then re-push. |
-| `gh` not installed | Construct the PR URL from `git remote get-url origin` and present as a clickable link. Auto-merge route falls back to "queue for approval" (no auto-merge possible without `gh` or GitHub API access). |
-| Auto-merge 3-min timeout | Skill exits cleanly; merge fire-back loop merges when CI eventually completes. No post-merge resume needed — doc updates already landed inline at Step 4. |
-| `LIFECYCLE.md` missing or `stage:` unparseable | Default to `stage: production`; add "LIFECYCLE.md repair needed" to PR body's `## Notes`. |
-| Adversary loop doesn't converge within a reasonable cap | Emit `exception` queue entry per Step 5 Route C; no PR opened. (Cap is gap G14 — apply judgment.) |
-| CI red on a would-be-auto-merge diff | Flip to MEDIUM queue entry per Step 5; name the failing check in `attempts`. |
-| Hub queue API non-2xx | Fall back to legacy in-chat approval; warn that queue write was skipped. |
-| `QUEUE_SERVICE_ROLE_KEY` missing | Same fallback; tell Seth to set the secret. |
-| Inline doc-update at Step 4 fails (PLANNING / LIFECYCLE / CHANGELOG / PRODUCT) | Stop before opening PR; emit `exception` queue entry naming the failed doc, with the partial branch state preserved. Re-running the skill on the same branch will re-attempt cleanly. |
+| Failure                                                | Behavior                                                                                                                                                                       |
+| ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| No changes to commit                                   | Exception packet ("no diff to commit"); exit `exception_emitted`.                                                                                                              |
+| Anomalous untracked files                              | Exclude; note in PR body `## Notes`; continue.                                                                                                                                 |
+| HEAD not on `main` at Step 4a                          | Exception packet ("unexpected HEAD at commit time"); exit `exception_emitted`.                                                                                                 |
+| Push conflict                                          | `git pull --rebase origin <branch>` then re-push once; still failing → exception packet.                                                                                       |
+| `LIFECYCLE.md` missing or `stage:` unparseable         | Default to `stage: production`, `monetized: true`; add "LIFECYCLE.md repair needed" to PR body's `## Notes`.                                                                   |
+| `<ADVERSARY_CONVERGED> == false` reaches this skill    | Route C; exit `exception_emitted`. (The implementer normally cap-hit-exits before invoking commit.)                                                                            |
+| CI red on a would-be-auto-merge diff                   | Decision tree branch 3 → Route B at MEDIUM; name the failing check in `attempts`.                                                                                              |
+| Queue write non-2xx / `QUEUE_SERVICE_ROLE_KEY` missing | Route B: leave PR + `commit-pending-merge` label for the MFB.1 sweep; warn; exit `queued`. Route C: log `::error::` (the block is unreported — the workflow log is the trail). |
+| Activity write fails                                   | Log `::warning::`; continue. Observability, not a gate.                                                                                                                        |
+| Inline doc-update at Step 4b fails                     | Stop before opening PR; exception packet naming the failed doc, partial branch state preserved. Re-running on the same branch re-attempts cleanly.                             |
 
 ---
 
 ## What this skill does NOT do
 
-- **Run `security-review`.** It runs in CI per `STANDARDS.md §17`; findings appear in the PR body via the central workflow's composer. This skill leaves the sentinel comments in place.
+- **Run the adversary loop.** The implementer owns it (its Step 5); this skill consumes the result.
+- **Run `security-review`.** It runs in CI per `STANDARDS.md §17`; findings land in the PR body via the central workflow's composer. This skill leaves the sentinel comments in place.
+- **Merge PRs or poll merge state.** Merge execution is the hub's `mergePr()`, triggered by the `merge-ready` ping (path A) or Seth's approval (path B).
+- **Trigger deploys.** Post-merge deploy is CD on push to main; production deploys are the `deploy` skill's territory.
+- **Interact in chat.** CI-only. Manual commits go through `simple-commit` or Claude Code directly.
 - **Update `ARCHITECTURE.md`.** Out of scope (gap G13 in `STANDARDS.md §11.1`). Flag material architecture changes in `## Notes` for human follow-up.
-- **Write `SESSION.md` / `SESSIONS_LOG.md` / `.commit-state`.** All retired (G11). State lives in git, `LIFECYCLE.md`, and the hub's queue.
-- **Wait synchronously on queue approval.** The skill exits at Step 5 Route B; the merge fire-back loop resumes it.
-- **Deploy to production.** That's `deploy`'s territory.
-- **Resolve product slug → hub product_id for the queue packet.** v0 omits `product_id` and uses the title prefix; the hub-side resolution is tracked as a §11.1 follow-up.
+- **Wait synchronously on queue approval, CI, or merge.** The skill exits at its terminal route; the hub owns everything after.
