@@ -3,38 +3,28 @@ name: implementer (callable)
 on:
   workflow_call:
     inputs:
-      action:
-        description: "next-step | address-feedback"
-        type: string
-        required: false
-        default: "next-step"
-      verify_entry_id:
-        description: "Optional verify queue entry ID from the wake mechanism"
-        type: string
-        required: false
-        default: ""
       product_slug:
         description: "Product slug (defaults to repo basename)"
         type: string
         required: false
         default: ""
       session_id:
-        description: "Autonomous session ID from the hub play-button loop (M21). Empty on manual triggers."
+        description: "Autonomous session ID from the hub play-button loop."
         type: string
         required: false
         default: ""
       hub_url:
-        description: "Hub base URL for posting tick-reports (M21). Defaults to https://sethgibson.com."
+        description: "Hub base URL for posting tick-reports. Defaults to https://sethgibson.com."
         type: string
         required: false
         default: "https://sethgibson.com"
       target_kind:
-        description: "Directed target kind from the hub picker (M25): 'backlog' | 'milestone'. Empty = BACKLOG-first auto-pick (legacy / manual triggers)."
+        description: "Directed target kind from the hub picker: 'backlog' | 'milestone'. Empty trips the skill's Guard 2 — manual dispatch is unsupported."
         type: string
         required: false
         default: ""
       target_ref:
-        description: "Directed target ref (M25): BL-<n> for a backlog item, M<n> for a milestone. Empty when target_kind is empty."
+        description: "Directed target ref: BL-<n> for a backlog item, M<n> for a milestone."
         type: string
         required: false
         default: ""
@@ -78,19 +68,17 @@ jobs:
       - name: Run implementer agent
         uses: anthropics/claude-code-action@v1
         env:
-          # Used by the commit skill's queue emission path (per STANDARDS §14
+          # Used by the implementer's queue packets + activity records and the
+          # commit skill's queue emission path (per STANDARDS §14
           # multi-storage credentials). Same secret security-review uses.
           QUEUE_SERVICE_ROLE_KEY: ${{ secrets.QUEUE_SERVICE_ROLE_KEY }}
-          # M21: tick-report auth token (separate from QUEUE_SERVICE_ROLE_KEY per m2m convention).
+          # Tick-report auth token (separate from QUEUE_SERVICE_ROLE_KEY per m2m convention).
           AUTONOMOUS_TICK_TOKEN: ${{ secrets.AUTONOMOUS_TICK_TOKEN }}
-          # Dispatch payload passed through to the agent via env so the
-          # SKILL.md prompt can branch on action / verify_entry_id / session_id.
-          IMPLEMENTER_ACTION: ${{ inputs.action }}
-          IMPLEMENTER_VERIFY_ENTRY_ID: ${{ inputs.verify_entry_id }}
+          # Dispatch payload passed through to the agent via env.
           IMPLEMENTER_PRODUCT_SLUG: ${{ inputs.product_slug }}
           IMPLEMENTER_SESSION_ID: ${{ inputs.session_id }}
           IMPLEMENTER_HUB_URL: ${{ inputs.hub_url }}
-          # M25: directed target (empty = BACKLOG-first, unchanged).
+          # Directed target — required by the skill's Guard 2.
           IMPLEMENTER_TARGET_KIND: ${{ inputs.target_kind }}
           IMPLEMENTER_TARGET_REF: ${{ inputs.target_ref }}
         with:
@@ -99,19 +87,17 @@ jobs:
             You are running as the **implementer agent** in CI.
 
             Read `.fleet-ci/.github/scripts/implementer/SKILL.md` and follow
-            it exactly. It defines the pre-flight guards, the flow (read
-            PLANNING.md → pick next unblocked step → implement → invoke commit
-            → exit), and the failure modes.
+            it exactly. It defines the pre-flight guards, the flow (resolve
+            the directed target → implement the next unblocked step → invoke
+            commit → exit), and the failure modes.
 
             When ready to commit, read `.fleet-ci/.github/scripts/commit/SKILL.md`
-            and follow its 8-step flow. The commit skill handles tier
-            classification, PR body composition, queue emission, and merge
-            routing.
+            and follow its flow. The commit skill handles tier classification,
+            PR body composition, queue emission, and merge routing.
 
             Runtime context:
             - Working directory has the full consumer repo (fetch-depth: 0).
-            - Action: $IMPLEMENTER_ACTION (default "next-step").
-            - Verify entry ID: $IMPLEMENTER_VERIFY_ENTRY_ID (empty on manual triggers).
+            - Directed target: $IMPLEMENTER_TARGET_KIND / $IMPLEMENTER_TARGET_REF.
             - Product slug: $IMPLEMENTER_PRODUCT_SLUG (or derive from $GITHUB_REPOSITORY).
 
             Exit after ONE step. The verify gate is the loop boundary.
