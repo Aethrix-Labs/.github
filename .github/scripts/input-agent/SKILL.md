@@ -2,7 +2,7 @@
 
 **Status:** Active — synthesize mode only (M8). Route + dedup modes are scaffolded but inert.
 
-**When to use this skill:** Use synthesize mode automatically — it is not user-invoked. It fires after every contribution write (via MCP `start_thread` / `log_to_thread` and hub UI contribution form). Use dedup mode (when active, M11) after a new contribution arrives to check for overlapping threads.
+**When to use this skill:** Use synthesize mode automatically — it is not user-invoked. It fires after every contribution write (via MCP `start_thread` / `log_to_thread` and hub UI contribution form). Use dedup mode (when active) after a new contribution arrives to check for overlapping threads.
 
 ---
 
@@ -27,11 +27,11 @@ Reads all contributions on a thread and produces or updates the `synthesis` fiel
 
 ### route (inert — M8)
 
-Scope per INPUT_SYSTEM.md §5.1: route ambiguous contributions to the right surface/thread. Not active in M8 — routing for Seth's own MCP contributions is handled by the conversation (Seth names the thread explicitly). Future scope: non-Claude inbound (email/SMS if those channels activate).
+Scope per `~/products/docs/IDEA_THREADS.md §8` (deferred — routing-suggest): route ambiguous contributions to the right surface/thread. Not active in M8 — routing for Seth's own MCP contributions is handled by the conversation (Seth names the thread explicitly). Future scope: non-Claude inbound (email/SMS if those channels activate).
 
 ### dedup (inert — M8)
 
-Scope per INPUT_SYSTEM.md §5.3 and M11: scan existing threads for near-duplicates when a new contribution arrives; emit an `approval` entry proposing a merge. Never auto-merges. Activates in M11 (trigger: first time Seth notices two threads that should obviously be merged).
+Scope per `~/products/docs/IDEA_THREADS.md §8` (deferred — dedup): scan existing threads for near-duplicates when a new contribution arrives; emit an `approval` entry proposing a merge. Never auto-merges. Activates when first needed (trigger: first time Seth notices two threads that should obviously be merged).
 
 ---
 
@@ -47,5 +47,5 @@ This skill does not write agent_activity records in M8. Synthesizer runs are fas
 - MCP write path: `app/routes/api.mcp.ts` (calls runSynthesizer after every tool write)
 - Hub UI write path: `app/routes/ideas.tsx` action (calls runSynthesizer after add_contribution and capture)
 - Thread schema: `app/db/schema.ts` — `ideas.synthesis` column
-- Design spec: `docs/INPUT_SYSTEM.md §5.2`
+- Design spec: `~/products/docs/IDEA_THREADS.md §4` (synthesizer)
 - Model assignment: `STANDARDS.md G18`
