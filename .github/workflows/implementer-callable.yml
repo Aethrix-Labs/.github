@@ -66,6 +66,7 @@ jobs:
           git config user.email "implementer-agent@aethrix-labs.local"
 
       - name: Run implementer agent
+        id: agent
         uses: anthropics/claude-code-action@v1
         env:
           # Used by the implementer's queue packets + activity records and the
@@ -106,3 +107,68 @@ jobs:
             --model claude-sonnet-4-6
             --max-turns 80
             --allowedTools Read,Bash,Write,Edit,Glob,Grep
+
+      - name: Emit failure queue entry + tick-report
+        # The agent step died (max-turns, crash, infra error) without reaching
+        # its own exit path — so no queue entry and no tick-report were sent.
+        # This handler is the skill's "claude-code-action itself errors" failure
+        # mode (implementer SKILL.md failure-modes table): surface the death in
+        # the decision queue and tell the orchestrator the tick failed so the
+        # session goes `errored` instead of hanging until the cron sweep.
+        # Writes are observability, not gates — both POSTs warn-and-continue.
+        if: failure() && steps.agent.outcome == 'failure'
+        env:
+          QUEUE_SERVICE_ROLE_KEY: ${{ secrets.QUEUE_SERVICE_ROLE_KEY }}
+          AUTONOMOUS_TICK_TOKEN: ${{ secrets.AUTONOMOUS_TICK_TOKEN }}
+          IMPLEMENTER_PRODUCT_SLUG: ${{ inputs.product_slug }}
+          IMPLEMENTER_SESSION_ID: ${{ inputs.session_id }}
+          IMPLEMENTER_HUB_URL: ${{ inputs.hub_url }}
+          IMPLEMENTER_TARGET_KIND: ${{ inputs.target_kind }}
+          IMPLEMENTER_TARGET_REF: ${{ inputs.target_ref }}
+        run: |
+          SLUG="${IMPLEMENTER_PRODUCT_SLUG:-$(basename "$GITHUB_REPOSITORY")}"
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          HUB="${IMPLEMENTER_HUB_URL:-https://sethgibson.com}"
+
+          # Queue entry — exception, high tier. request_id is rooted in the
+          # GitHub run ID (one entry per failed run; reruns get a new run ID,
+          # which is correct — a new failure is a new event). Shape per
+          # implementer PACKETS.md § workflow-failed.
+          if [ -n "$QUEUE_SERVICE_ROLE_KEY" ]; then
+            REQUEST_ID=$(printf '%s' "${GITHUB_RUN_ID}workflow-failed" | sha256sum | cut -d' ' -f1)
+            curl -sf -X POST "${HUB}/api/v1/queue/entries" \
+              -H "Content-Type: application/json" \
+              -H "x-service-role-key: $QUEUE_SERVICE_ROLE_KEY" \
+              -H "User-Agent: aethrix-fleet-ci/1.0 (implementer-callable)" \
+              -d "{
+                \"request_id\": \"$REQUEST_ID\",
+                \"entry_type\": \"exception\",
+                \"risk_tier\": \"high\",
+                \"agent_name\": \"implementer\",
+                \"product_slug\": \"$SLUG\",
+                \"title\": \"[$SLUG] implementer workflow failed on ${IMPLEMENTER_TARGET_REF:-unknown target}\",
+                \"goal\": \"Advance ${IMPLEMENTER_TARGET_KIND:-?}/${IMPLEMENTER_TARGET_REF:-?} by one step\",
+                \"attempts\": [\"claude-code-action step failed (max-turns, crash, or infra error) before the skill's own exit path; no in-band queue entry or tick-report was sent. Run: $RUN_URL\"],
+                \"ask\": \"Inspect the workflow run log; decide retry, fix the step/criteria, or restructure the target\",
+                \"recommendation\": \"Check the last tool calls in the log — max-turns deaths usually mean the agent was attempting work outside its lane (e.g. an unmarked human-only step)\"
+              }" \
+            || echo "::warning::implementer-callable: failure queue-entry POST failed"
+          else
+            echo "::warning::implementer-callable: QUEUE_SERVICE_ROLE_KEY missing; skipping failure queue entry"
+          fi
+
+          # Tick-report — outcome `workflow-failed` (reserved for this handler
+          # per implementer SKILL.md Step 7; orchestrator maps it to `errored`).
+          if [ -n "$IMPLEMENTER_SESSION_ID" ] && [ -n "$AUTONOMOUS_TICK_TOKEN" ]; then
+            curl -sf -X POST \
+              -H "Authorization: Bearer $AUTONOMOUS_TICK_TOKEN" \
+              -H "Content-Type: application/json" \
+              "${HUB}/api/autonomous/tick-report" \
+              -d "{
+                \"session_id\": \"$IMPLEMENTER_SESSION_ID\",
+                \"run_id\": \"$GITHUB_RUN_ID\",
+                \"outcome\": \"workflow-failed\",
+                \"run_url\": \"$RUN_URL\"
+              }" \
+            || echo "::warning::implementer-callable: failure tick-report POST failed; defensive cron sweep will reconcile"
+          fi

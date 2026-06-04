@@ -76,15 +76,15 @@ The hub has bound this session to a specific target via `$IMPLEMENTER_TARGET_KIN
 **`target_kind == "milestone"`** (`target_ref` is `M<n>`):
 
 1. Locate the `## <target_ref>` heading in `/docs/PLANNING.md` (or `/PLANNING.md`). If the milestone heading doesn't exist (renamed / removed since the picker enumerated it), treat as "no work" — log `::notice::implementer: directed milestone <target_ref> not found; nothing to do` and exit cleanly with tick-outcome `guard-tripped` (the orchestrator's target-scoped check will mark the session `done`). A directed dispatch must never silently pick something else.
-2. Within that milestone, find the **first** `- [ ]` / `* [ ]` step that is (a) not preceded by an unresolved `**Blocked by:**` annotation and (b) does not begin with `*(human)*`. That step is the work item. Its text is everything between the checkbox and the next checkbox / heading / horizontal rule; acceptance criteria are the indented bullets that follow.
+2. Within that milestone, find the **first** `- [ ]` / `* [ ]` step that is (a) not preceded by an unresolved `**Blocked by:**` annotation and (b) does not begin with the human marker. **Human-marker detection MUST be emphasis-agnostic:** the marker is `(human)` wrapped in any markdown emphasis — `*(human)*`, `_(human)_`, `**(human)**`, or `__(human)__` — immediately after the checkbox. All variants render identically and mean the same thing; never detect by literal `*(human)*` string match alone (per `templates/planning/INSTRUCTIONS.md` "Emphasis-variant equivalence" — a literal match caused the 2026-06-04 max-turns incident on a `_(human)_`-marked step). That step is the work item. Its text is everything between the checkbox and the next checkbox / heading / horizontal rule; acceptance criteria are the indented bullets that follow.
 3. If the milestone has **no** qualifying step (all done, all blocked, or all `*(human)*`), log `::notice::implementer: directed milestone <target_ref> has no unblocked step; nothing to do` and exit cleanly with tick-outcome `guard-tripped`. (The picker only offers milestones with ≥1 unblocked step and the start route 422s stale targets, but a step can be consumed between enumeration and dispatch — handle it defensively, never by diverting to another target.)
-4. **Scan the acceptance criteria for unmarked human-only work** — sub-bullets matching `STANDARDS §4.2`'s "When to mark" criteria (the pattern list in Step 3 Case D). A match → branch to Step 3 Case D rather than walking into a partial-completion trap. Treat the scan as a heuristic; Case D's mid-implementation trigger still catches anything it misses. Then continue to **Step 2**.
+4. **Scan the acceptance criteria for unmarked human-only work** — sub-bullets matching `templates/planning/INSTRUCTIONS.md` (human-action marker)'s "When to mark" criteria (the pattern list in Step 3 Case D). A match → branch to Step 3 Case D rather than walking into a partial-completion trap. Treat the scan as a heuristic; Case D's mid-implementation trigger still catches anything it misses. Then continue to **Step 2**.
 
 **`target_kind == "backlog"`** (`target_ref` is `BL-<n>`):
 
 1. In `/docs/BACKLOG.md` `## Open`, find the `- [ ]` item whose ID is `<target_ref>`. If it's gone (already closed / not found), log `::notice::implementer: directed backlog item <target_ref> not found in ## Open; nothing to do` and exit cleanly with tick-outcome `guard-tripped`.
-2. If the item's text begins with `*(human)*` → branch to Step 3 Case C with `<target_ref>` substituted for the step ID. Otherwise the **item body is the acceptance criteria**: the indented bullets / paragraphs / embedded screenshots beneath the `- [ ]` line, up to the next `- [ ]` or `##` heading. The `BL-<n>` ID takes the place of the PLANNING step ID in all downstream Step 3 / Step 6 / activity-trail references. Continue to **Step 2**.
-3. **Elevation check (applies throughout implementation).** Backlog items are tier-low by convention (per `STANDARDS §4.3`). If you discover the item is actually tier-medium-or-higher (needs a feature flag, schema migration, multi-step coordination, public-API change), do NOT silently widen scope — emit the **`ambiguity`** packet per `PACKETS.md` with `ask: "Backlog item <BL-id> is larger than tier-low; recommend elevating to a PLANNING.md milestone step (or splitting). Exiting without commit."`, exit cleanly, and leave the item un-closed in BACKLOG.md.
+2. If the item's text begins with the human marker (any emphasis variant, per the Step 1 milestone rule above) → branch to Step 3 Case C with `<target_ref>` substituted for the step ID. Otherwise the **item body is the acceptance criteria**: the indented bullets / paragraphs / embedded screenshots beneath the `- [ ]` line, up to the next `- [ ]` or `##` heading. The `BL-<n>` ID takes the place of the PLANNING step ID in all downstream Step 3 / Step 6 / activity-trail references. Continue to **Step 2**.
+3. **Elevation check (applies throughout implementation).** Backlog items are tier-low by convention (per `templates/backlog/INSTRUCTIONS.md`). If you discover the item is actually tier-medium-or-higher (needs a feature flag, schema migration, multi-step coordination, public-API change), do NOT silently widen scope — emit the **`ambiguity`** packet per `PACKETS.md` with `ask: "Backlog item <BL-id> is larger than tier-low; recommend elevating to a PLANNING.md milestone step (or splitting). Exiting without commit."`, exit cleanly, and leave the item un-closed in BACKLOG.md.
 
 **One step per invocation.** Even for a milestone target, this skill implements exactly the _next_ unblocked step and exits. "A milestone advances up to the cap of 3" is the **orchestrator's** behavior (it re-dispatches the same sticky target for the next tick per `AUTONOMOUS_DEV.md §5`), not this skill's. The skill never loops within a milestone.
 
@@ -115,12 +115,12 @@ If the step requires a decision that's outside Seth's creative & strategic lane 
 Log a final line and exit:
 
 ```
-implementer: step <id> requires human action per STANDARDS §4.2; emitted strategic queue entry <id>. Exiting.
+implementer: step <id> requires human action per the PLANNING template instructions (templates/planning/INSTRUCTIONS.md, human-action marker); emitted strategic queue entry <id>. Exiting.
 ```
 
 Skip Steps 4–6; still write the run-completed record and send the tick-report per Step 7.
 
-**Case D — Mid-step discovery of unmarked human-only work (per `STANDARDS §4.2` "Mid-step discovery").** Triggers when either (a) Step 1's heuristic scan flagged this step upfront, OR (b) during implementation you realize part of the acceptance criteria matches the §4.2 "When to mark" criteria — the pattern list: interactive OAuth flows (`wrangler login`, `gh auth login`, `gcloud auth login`), local-machine verification ("test on physical device," "open in browser"), third-party dashboard configuration ("create account at," "enable in Settings →"), payments, identity verification, App Store / external review waits, physical actions. Critical rule: **do NOT mark the parent step `[x]` based on partial work** — PLANNING.md is the only durable surface for "what's next," and misrepresenting completion there causes downstream runs to fail far from the cause.
+**Case D — Mid-step discovery of unmarked human-only work (per `templates/planning/INSTRUCTIONS.md` (human-action marker) "Mid-step discovery").** Triggers when either (a) Step 1's heuristic scan flagged this step upfront, OR (b) during implementation you realize part of the acceptance criteria matches the template's "When to mark" criteria — the pattern list: interactive OAuth flows (`wrangler login`, `gh auth login`, `gcloud auth login`), local-machine verification ("test on physical device," "open in browser"), third-party dashboard configuration ("create account at," "enable in Settings →"), payments, identity verification, App Store / external review waits, physical actions. Critical rule: **do NOT mark the parent step `[x]` based on partial work** — PLANNING.md is the only durable surface for "what's next," and misrepresenting completion there causes downstream runs to fail far from the cause.
 
 Two sub-cases:
 
@@ -128,7 +128,7 @@ Two sub-cases:
 
 1. Do the agent-doable work normally (per Case A's engineering judgment).
 2. Edit `PLANNING.md` inline in this same PR (per the inline-doc-update convention resolved 2026-05-20):
-   - Append a parenthetical to the parent step's text: `(split mid-implementation per STANDARDS §4.2; criteria <list> moved to M<n>.<x>a/b/...)`.
+   - Append a parenthetical to the parent step's text: `(split mid-implementation per the PLANNING template instructions (templates/planning/INSTRUCTIONS.md, human-action marker); criteria <list> moved to M<n>.<x>a/b/...)`.
    - Insert new `*(human)*` sub-steps immediately after the parent step, named `M<n>.<x>a`, `M<n>.<x>b`, etc. Each sub-step's text restates the human-only criterion as a discrete action.
    - Mark the parent step `[x]` — its remaining (agent-doable) scope is complete.
 3. Continue to Step 4 (tests) and Step 5 (adversary loop) normally.
@@ -139,7 +139,7 @@ Two sub-cases:
 Log a final line and exit:
 
 ```
-implementer: step <parent-id> needs split per STANDARDS §4.2; emitted strategic queue entry <id>. Exiting without commit.
+implementer: step <parent-id> needs split per the PLANNING template instructions (templates/planning/INSTRUCTIONS.md, human-action marker); emitted strategic queue entry <id>. Exiting without commit.
 ```
 
 Skip Steps 4–6; still write the run-completed record and send the tick-report per Step 7.
@@ -188,7 +188,7 @@ The implementer does NOT pre-update those docs itself — the commit skill owns 
 **Pass the work item ID to the commit skill** so the PR body's closing section is populated correctly:
 
 - PLANNING.md step: include "Closes step M<n>.<x>" in the PR body's Summary; commit's Step 4b flips the checkbox in PLANNING.md.
-- BACKLOG.md item: include "Closes backlog item BL-<n>" in the PR body's Summary; commit's Step 4b moves the item from BACKLOG.md `## Open` to `## Closed` with date + PR number (per `STANDARDS §4.3` item shape).
+- BACKLOG.md item: include "Closes backlog item BL-<n>" in the PR body's Summary; commit's Step 4b moves the item from BACKLOG.md `## Open` to `## Closed` with date + PR number (per `templates/backlog/INSTRUCTIONS.md` item shape).
 
 **Pass the implementer's `run_id` to the commit skill** (export as `IMPLEMENTER_RUN_ID` env var before invoking) so commit's four mid-flight activity records stitch into the same logical run as the implementer's `run-started` / `run-completed` bracket. Commit's records are required mid-flight observability per `STANDARDS §9` "Commit-skill exit contract" — when the implementer dies inside Step 6 (max-turns, crash), commit's `commit-started` / `tier-classified` / `pr-opened` / `commit-exited` records localize the failure to a phase boundary.
 
@@ -248,7 +248,7 @@ Guard trips and Step 1 target-not-found exits happen before the run-started reco
 | Failure                                                         | Behavior                                                                                                                                                                                                                                             |
 | --------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Guard 1–2 trip, or Step 1 target not found / no qualifying step | Exit cleanly with `::warning::` / `::notice::` log line. No queue entry, no activity record (run hadn't started). Tick-report outcome: `guard-tripped`.                                                                                              |
-| Next step is marked `*(human)*` (`STANDARDS §4.2`)              | Emit `strategic` queue entry per Step 3 Case C; write `run-completed` record with `outcome: "blocked-human"`; exit cleanly. No commit, no attempt to skip ahead.                                                                                     |
+| Next step is marked `*(human)*` (`templates/planning/INSTRUCTIONS.md` (human-action marker))              | Emit `strategic` queue entry per Step 3 Case C; write `run-completed` record with `outcome: "blocked-human"`; exit cleanly. No commit, no attempt to skip ahead.                                                                                     |
 | Step implementation fails (cannot determine what to do)         | Emit `strategic` queue entry per Step 3 Case B; write `run-completed` with `outcome: "blocked-strategic"`; exit.                                                                                                                                     |
 | Tests fail in code this step touched and agent can't fix        | Continue to commit; note in PR body `## Notes`. The commit skill's CI-red handling flips would-be-auto-merge to MEDIUM queue. `run-completed` outcome is `"queued-for-approval"` or `"committed"` depending on commit gate.                          |
 | Tests fail in unrelated code                                    | Note in `## Notes`; continue. Same CI-red flow if CI catches it.                                                                                                                                                                                     |
@@ -257,7 +257,7 @@ Guard trips and Step 1 target-not-found exits happen before the run-started reco
 | Reviewer SKILL.md missing from `.fleet-ci/`                     | Log `::warning::implementer: pre-commit-reviewer SKILL.md missing; skipping adversary loop` and proceed to Step 6. This is a CI configuration failure; don't gate work on it. Operator notices via the missing review records in the activity trail. |
 | Commit skill exits cleanly (auto-merged or queued)              | Implementer exits success; `run-completed` outcome is `"committed"` or `"queued-for-approval"`.                                                                                                                                                      |
 | Commit skill emits exception entry                              | Implementer exits success — the exception entry is the right surface for the failure, not a duplicate workflow failure. `run-completed` outcome is `"queued-for-approval"`.                                                                          |
-| `claude-code-action` itself errors                              | The workflow's error handling fires; if a queue entry for that case is wanted, the central workflow's `if: failure()` path emits one (like security-review's pattern). `run-completed` may not write — workflow-level failure, not skill-level.      |
+| `claude-code-action` itself errors                              | The central workflow's `if: failure()` handler (added 2026-06-04) emits the `workflow-failed` exception queue entry per `PACKETS.md` and a tick-report with outcome `workflow-failed` (orchestrator → `errored`). `run-completed` does not write — workflow-level failure, not skill-level.      |
 | `QUEUE_SERVICE_ROLE_KEY` missing                                | Commit skill's graceful fallback fires; reviewer and implementer activity writes both skip with `::warning::`. The skill itself doesn't fail; the operator notices via missing queue entry and missing activity records.                             |
 
 ---
@@ -271,9 +271,5 @@ The agent does NOT enforce concurrency. The central workflow does, via `concurre
 ## What this skill does NOT do
 
 - **Multiple work items per run.** One PLANNING.md step OR one BACKLOG.md item per invocation; exits after commit. The verify gate is the loop boundary. Never mixes the two surfaces in a single run — the hub picker owns prioritization.
-- **Skip past `*(human)*`-marked steps.** Those are hard blockers per `STANDARDS §4.2`. Emit `strategic` queue entry (Step 3 Case C) and exit; do not advance to the next unchecked step. If Seth wants out-of-order execution, he reorders PLANNING.
-- **Decide tech-stack or major architecture.** Those are HIGH tier per `§9` elevation rules and always queue. If a step's acceptance criteria require such a decision, emit a `strategic` queue entry and exit (per Step 3 Case B ambiguity flow).
-- **Modify PLANNING.md itself beyond what's needed for the completed step.** The commit skill's Step 4b owns inline doc updates (flipping the completed checkbox, refreshing LIFECYCLE/CHANGELOG/PRODUCT). Restructuring or re-prioritizing PLANNING is Seth's lane.
-- **Make creative or strategic calls.** Per `STANDARDS.md §10` — those queue as `strategic` entries. The agent prepares; Seth decides.
-- **Wait for queue entry resolution.** The skill exits after commit; the hub orchestrator resumes the loop.
-- **Self-debug claude-code-action infrastructure issues.** Token expiry, quota exhaustion, etc. surface as workflow failures; the operator (or a future ops agent) handles them.
+- **Skip past `*(human)*`-marked steps.** Those are hard blockers per `templates/planning/INSTRUCTIONS.md` (human-action marker). Emit `strategic` queue entry (Step 3 Case C) and exit; do not advance to the next unchecked step. If Seth wants out-of-order execution, he reorders PLANNING.
+- **Decide tech-stack or major architecture.** Those are HIGH tier per `§9` elevation rules and always queue. If a step's acceptance criteria require such a decision,
