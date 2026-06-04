@@ -62,7 +62,7 @@ Every packet includes:
   "risk_tier": "medium",
   "title": "[<slug>] PLANNING step <id> needs your manual action",
   "goal": "Advance PLANNING.md past step <id>",
-  "attempts": ["Identified step <id> as next unblocked step; step is marked *(human)* per STANDARDS §4.2"],
+  "attempts": ["Identified step <id> as next unblocked step; step is marked *(human)* per the PLANNING template instructions (templates/planning/INSTRUCTIONS.md, human-action marker)"],
   "ask": "<full step text including acceptance criteria, copied verbatim from PLANNING.md>",
   "recommendation": "Complete the manual action, then check off the step in PLANNING.md and commit. Implementer cannot advance past this step until that is done; downstream steps likely depend on it."
 }
@@ -79,7 +79,7 @@ Every packet includes:
   "goal": "Complete the human-only criteria split out from <parent-id>",
   "attempts": [
     "Implemented agent-doable scope of <parent-id> in PR #<n>",
-    "Split human-only criteria into <list of new sub-step IDs> per STANDARDS §4.2 mid-step discovery"
+    "Split human-only criteria into <list of new sub-step IDs> per the PLANNING template instructions (templates/planning/INSTRUCTIONS.md, human-action marker) mid-step discovery"
   ],
   "ask": "Complete the new *(human)* sub-steps (<list>); check them off in PLANNING.md. Next implementer run will block on these per Case C until they're done.",
   "recommendation": "Review the split in PR #<n>; if the partition is wrong, edit PLANNING.md to restore the parent step and reopen scope as needed before the next implementer run."
@@ -96,7 +96,7 @@ Every packet includes:
   "title": "[<slug>] PLANNING step <parent-id> mixes agent-doable and human-only work; how should I split it?",
   "goal": "Implement <parent step text>",
   "attempts": [
-    "Identified human-only criteria via STANDARDS §4.2 heuristics: <list>",
+    "Identified human-only criteria via the PLANNING template's "When to mark" heuristics: <list>",
     "Could not cleanly partition — criteria appear entangled"
   ],
   "ask": "Restructure <parent-id> in PLANNING.md to separate agent-doable scope from *(human)* sub-steps; re-run implementer once the split is committed.",
@@ -121,45 +121,23 @@ Every packet includes:
 }
 ```
 
+### `workflow-failed` (central workflow, not the skill)
+
+Emitted by `implementer-callable.yml`'s `if: failure()` handler (added 2026-06-04) when the claude-code-action step itself dies — max-turns, crash, infra error — meaning the agent never reached its own exit path, so no in-band packet or tick-report fired. Documented here for completeness; the skill never emits this variant. The handler also sends a tick-report with outcome `workflow-failed` (orchestrator maps it to `errored`).
+
+```json
+{
+  "request_id": "<sha256 of github-run-id + 'workflow-failed'>",
+  "entry_type": "exception",
+  "risk_tier": "high",
+  "title": "[<slug>] implementer workflow failed on <target_ref>",
+  "goal": "Advance <target_kind>/<target_ref> by one step",
+  "attempts": ["claude-code-action step failed before the skill's own exit path; no in-band queue entry or tick-report was sent. Run: <run_url>"],
+  "ask": "Inspect the workflow run log; decide retry, fix the step/criteria, or restructure the target",
+  "recommendation": "Check the last tool calls in the log — max-turns deaths usually mean the agent was attempting work outside its lane"
+}
+```
+
 ## Activity records
 
-Both records share the queue-packet common fields plus `run_id`. POST to `/api/v1/activity/entries`.
-
-### `run-started`
-
-Written immediately after Step 1 resolves the work item, before implementation begins.
-
-```json
-{
-  "request_id": "<sha256 of run_id + 'run-started'>",
-  "action": "run-started",
-  "run_id": "<run_id>",
-  "payload": {
-    "step_id": "<M2.7 or BL-12>",
-    "step_text": "<full step text>",
-    "target_kind": "<milestone|backlog>",
-    "target_ref": "<M<n>|BL-<n>>",
-    "github_run_id": "$GITHUB_RUN_ID",
-    "github_sha": "$GITHUB_SHA"
-  }
-}
-```
-
-### `run-completed`
-
-Written at exit on every path after run-started was written. Guard trips and Step 1 target-not-found exits happen before run-started, so they write no activity records (tick-report only).
-
-```json
-{
-  "request_id": "<sha256 of run_id + 'run-completed'>",
-  "action": "run-completed",
-  "run_id": "<run_id>",
-  "payload": {
-    "step_id": "<M2.7 or BL-12>",
-    "outcome": "committed" | "queued-for-approval" | "blocked-strategic" | "blocked-human" | "blocked-adversary-cap-hit" | "blocked-tests",
-    "iterations_used": <0-3>,
-    "pr_url": "<url or null>",
-    "queue_entry_id": "<id if any queue entry was emitted, else null>"
-  }
-}
-```
+Both records share the queue-packet common fields plus `run_id`. POST to `/api/v1/a
