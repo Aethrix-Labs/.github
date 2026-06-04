@@ -75,6 +75,8 @@ head -10 docs/LIFECYCLE.md 2>/dev/null || head -10 LIFECYCLE.md
 
 Extract `stage:` and `monetized:` from the frontmatter header. Missing or unparseable → default to `stage: production`, `monetized: true` (fail up). Note this in the PR body as "LIFECYCLE.md repair needed."
 
+**Migration detection (per `STANDARDS §9` "Database-migration handling").** While reading the diff, check whether it adds schema-migration files: new `*.sql` under the Drizzle `out` directory (read `drizzle.config.*`; default `migrations/` or `drizzle/`), or the equivalent for the product's ORM. If yes, also check whether the product's deploy is **migration-aware**: its deploy workflow (`.github/workflows/*`) or `DEPLOYMENT.md`-documented deploy command contains a `migrations apply` step. Record `<MIGRATIONS_DETECTED>` (`true`/`false`) and `<DEPLOY_MIGRATION_AWARE>` (`true`/`false`/`n/a` when no migrations detected) for the Step 4f bundle; they drive Step 5.6.
+
 ### Step 2: Consume the adversary result
 
 The implementer already ran the adversary loop (its Step 5) before invoking this skill. Do NOT re-run `pre-commit-reviewer`. Consume:
@@ -193,6 +195,9 @@ Reduce to a single value: `failed` if any required check has bucket `fail`; othe
 | `<TESTS_SUMMARY>`       | implementer input or `none`         | `3 added, 0 untestable`                  |
 | `<RECOMMENDATION>`      | composed from Step 2 + 4e           | `Approve — all checks green`             |
 | `<MILESTONE_CLOSED>`    | Step 4b milestone-close check       | `M3` or `false`                          |
+| `<MIGRATIONS_DETECTED>` | Step 1 migration detection          | `true`                                   |
+| `<DEPLOY_MIGRATION_AWARE>` | Step 1 awareness check           | `false` (or `n/a`)                       |
+| `<MIGRATION_FILES>`     | Step 1 migration detection          | `migrations/0007_learning_loop.sql`      |
 
 **If `<ADVERSARY_CONVERGED> == false`,** Steps 4a–4f are skipped entirely (no PR is opened on Route C). The bundle then only requires `<TIER>`, `<RATIONALE>`, `<STAGE>`, `<MUST_ESCALATE_HIT>`, `<ADVERSARY_CONVERGED>`, `<PRODUCT_SLUG>`; the PR-related fields are absent by design. Step 5's guard accounts for this.
 
@@ -245,7 +250,7 @@ This step is **mechanical**. Walk the decision tree top-down to a single termina
 
 **5a. Guard — verify Step 4 outputs exist.**
 
-- **Always required** (every run): `<TIER>`, `<RATIONALE>`, `<STAGE>`, `<MUST_ESCALATE_HIT>`, `<ADVERSARY_CONVERGED>`, `<PRODUCT_SLUG>`.
+- **Always required** (every run): `<TIER>`, `<RATIONALE>`, `<STAGE>`, `<MUST_ESCALATE_HIT>`, `<ADVERSARY_CONVERGED>`, `<PRODUCT_SLUG>`, `<MIGRATIONS_DETECTED>`, `<DEPLOY_MIGRATION_AWARE>`.
 - **Additionally required when `<ADVERSARY_CONVERGED> == true`** (a PR exists): `<CI_STATUS>`, `<PR_NUMBER>`, `<PR_URL>`, `<PR_TITLE>`, `<PLANNING_ANCHOR_URL>`, `<ADVERSARY_SUMMARY>`, `<TESTS_SUMMARY>`, `<RECOMMENDATION>`, `<MILESTONE_CLOSED>`.
 
 If any required name is missing, **stop immediately**: log `::error::commit: Step 5 guard failed — Step 4 outputs missing: <list>`, emit the **`exception`** packet with that cause, and exit `exception_emitted`. Do not pick a route. Missing outputs mean Step 4 didn't finish; pressing on produces exactly the brittleness the §11.3 entry resolves.
@@ -314,6 +319,14 @@ Fires iff `<MILESTONE_CLOSED> != false` and a PR was opened (Routes A and B; nev
 
 Read `.fleet-ci/.github/scripts/milestone-close/SKILL.md` and run its **Phase 2**: compose the manual test plan and POST the medium-tier `follow-up` queue entry (shipped summary + how Seth should manually test the milestone). The entry is non-blocking — on POST failure or missing `QUEUE_SERVICE_ROLE_KEY`, log a warning, include the test plan in this skill's final output, and continue. Never block or unwind the merge over it.
 
+### Step 5.6: Migration-pending emission (conditional — Routes A and B only)
+
+Fires iff `<MIGRATIONS_DETECTED> == true` AND `<DEPLOY_MIGRATION_AWARE> == false` and a PR was opened (Routes A and B; never Route C). Per `STANDARDS §9` "Database-migration handling."
+
+Emit the **`migration-pending`** packet per `PACKETS.md`: migration filenames, DB binding, the exact `wrangler d1 migrations apply` commands for staging and prod, and the PR URL. The PR's merge route is unaffected — the code is fine; the entry exists so the hub blocks the *next dispatch* until migrations are applied and the entry is resolved (hub-side enforcement, same point as verify entries).
+
+Unlike Step 5.5, a failed POST here is NOT silently absorbed: on non-2xx or missing `QUEUE_SERVICE_ROLE_KEY`, log `::error::commit: migration-pending entry failed to post — migrations in PR #<PR_NUMBER> will NOT block dispatch; apply manually: <commands>` and surface the apply commands in the skill's final output. Still exit on the route's normal exit reason. When `<DEPLOY_MIGRATION_AWARE> == true`, skip — CD applies the migrations on deploy; a deploy failure routes through the existing exception path.
+
 ### Step 6: Exit
 
 > Write the **`commit-exited`** activity record.
@@ -344,6 +357,7 @@ Merge execution lives in the hub Worker (`mergePr()`, holding `GITHUB_MERGE_TOKE
 | Inline doc-update at Step 4b fails                     | Stop before opening PR; exception packet naming the failed doc, partial branch state preserved. Re-running on the same branch re-attempts cleanly.                             |
 | Milestone archive (Step 4b milestone-close Phase 1) fails or script missing | Per `milestone-close/SKILL.md` Phase 1c: "not archivable" → recheck closure, don't force; "not found" with the milestone already in `PLANNING_ARCHIVE.md` → idempotent success; script missing / §9 contract mismatch → skip archive, note in PR body `## Notes`, still run Step 5.5. |
 | Milestone follow-up POST (Step 5.5) non-2xx or key missing | Log `::warning::`, surface the test plan in the skill's final output, continue. Non-blocking by design. |
+| Migration-pending POST (Step 5.6) non-2xx or key missing | Log `::error::` with the apply commands inline (loud — an unposted entry means dispatch won't block); surface commands in final output; continue on the route's normal exit reason. |
 
 ---
 
