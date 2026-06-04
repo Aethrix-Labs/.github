@@ -36,6 +36,7 @@ The hub resolves `product_slug` → `product_id` server-side.
 | ----------- | ------------------------- | ---------- | ------------------ | ------------------------------------- |
 | `approval`  | Step 5 Route B            | approval   | `<TIER_FOR_PACKET>` | `sha256(<PR_URL>)` — idempotent on re-run |
 | `exception` | Step 5 Route C (no PR)    | exception  | `<TIER>`           | `sha256(<branch> + <timestamp>)`      |
+| `migration-pending` | Step 5.6 (Routes A and B) | exception  | high       | `sha256(<PR_URL> + 'migration-pending')` — idempotent per PR |
 
 ### `approval` (Route B)
 
@@ -88,6 +89,32 @@ The PR is NOT opened on Route C — the diff stays on the local branch.
 ```
 
 Omit the adversary-report artifact when the block isn't adversary-related (e.g. doc-update failure, deploy failure).
+
+### `migration-pending` (Step 5.6)
+
+Emitted alongside an open PR (Routes A and B) when the diff adds migration files and the product's deploy is not migration-aware (per `STANDARDS §9` "Database-migration handling"). The PR's merge route is unaffected; this entry exists so the hub blocks the next dispatch until migrations are applied.
+
+```json
+{
+  "request_id": "<SHA256_OF_PR_URL_PLUS_MIGRATION_PENDING>",
+  "entry_type": "exception",
+  "category": "migration-pending",
+  "risk_tier": "high",
+  "title": "[<PRODUCT_SLUG>] migrations pending: PR #<PR_NUMBER> adds <N> migration file(s) — apply before next dispatch",
+  "goal": "PR #<PR_NUMBER> (<PR_TITLE>) adds schema migrations that CD does not auto-apply: <MIGRATION_FILES>",
+  "attempts": [
+    "Detected migration files in diff: <MIGRATION_FILES>",
+    "Deploy workflow / DEPLOYMENT.md has no `migrations apply` step — CD will not apply them"
+  ],
+  "ask": "Apply the migrations, then resolve this entry to unblock dispatch. Staging: `npx wrangler d1 migrations apply <DB_BINDING> --remote --env staging` — Prod: `npx wrangler d1 migrations apply <DB_BINDING> --remote --env production`. (Adjust env flags to the product's wrangler config; see its DEPLOYMENT.md.)",
+  "recommendation": "Apply to staging now; prod rides the next gated prod deploy. Longer-term: make this product's deploy migration-aware per STANDARDS §9 so this entry stops firing.",
+  "artifacts": [
+    { "label": "PR", "href": "<PR_URL>", "artifact_type": "github-pr" }
+  ]
+}
+```
+
+`<DB_BINDING>` comes from the product's `wrangler.toml`/`wrangler.jsonc` `d1_databases` binding. Multiple bindings touched → one command line per binding inside `ask`.
 
 ## Activity records
 
