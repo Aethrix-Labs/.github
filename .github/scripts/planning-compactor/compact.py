@@ -23,10 +23,18 @@ Three modes:
              summary form). Atomic writes via temp-file-then-rename so a crash mid-write
              can't leave either file half-modified.
 
+Single-milestone mode (2026-06-03, consumed by the `milestone-close` skill in CI):
+  --milestone M<n>   Restrict the plan to exactly one fully-closed milestone. Errors
+                     (exit 1) if the milestone is missing or not fully closed — never
+                     silently archives something else. Valid with --dry-run / --apply.
+  --summary "<text>" Convenience for --milestone --apply: the composed one-paragraph
+                     summary for that single milestone, inline instead of a JSON file.
+
 Invocation:
   python3 compact.py --check    docs/PLANNING.md
   python3 compact.py --dry-run  docs/PLANNING.md
   python3 compact.py --apply    docs/PLANNING.md
+  python3 compact.py --apply --milestone M3 --summary "<paragraph>" docs/PLANNING.md
 
 Exit codes:
   0  Clean run (any mode)
@@ -753,7 +761,29 @@ def main() -> int:
              "with a CHANGELOG match render an \"awaiting composed summary\" placeholder; "
              "milestones without a match render a git-history pointer.",
     )
+    parser.add_argument(
+        "--milestone",
+        help="Restrict the plan to exactly one milestone ID (e.g. M3, MFB.1). The "
+             "milestone must exist and be fully closed; anything else exits 1. "
+             "Not valid with --check.",
+    )
+    parser.add_argument(
+        "--summary",
+        help="Composed one-paragraph summary for the --milestone target (single-"
+             "milestone --apply convenience; alternative to --summaries). "
+             "Requires --milestone.",
+    )
     args = parser.parse_args()
+
+    if args.milestone and args.check:
+        print(json.dumps({"error": "--milestone is not valid with --check"}), file=sys.stderr)
+        return 2
+    if args.summary and not args.milestone:
+        print(json.dumps({"error": "--summary requires --milestone"}), file=sys.stderr)
+        return 2
+    if args.summary and args.summaries:
+        print(json.dumps({"error": "--summary and --summaries are mutually exclusive"}), file=sys.stderr)
+        return 2
 
     planning_path = Path(args.planning_path)
     if not planning_path.exists():
@@ -794,10 +824,43 @@ def main() -> int:
     )
     plan["changelog_file"] = str(changelog_path) if changelog_path else None
 
+    if args.milestone:
+        mid = args.milestone.upper()
+        matched = [a for a in plan["archivable"] if (a["id"] or "").upper() == mid]
+        if not matched:
+            blocked = [n for n in plan["non_archivable"] if (n["id"] or "").upper() == mid]
+            if blocked:
+                print(
+                    json.dumps({"error": f"milestone {mid} is not archivable: {blocked[0]['reason']}"}),
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    json.dumps({"error": f"milestone {mid} not found in {planning_path}"}),
+                    file=sys.stderr,
+                )
+            return 1
+        # Narrow the plan to the single target. apply_plan derives the cut set from
+        # plan["archivable"], so filtering here is sufficient; recompute the derived
+        # fields so dry-run JSON stays truthful.
+        plan["scope"] = "single-milestone"
+        plan["archivable"] = matched
+        kept_ids = {(a["id"] or "").upper() for a in matched}
+        oc = plan["overview_table_changes"]
+        all_rows = oc["rows_to_remove"] + oc["rows_to_keep"]
+        plan["overview_table_changes"] = {
+            "rows_to_remove": [m for m in all_rows if m.upper() in kept_ids],
+            "rows_to_keep": [m for m in all_rows if m.upper() not in kept_ids],
+        }
+        plan["estimated_line_reduction"] = sum(a["line_count"] for a in matched)
+
     if args.apply:
         archive_date = args.archive_date or datetime.date.today().isoformat()
         composed_summaries: Optional[dict[str, str]] = None
-        if args.summaries:
+        if args.summary:
+            # Key by the matched plan ID (exact casing from the heading), not the raw arg.
+            composed_summaries = {plan["archivable"][0]["id"]: args.summary}
+        elif args.summaries:
             summaries_path = Path(args.summaries)
             if not summaries_path.exists():
                 print(json.dumps({"error": f"--summaries file not found: {summaries_path}"}), file=sys.stderr)

@@ -125,7 +125,7 @@ Then skim the source files the design will touch. The goal is to map *design sur
 
 **Stay stack-agnostic.** Never assume a framework, language, or host — read `docs/DECISIONS.md`, `docs/CLAUDE.md`, and `docs/ARCHITECTURE.md` and plan in this product's terms. If the product uses a stack with a runbook in `docs/stacks/<stack>.md` (indexed in `FLEET_TECH.md §2.1`), consult it for platform-bootstrap steps.
 
-If `docs/PLANNING.md` doesn't exist, this product hasn't reached Phase 4 — flag it rather than inventing a structure. `PLANNING.md` needs authoring first (start from `~/products/docs/templates/PLANNING.md`).
+If `docs/PLANNING.md` doesn't exist, this product hasn't reached Phase 4 — flag it rather than inventing a structure. `PLANNING.md` needs authoring first (start from `~/products/docs/templates/planning/PLANNING.md`).
 
 ## Step 3: Derive the milestone(s) and steps
 
