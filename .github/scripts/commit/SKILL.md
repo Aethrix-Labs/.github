@@ -131,6 +131,7 @@ In CI the working tree is always a fresh checkout of `main`. If HEAD is somehow 
 The docs to consider, in order:
 
 - **`PLANNING.md`** — flip the completed step's checkbox to `[x]`. If multiple sub-bullets were the step's acceptance criteria, flip those too. Be conservative — only check off what was actually fully completed by this PR. Partial → leave unchecked and add `*(partial — X done)*` in the step body.
+  - **Milestone-close check.** After flipping, test whether the step was **milestone-closing** per `STANDARDS §9`: every top-level checkbox under its parent `## M<n>` heading is now `[x]`. If yes, read `.fleet-ci/.github/scripts/milestone-close/SKILL.md` and run its **Phase 1** (archive the closed milestone to `PLANNING_ARCHIVE.md` via `compact.py --milestone`) so the archive rides in this same commit. Record `<MILESTONE_CLOSED> = <M-id>` for the Step 4f bundle; record `false` when no milestone closed. Run Phase 1 **after** this PLANNING flip and **before** the `LIFECYCLE.md` update below (so `next_milestone:` reads from the post-archive file).
 - **`LIFECYCLE.md`** — bump `last_updated:` to today's date. Update `next_milestone:` to whatever's next in `PLANNING.md`. If the next step is marked `*(human)*` per `STANDARDS §4.2`, propagate the `(human)` annotation into `next_milestone:` so the hub dashboard surfaces the manual-action state at a glance. Body sections only if state materially shifted.
 - **`CHANGELOG.md`** — prepend a new entry with today's date and a short title. Include both a `**User-facing:**` section (what end-users notice — omit if pure infra) and a `**Developer:**` section (what changed in the repo, in terms a maintainer cares about). Match the existing file's date and heading conventions if one exists.
 - **`PRODUCT.md`** — only update if this PR changed user-facing product knowledge (in-app FAQ, help docs, agent-readable feature descriptions). Per `SKILL_AUDIT §3.9` this is `PRODUCT.md`'s scope. Pure scaffolding / infra / refactors don't touch it. `ARCHITECTURE.md` updates remain out-of-scope (gap G13 — flag material architecture changes in `## Notes` of the PR body instead).
@@ -191,6 +192,7 @@ Reduce to a single value: `failed` if any required check has bucket `fail`; othe
 | `<ADVERSARY_SUMMARY>`   | Step 2 (from implementer)           | `converged, no findings`                 |
 | `<TESTS_SUMMARY>`       | implementer input or `none`         | `3 added, 0 untestable`                  |
 | `<RECOMMENDATION>`      | composed from Step 2 + 4e           | `Approve — all checks green`             |
+| `<MILESTONE_CLOSED>`    | Step 4b milestone-close check       | `M3` or `false`                          |
 
 **If `<ADVERSARY_CONVERGED> == false`,** Steps 4a–4f are skipped entirely (no PR is opened on Route C). The bundle then only requires `<TIER>`, `<RATIONALE>`, `<STAGE>`, `<MUST_ESCALATE_HIT>`, `<ADVERSARY_CONVERGED>`, `<PRODUCT_SLUG>`; the PR-related fields are absent by design. Step 5's guard accounts for this.
 
@@ -244,7 +246,7 @@ This step is **mechanical**. Walk the decision tree top-down to a single termina
 **5a. Guard — verify Step 4 outputs exist.**
 
 - **Always required** (every run): `<TIER>`, `<RATIONALE>`, `<STAGE>`, `<MUST_ESCALATE_HIT>`, `<ADVERSARY_CONVERGED>`, `<PRODUCT_SLUG>`.
-- **Additionally required when `<ADVERSARY_CONVERGED> == true`** (a PR exists): `<CI_STATUS>`, `<PR_NUMBER>`, `<PR_URL>`, `<PR_TITLE>`, `<PLANNING_ANCHOR_URL>`, `<ADVERSARY_SUMMARY>`, `<TESTS_SUMMARY>`, `<RECOMMENDATION>`.
+- **Additionally required when `<ADVERSARY_CONVERGED> == true`** (a PR exists): `<CI_STATUS>`, `<PR_NUMBER>`, `<PR_URL>`, `<PR_TITLE>`, `<PLANNING_ANCHOR_URL>`, `<ADVERSARY_SUMMARY>`, `<TESTS_SUMMARY>`, `<RECOMMENDATION>`, `<MILESTONE_CLOSED>`.
 
 If any required name is missing, **stop immediately**: log `::error::commit: Step 5 guard failed — Step 4 outputs missing: <list>`, emit the **`exception`** packet with that cause, and exit `exception_emitted`. Do not pick a route. Missing outputs mean Step 4 didn't finish; pressing on produces exactly the brittleness the §11.3 entry resolves.
 
@@ -306,6 +308,12 @@ Emit the **`approval`** packet per `PACKETS.md`. Exit reason: **`queued`**, with
 
 Emit the **`exception`** packet per `PACKETS.md`. No PR is opened; the diff stays on the local branch (pushed to the remote branch if 4c completed, otherwise local-only — name the branch in the packet either way). Exit reason: **`exception_emitted`**.
 
+### Step 5.5: Milestone follow-up emission (conditional — Routes A and B only)
+
+Fires iff `<MILESTONE_CLOSED> != false` and a PR was opened (Routes A and B; never Route C). Runs **before** Step 6 on Route A, and as the final action before exit on Route B.
+
+Read `.fleet-ci/.github/scripts/milestone-close/SKILL.md` and run its **Phase 2**: compose the manual test plan and POST the medium-tier `follow-up` queue entry (shipped summary + how Seth should manually test the milestone). The entry is non-blocking — on POST failure or missing `QUEUE_SERVICE_ROLE_KEY`, log a warning, include the test plan in this skill's final output, and continue. Never block or unwind the merge over it.
+
 ### Step 6: Exit
 
 > Write the **`commit-exited`** activity record.
@@ -334,6 +342,8 @@ Merge execution lives in the hub Worker (`mergePr()`, holding `GITHUB_MERGE_TOKE
 | Queue write non-2xx / `QUEUE_SERVICE_ROLE_KEY` missing | Route B: leave PR + `commit-pending-merge` label for the MFB.1 sweep; warn; exit `queued`. Route C: log `::error::` (the block is unreported — the workflow log is the trail). |
 | Activity write fails                                   | Log `::warning::`; continue. Observability, not a gate.                                                                                                                        |
 | Inline doc-update at Step 4b fails                     | Stop before opening PR; exception packet naming the failed doc, partial branch state preserved. Re-running on the same branch re-attempts cleanly.                             |
+| Milestone archive (Step 4b milestone-close Phase 1) fails or script missing | Per `milestone-close/SKILL.md` Phase 1c: "not archivable" → recheck closure, don't force; "not found" with the milestone already in `PLANNING_ARCHIVE.md` → idempotent success; script missing / §9 contract mismatch → skip archive, note in PR body `## Notes`, still run Step 5.5. |
+| Milestone follow-up POST (Step 5.5) non-2xx or key missing | Log `::warning::`, surface the test plan in the skill's final output, continue. Non-blocking by design. |
 
 ---
 
