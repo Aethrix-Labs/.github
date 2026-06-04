@@ -140,4 +140,43 @@ Emitted by `implementer-callable.yml`'s `if: failure()` handler (added 2026-06-0
 
 ## Activity records
 
-Both records share the queue-packet common fields plus `run_id`. POST to `/api/v1/a
+Both records share the queue-packet common fields plus `run_id`. POST to `/api/v1/activity/entries`.
+
+### `run-started`
+
+Written immediately after Step 1 resolves the work item, before implementation begins.
+
+```json
+{
+  "request_id": "<sha256 of run_id + 'run-started'>",
+  "action": "run-started",
+  "run_id": "<run_id>",
+  "payload": {
+    "step_id": "<M2.7 or BL-12>",
+    "step_text": "<full step text>",
+    "target_kind": "<milestone|backlog>",
+    "target_ref": "<M<n>|BL-<n>>",
+    "github_run_id": "$GITHUB_RUN_ID",
+    "github_sha": "$GITHUB_SHA"
+  }
+}
+```
+
+### `run-completed`
+
+Written at exit on every path after run-started was written. Guard trips and Step 1 target-not-found exits happen before run-started, so they write no activity records (tick-report only).
+
+```json
+{
+  "request_id": "<sha256 of run_id + 'run-completed'>",
+  "action": "run-completed",
+  "run_id": "<run_id>",
+  "payload": {
+    "step_id": "<M2.7 or BL-12>",
+    "outcome": "committed" | "queued-for-approval" | "blocked-strategic" | "blocked-human" | "blocked-adversary-cap-hit" | "blocked-tests",
+    "iterations_used": <0-3>,
+    "pr_url": "<url or null>",
+    "queue_entry_id": "<id if any queue entry was emitted, else null>"
+  }
+}
+```
