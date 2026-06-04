@@ -187,6 +187,11 @@ Three modes (all take a path to `PLANNING.md` as positional arg):
 - `--dry-run` (default) — emit the structured plan JSON described in Step 3. No file writes.
 - `--apply` — execute the plan and write the files. Same JSON output plus `wrote_files` list.
 
+Single-milestone flags (added 2026-06-03 for the `milestone-close` CI consumer; valid with `--dry-run`/`--apply`, not `--check`):
+
+- `--milestone <id>` — restrict the plan to exactly that fully-closed milestone. Missing or still-open → structured error, exit 1; never silently archives something else.
+- `--summary "<text>"` — the composed paragraph for the single target, inline (alternative to `--summaries=<json>`).
+
 Invocation:
 
 ```bash
@@ -195,7 +200,7 @@ python3 skills/planning-compactor/compact.py --dry-run docs/PLANNING.md
 python3 skills/planning-compactor/compact.py --apply docs/PLANNING.md
 ```
 
-If running from a vended location (`Aethrix-Labs/.github:.github/scripts/planning-compactor/`), substitute the path. The skill is **not currently CI-wired** — it runs at human invocation; if it ever gets a CI consumer (e.g., scheduled compaction), it would need a `vending.json` per the §17.5 vending convention.
+If running from a vended location (`Aethrix-Labs/.github:.github/scripts/planning-compactor/`), substitute the path. This SKILL.md runs at human invocation only, but `compact.py` **has a CI consumer as of 2026-06-03**: the `milestone-close` skill (invoked by `commit` when a step closes its milestone) calls `compact.py --apply --milestone <id> --summary "<paragraph>"` to archive the single just-closed milestone non-interactively — no dry-run/approval loop, risk covered by the PR gate it rides inside. The `vending.json` in this folder vends the bundle for that consumer per §17.5. With milestone-close running at every close, bulk compaction here is the backstop: legacy files, products predating milestone-close, post-incident cleanup.
 
 ## When to use this skill — quick checklist
 
