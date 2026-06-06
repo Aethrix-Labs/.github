@@ -49,9 +49,9 @@ jobs:
         with:
           fetch-depth: 0 # needed for full git history (commit skill reads log)
 
-      - uses: actions/checkout@v4 # central repo (SKILL.md + scripts)
+      - uses: actions/checkout@v4 # fleet-skills repo (CI skills under ci/)
         with:
-          repository: Aethrix-Labs/.github
+          repository: Aethrix-Labs/fleet-skills
           path: .fleet-ci
           ref: main
 
@@ -87,12 +87,12 @@ jobs:
           prompt: |
             You are running as the **implementer agent** in CI.
 
-            Read `.fleet-ci/.github/scripts/implementer/SKILL.md` and follow
+            Read `.fleet-ci/ci/implementer/SKILL.md` and follow
             it exactly. It defines the pre-flight guards, the flow (resolve
             the directed target → implement the next unblocked step → invoke
             commit → exit), and the failure modes.
 
-            When ready to commit, read `.fleet-ci/.github/scripts/commit/SKILL.md`
+            When ready to commit, read `.fleet-ci/ci/ci-commit/SKILL.md`
             and follow its flow. The commit skill handles tier classification,
             PR body composition, queue emission, and merge routing.
 

@@ -3,10 +3,10 @@
 # Deployed at:   Aethrix-Labs/.github:.github/workflows/security-review.yml
 # Convention:    STANDARDS.md §17 (Fleet CI)
 # Spec:          SECURITY_REVIEW_REDESIGN.md §9 (§9.0 supersedes the per-repo vend model)
-# Authoring src: sethgibson-com:/skills/security-review/ (workflow YAML lives only here)
-# Helper src:    sethgibson-com:/skills/security-review/{*.py,SKILL.md}
-#                → promoted to Aethrix-Labs/.github:.github/scripts/security-review/
-#                  per the §17.5 drift/update protocol
+# Authoring src: fleet-command-center:/skills/security-review/ (canonical; workflow YAML lives only at .github)
+# Helper src:    fleet-command-center:/skills/security-review/{*.py,SKILL.md}
+#                → vended to Aethrix-Labs/fleet-skills:ci/security-review/ (STANDARDS §19.6)
+#                  and fetched at runtime via the second checkout into .fleet-ci/
 #
 # This workflow is deployed once at the org level. Every in-org repo inherits
 # it via the org ruleset (required workflow). No per-repo workflow file needed.
@@ -33,7 +33,7 @@ jobs:
 
       - uses: actions/checkout@v4 # central repo (helpers + SKILL.md)
         with:
-          repository: Aethrix-Labs/.github
+          repository: Aethrix-Labs/fleet-skills
           path: .fleet-ci
           ref: main
 
@@ -94,7 +94,7 @@ jobs:
       - name: Aggregate deterministic findings
         if: always()
         run: |
-          python3 .fleet-ci/.github/scripts/security-review/aggregator.py \
+          python3 .fleet-ci/ci/security-review/aggregator.py \
             --gitleaks gitleaks.sarif \
             --semgrep semgrep-results.json \
             --npm-audit npm-audit.json \
@@ -127,7 +127,7 @@ jobs:
 
       - uses: actions/checkout@v4 # central repo (helpers + SKILL.md)
         with:
-          repository: Aethrix-Labs/.github
+          repository: Aethrix-Labs/fleet-skills
           path: .fleet-ci
           ref: main
 
@@ -139,7 +139,7 @@ jobs:
       - name: Conditional gate (§3.3)
         id: gate
         run: |
-          python3 .fleet-ci/.github/scripts/security-review/should-run-semantic.py \
+          python3 .fleet-ci/ci/security-review/should-run-semantic.py \
             --base "${{ github.event.pull_request.base.sha }}" \
             --head "${{ github.event.pull_request.head.sha }}" \
             --deterministic-findings deterministic-findings.json
@@ -154,7 +154,7 @@ jobs:
           prompt: |
             You are running as the security-review semantic step in CI.
 
-            Read `.fleet-ci/.github/scripts/security-review/SKILL.md` and follow it
+            Read `.fleet-ci/ci/security-review/SKILL.md` and follow it
             exactly. It defines the three semantic checks, the triage rules,
             and the required output schema.
 
@@ -181,7 +181,7 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           COMMIT_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          python3 .fleet-ci/.github/scripts/security-review/queue-emit.py \
+          python3 .fleet-ci/ci/security-review/queue-emit.py \
             --semantic-failed \
             --fail-reason "Semantic step failed; see workflow run for details"
 
@@ -215,13 +215,13 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           if [ "${{ steps.gate.outputs.run }}" != "true" ]; then
-            python3 .fleet-ci/.github/scripts/security-review/pr-body-composer.py \
+            python3 .fleet-ci/ci/security-review/pr-body-composer.py \
               --deterministic-findings deterministic-findings.json \
               --semantic-findings semantic-findings.json \
               --semantic-skipped \
               --skip-reason "${{ steps.gate.outputs.reasons }}"
           else
-            python3 .fleet-ci/.github/scripts/security-review/pr-body-composer.py \
+            python3 .fleet-ci/ci/security-review/pr-body-composer.py \
               --deterministic-findings deterministic-findings.json \
               --semantic-findings semantic-findings.json
           fi
@@ -241,7 +241,7 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           COMMIT_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          python3 .fleet-ci/.github/scripts/security-review/queue-emit.py \
+          python3 .fleet-ci/ci/security-review/queue-emit.py \
             --deterministic-findings deterministic-findings.json \
             --semantic-findings semantic-findings.json
 
