@@ -36,6 +36,7 @@ jobs:
           repository: Aethrix-Labs/fleet-skills
           path: .fleet-ci
           ref: main
+          token: ${{ secrets.FLEET_SKILLS_PAT }} # fleet-skills is private; default GITHUB_TOKEN can't cross repos
 
       - name: Install gitleaks
         run: |
@@ -130,6 +131,7 @@ jobs:
           repository: Aethrix-Labs/fleet-skills
           path: .fleet-ci
           ref: main
+          token: ${{ secrets.FLEET_SKILLS_PAT }} # fleet-skills is private; default GITHUB_TOKEN can't cross repos
 
       - name: Download deterministic findings
         uses: actions/download-artifact@v4

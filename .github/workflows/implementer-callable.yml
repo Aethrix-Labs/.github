@@ -54,6 +54,7 @@ jobs:
           repository: Aethrix-Labs/fleet-skills
           path: .fleet-ci
           ref: main
+          token: ${{ secrets.FLEET_SKILLS_PAT }} # fleet-skills is private; default GITHUB_TOKEN can't cross repos
 
       - name: Set up gh CLI
         # The commit skill uses `gh pr create`, `gh pr merge --auto`, etc.
