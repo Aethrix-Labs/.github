@@ -55,6 +55,7 @@ jobs:
         run: |
           gitleaks detect \
             --source . \
+            --config .fleet-ci/ci/security-review/gitleaks.toml \
             --redact \
             --report-format sarif \
             --report-path gitleaks.sarif \
@@ -63,7 +64,7 @@ jobs:
       - name: Semgrep
         run: |
           python3 -m pip install semgrep
-          semgrep --config p/security-audit --json --output semgrep-results.json || true
+          semgrep --config p/security-audit --exclude docs/mockups --json --output semgrep-results.json || true
 
       # --- DEP-AUDIT VARIANT (pick ONE; delete the others) ---
 
