@@ -7,7 +7,7 @@ name: dev-watchdog (callable)
 # no unactioned suggestion outstanding.
 #
 # Requires the dev-watchdog bundle to be vended to fleet-skills `ci/dev-watchdog/`
-# (SKILL.md + scripts/gate.sh), reached here at .fleet-ci/ci/dev-watchdog/.
+# (SKILL.md + gate.sh), reached here at .fleet-ci/ci/dev-watchdog/.
 
 on:
   workflow_call:
@@ -61,7 +61,7 @@ jobs:
       - name: Gate
         id: gate
         run: |
-          DECISION="$(bash .fleet-ci/ci/dev-watchdog/scripts/gate.sh "$GITHUB_WORKSPACE" 2>/tmp/gate.err)"
+          DECISION="$(bash .fleet-ci/ci/dev-watchdog/gate.sh "$GITHUB_WORKSPACE" 2>/tmp/gate.err)"
           cat /tmp/gate.err || true
           echo "decision=$DECISION" >> "$GITHUB_OUTPUT"
           echo "dev-watchdog gate decision: $DECISION"
