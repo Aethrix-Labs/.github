@@ -1,0 +1,149 @@
+name: dev-watchdog (callable)
+
+# Daily per-product development health check (STANDARDS §24; SYSTEM_VISION Phase 14).
+# The thin per-product .github/workflows/dev-watchdog.yml (cron + workflow_dispatch)
+# `uses:` this. Flow: cheap no-LLM gate -> branch on token -> (recommend only)
+# open-entry precheck -> Opus recommender. Opus runs ONLY on an idle product with
+# no unactioned suggestion outstanding.
+#
+# Requires the dev-watchdog bundle to be vended to fleet-skills `ci/dev-watchdog/`
+# (SKILL.md + scripts/gate.sh), reached here at .fleet-ci/ci/dev-watchdog/.
+
+on:
+  workflow_call:
+    inputs:
+      product_slug:
+        description: "Product slug (defaults to repo basename)."
+        type: string
+        required: false
+        default: ""
+      hub_url:
+        description: "Hub base URL for the queue GET/POST. Defaults to https://sethgibson.com."
+        type: string
+        required: false
+        default: "https://sethgibson.com"
+
+permissions:
+  contents: write       # open the low-tier drift-reconciliation PR
+  pull-requests: write  # gh pr create for the drift PR
+  id-token: write       # required by anthropics/claude-code-action@v1
+
+concurrency:
+  # Serialize per product; a cron run and a manual dispatch must not race the
+  # drift branch/PR. Queue waits rather than cancelling an in-flight run.
+  group: dev-watchdog-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  dev-watchdog:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4        # consumer repo at $GITHUB_WORKSPACE
+        with:
+          fetch-depth: 0                 # recommender reads git log / history
+
+      - uses: actions/checkout@v4        # fleet-skills (CI skills under ci/)
+        with:
+          repository: Aethrix-Labs/fleet-skills
+          path: .fleet-ci
+          ref: main
+          token: ${{ secrets.FLEET_SKILLS_PAT }}
+
+      - name: Set up gh CLI
+        run: gh --version                # preinstalled on ubuntu-latest
+
+      - name: Configure git for commits
+        run: |
+          git config user.name  "dev-watchdog[bot]"
+          git config user.email "dev-watchdog@aethrix-labs.local"
+
+      # ---- Phase 0: cheap, deterministic gate (no LLM) ----
+      - name: Gate
+        id: gate
+        run: |
+          DECISION="$(bash .fleet-ci/ci/dev-watchdog/scripts/gate.sh "$GITHUB_WORKSPACE" 2>/tmp/gate.err)"
+          cat /tmp/gate.err || true
+          echo "decision=$DECISION" >> "$GITHUB_OUTPUT"
+          echo "dev-watchdog gate decision: $DECISION"
+
+      # ---- Open-entry precheck: only meaningful on the idle path ----
+      # If an unactioned dev-watchdog suggestion already exists, don't stack
+      # another (and don't spin up Opus). Any open follow-up for the product
+      # suppresses; narrow to agent_name=dev-watchdog if/when the hub supports it.
+      - name: Open-entry precheck
+        id: precheck
+        if: steps.gate.outputs.decision == 'recommend'
+        env:
+          QUEUE_SERVICE_ROLE_KEY: ${{ secrets.QUEUE_SERVICE_ROLE_KEY }}
+          HUB_URL: ${{ inputs.hub_url }}
+          PRODUCT_SLUG: ${{ inputs.product_slug }}
+        run: |
+          SLUG="${PRODUCT_SLUG:-$(basename "$GITHUB_REPOSITORY")}"
+          HUB="${HUB_URL:-https://sethgibson.com}"
+          if [ -z "$QUEUE_SERVICE_ROLE_KEY" ]; then
+            echo "::warning::dev-watchdog: QUEUE_SERVICE_ROLE_KEY missing; skipping precheck (proceeding)"
+            echo "proceed=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          COUNT="$(curl -s "${HUB}/api/v1/queue/entries?product=${SLUG}&status=open&entry_type=follow-up" \
+            -H "x-service-role-key: $QUEUE_SERVICE_ROLE_KEY" | jq -r '.count // 0')"
+          echo "open follow-up entries for ${SLUG}: ${COUNT}"
+          if [ "${COUNT:-0}" -gt 0 ]; then
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            echo "An unactioned suggestion already exists — not invoking the recommender."
+          else
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ---- Phase 1: Opus recommender (idle path, no pending suggestion) ----
+      - name: Run recommender
+        id: recommender
+        if: steps.gate.outputs.decision == 'recommend' && steps.precheck.outputs.proceed == 'true'
+        uses: anthropics/claude-code-action@v1
+        env:
+          QUEUE_SERVICE_ROLE_KEY: ${{ secrets.QUEUE_SERVICE_ROLE_KEY }}
+          DEV_WATCHDOG_PRODUCT_SLUG: ${{ inputs.product_slug }}
+          DEV_WATCHDOG_HUB_URL: ${{ inputs.hub_url }}
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            You are running as the **dev-watchdog recommender** in CI.
+
+            Read `.fleet-ci/ci/dev-watchdog/SKILL.md` and follow it exactly.
+
+            The cheap gate already returned `recommend` (this product is built-out
+            and idle) and the open-entry precheck already passed (no unactioned
+            suggestion outstanding) — so SKIP the gate and SKIP precheck Step 1,
+            and run the recommender from the pre-build re-confirm onward:
+            continuity-drift sweep (low-tier drift PR via gh, NOT touching
+            PLANNING.md boxes), then the single highest-priority finding —
+            a deferred-work `follow-up` queue entry carrying a paste-ready Cowork
+            prompt, or the "what now?" entry if nothing is deferred.
+
+            Runtime context:
+            - Working directory has the full consumer repo (fetch-depth: 0).
+            - Product slug: $DEV_WATCHDOG_PRODUCT_SLUG (or derive from $GITHUB_REPOSITORY).
+            - Hub base URL: $DEV_WATCHDOG_HUB_URL (queue POST per STANDARDS §8).
+
+            Emit at most ONE follow-up queue entry. Do not author PLANNING.md
+            steps or net-new committed scope.
+          claude_args: |
+            --model claude-opus-4-8
+            --max-turns 60
+            --allowedTools Read,Bash,Write,Edit,Glob,Grep
+
+      # ---- Summary for the bail paths (no LLM spent) ----
+      - name: Summary
+        if: always()
+        run: |
+          D="${{ steps.gate.outputs.decision }}"
+          case "$D" in
+            open-work) echo "Bailed: PLANNING.md has open work — implementer's lane." ;;
+            pre-build) echo "Bailed: pre-build — early-phase skills own this product." ;;
+            recommend)
+              if [ "${{ steps.precheck.outputs.proceed }}" = "true" ]; then
+                echo "Idle: ran the recommender."
+              else
+                echo "Idle, but a suggestion is already pending — skipped the recommender."
+              fi ;;
+            *) echo "Gate returned: '$D'." ;;
+          esac
