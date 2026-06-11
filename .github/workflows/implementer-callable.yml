@@ -43,7 +43,9 @@ concurrency:
 
 jobs:
   implementer:
-    runs-on: ubuntu-latest
+    # Fleet PC (WSL2) self-hosted runner — agentic jobs run locally to avoid
+    # GitHub-hosted minute billing. See ~/products/docs/SELF_HOSTED_RUNNER.md.
+    runs-on: [self-hosted, linux, fleet]
     steps:
       - uses: actions/checkout@v4 # consumer repo at $GITHUB_WORKSPACE
         with:
