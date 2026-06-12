@@ -53,9 +53,48 @@ jobs:
 
       - name: Run gitleaks
         run: |
+          # The fleet baseline config is always the foundation: it carries the full
+          # default ruleset (`[extend] useDefault = true`) plus the docs/mockups/**
+          # allowlist. A consumer repo may ALSO commit a root .gitleaks.toml to
+          # allowlist its own confirmed false positives (public-by-design tokens,
+          # synthetic test fixtures). gitleaks loads exactly ONE config file, so we
+          # OVERLAY the repo's allowlist onto the baseline at runtime instead of
+          # choosing one or the other.
+          #
+          # Why overlay rather than swap to the repo config: swapping would let a
+          # repo whose .gitleaks.toml omits `[extend] useDefault = true` silently
+          # scan with zero rules (a coverage regression), and would let a repo
+          # disable org-mandated rules. Overlaying keeps default scanning fully on
+          # for every repo while honoring per-repo allowlists across the entire
+          # git history (inline `gitleaks:allow` hints do NOT apply retroactively to
+          # earlier commits, so a config allowlist is the only durable suppression
+          # for a triaged historical false positive). See STANDARDS §17.11.
+          CONFIG=.fleet-ci/ci/security-review/gitleaks.toml
+          if [ -f .gitleaks.toml ]; then
+            cp "$CONFIG" effective-gitleaks.toml
+            printf '\n\n# ---- overlay: consumer repo .gitleaks.toml (allowlist only) ----\n' >> effective-gitleaks.toml
+            # Append only the consumer config's ALLOWLIST content. Drop its own
+            # `title` and `[extend]` block so they don't collide with the baseline's
+            # keys (duplicate TOML keys are a parse error) and so a repo can never
+            # weaken the baseline ruleset — repos may add allowlists, not remove
+            # rules. gitleaks accepts a singular `[allowlist]` and array `[[allowlists]]`
+            # side by side, so the baseline's `[[allowlists]]` and the overlay's
+            # allowlist tables all apply.
+            awk '
+              /^[[:space:]]*\[/ {
+                if ($0 ~ /^[[:space:]]*\[extend\][[:space:]]*$/) { skip = 1; next }
+                else { skip = 0 }
+              }
+              skip { next }
+              /^[[:space:]]*title[[:space:]]*=/ { next }
+              { print }
+            ' .gitleaks.toml >> effective-gitleaks.toml
+            CONFIG=effective-gitleaks.toml
+            echo "::notice::Overlaid consumer .gitleaks.toml allowlist onto the fleet baseline."
+          fi
           gitleaks detect \
             --source . \
-            --config .fleet-ci/ci/security-review/gitleaks.toml \
+            --config "$CONFIG" \
             --redact \
             --report-format sarif \
             --report-path gitleaks.sarif \
