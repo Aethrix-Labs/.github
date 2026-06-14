@@ -59,9 +59,34 @@ jobs:
           git config user.name  "dev-watchdog[bot]"
           git config user.email "dev-watchdog@aethrix-labs.local"
 
+      # ---- Per-product toggles (master switch + feature flags), STANDARDS §24.4 ----
+      - name: Fetch watchdog flags
+        id: flags
+        env:
+          QUEUE_SERVICE_ROLE_KEY: ${{ secrets.QUEUE_SERVICE_ROLE_KEY }}
+          HUB_URL: ${{ inputs.hub_url }}
+          PRODUCT_SLUG: ${{ inputs.product_slug }}
+        run: |
+          SLUG="${PRODUCT_SLUG:-$(basename "$GITHUB_REPOSITORY")}"
+          HUB="${HUB_URL:-https://sethgibson.com}"
+          # Fail-safe: master ON, features OFF (suppress net-new) on any error —
+          # a hub outage must never trigger an auto-build (STANDARDS §24.4).
+          WD=true; AF=false; INSP=false
+          if RESP=$(curl -sf "${HUB}/api/v1/watchdog/flags?product=${SLUG}" \
+                      -H "x-service-role-key: ${QUEUE_SERVICE_ROLE_KEY}"); then
+            WD=$(echo "$RESP"   | jq -r '.watchdog_enabled    // true')
+            AF=$(echo "$RESP"   | jq -r '.auto_feature_enabled // false')
+            INSP=$(echo "$RESP" | jq -r '.inspiration_enabled  // false')
+          else
+            echo "::warning::dev-watchdog: flags fetch failed — net-new suppressed"
+          fi
+          { echo "watchdog_enabled=$WD"; echo "auto_feature_enabled=$AF"; echo "inspiration_enabled=$INSP"; } >> "$GITHUB_OUTPUT"
+          echo "flags: watchdog=$WD auto_feature=$AF inspiration=$INSP"
+
       # ---- Phase 0: cheap, deterministic gate (no LLM) ----
       - name: Gate
         id: gate
+        if: steps.flags.outputs.watchdog_enabled == 'true'
         run: |
           DECISION="$(bash .fleet-ci/ci/dev-watchdog/gate.sh "$GITHUB_WORKSPACE" 2>/tmp/gate.err)"
           cat /tmp/gate.err || true
@@ -105,6 +130,8 @@ jobs:
           QUEUE_SERVICE_ROLE_KEY: ${{ secrets.QUEUE_SERVICE_ROLE_KEY }}
           DEV_WATCHDOG_PRODUCT_SLUG: ${{ inputs.product_slug }}
           DEV_WATCHDOG_HUB_URL: ${{ inputs.hub_url }}
+          DEV_WATCHDOG_AUTO_FEATURE_ENABLED: ${{ steps.flags.outputs.auto_feature_enabled }}
+          DEV_WATCHDOG_INSPIRATION_ENABLED: ${{ steps.flags.outputs.inspiration_enabled }}
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           prompt: |
@@ -119,7 +146,12 @@ jobs:
             continuity-drift sweep (low-tier drift PR via gh, NOT touching
             PLANNING.md boxes), then the single highest-priority finding —
             a deferred-work `follow-up` queue entry carrying a paste-ready Cowork
-            prompt, or the "what now?" entry if nothing is deferred.
+            prompt. If NOTHING is deferred: the separate proposer step owns net-new
+            ideation, so emit the graduate/maintenance/sunset "what now?" entry ONLY
+            if BOTH feature toggles are off
+            (auto_feature=$DEV_WATCHDOG_AUTO_FEATURE_ENABLED,
+            inspiration=$DEV_WATCHDOG_INSPIRATION_ENABLED); if either is on, emit
+            nothing and let the proposer handle the nothing-deferred path.
 
             Runtime context:
             - Working directory has the full consumer repo (fetch-depth: 0).
@@ -133,10 +165,54 @@ jobs:
             --max-turns 60
             --allowedTools Read,Bash,Write,Edit,Glob,Grep
 
+      # ---- Phase 2: proposer — nothing-deferred net-new ideation (STANDARDS §24.6) ----
+      # Realizes dev-watchdog Step 5. Independent of the precheck so net-new runs
+      # daily under toggle control (§24.7); self-gates on "nothing deferred" inside
+      # the skill. Writes no code → no Write/Edit tools.
+      - name: Run proposer
+        if: >
+          steps.flags.outputs.watchdog_enabled == 'true' &&
+          steps.gate.outputs.decision == 'recommend' &&
+          (steps.flags.outputs.auto_feature_enabled == 'true' ||
+           steps.flags.outputs.inspiration_enabled == 'true')
+        uses: anthropics/claude-code-action@v1
+        env:
+          QUEUE_SERVICE_ROLE_KEY: ${{ secrets.QUEUE_SERVICE_ROLE_KEY }}
+          PROPOSER_PRODUCT_SLUG: ${{ inputs.product_slug }}
+          PROPOSER_HUB_URL: ${{ inputs.hub_url }}
+          PROPOSER_AUTO_FEATURE_ENABLED: ${{ steps.flags.outputs.auto_feature_enabled }}
+          PROPOSER_INSPIRATION_ENABLED: ${{ steps.flags.outputs.inspiration_enabled }}
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            You are running as the **proposer agent** in CI.
+
+            Read `.fleet-ci/ci/proposer/SKILL.md` and follow it exactly.
+
+            Proceed ONLY if the product is built-out, idle, and NOTHING is deferred
+            (re-confirm — the recommender ran the drift + deferred scans this run when
+            it wasn't suppressed). Emit ONLY the enabled entry types:
+              - auto_feature_enabled = $PROPOSER_AUTO_FEATURE_ENABLED
+              - inspiration_enabled  = $PROPOSER_INSPIRATION_ENABLED
+            Dedup by candidate-fingerprint. Ideate only — never plan, design, or build.
+
+            Runtime context:
+            - Working directory has the full consumer repo (fetch-depth: 0).
+            - Product slug: $PROPOSER_PRODUCT_SLUG (or derive from $GITHUB_REPOSITORY).
+            - Hub base URL: $PROPOSER_HUB_URL (queue POST per STANDARDS §8).
+          claude_args: |
+            --model claude-opus-4-8
+            --max-turns 60
+            --allowedTools Read,Bash,Glob,Grep
+
       # ---- Summary for the bail paths (no LLM spent) ----
       - name: Summary
         if: always()
         run: |
+          if [ "${{ steps.flags.outputs.watchdog_enabled }}" != "true" ]; then
+            echo "Bailed: watchdog_enabled is off for this product (master switch)."
+            exit 0
+          fi
           D="${{ steps.gate.outputs.decision }}"
           case "$D" in
             open-work) echo "Bailed: PLANNING.md has open work — implementer's lane." ;;
@@ -145,7 +221,10 @@ jobs:
               if [ "${{ steps.precheck.outputs.proceed }}" = "true" ]; then
                 echo "Idle: ran the recommender."
               else
-                echo "Idle, but a suggestion is already pending — skipped the recommender."
+                echo "Idle, but a deferred suggestion is already pending — skipped the recommender."
+              fi
+              if [ "${{ steps.flags.outputs.auto_feature_enabled }}" = "true" ] || [ "${{ steps.flags.outputs.inspiration_enabled }}" = "true" ]; then
+                echo "Proposer step ran (net-new ideation, per toggles)."
               fi ;;
             *) echo "Gate returned: '$D'." ;;
           esac

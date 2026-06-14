@@ -1,0 +1,138 @@
+name: lite-planner (callable)
+
+# No-design planning for an APPROVED auto-feature suggestion (STANDARDS §24.6).
+# The hub workflow_dispatches the thin per-product .github/workflows/lite-planner.yml
+# (on auto-feature approval), which `uses:` this. Flow: fetch the approved entry ->
+# Step-0 size/risk re-check (bounce if not "small") -> plan ONE no-design milestone ->
+# plan-reviewer -> commit PLANNING.md via ci-commit (low-tier auto-ship). The
+# autonomous implementer loop builds it; this skill never implements.
+#
+# Requires the lite-planner bundle vended to fleet-skills `ci/lite-planner/`,
+# reached here at .fleet-ci/ci/lite-planner/.
+
+on:
+  workflow_call:
+    inputs:
+      product_slug:
+        description: "Product slug (defaults to repo basename)."
+        type: string
+        required: false
+        default: ""
+      hub_url:
+        description: "Hub base URL for the entry fetch + queue POST. Defaults to https://sethgibson.com."
+        type: string
+        required: false
+        default: "https://sethgibson.com"
+      queue_entry_id:
+        description: "Approved auto-feature entry id; lite-planner fetches goal + recommendation (scope/acceptance) from the hub."
+        type: string
+        required: true
+
+permissions:
+  contents: write       # commit the PLANNING.md edit (low-tier auto-ship)
+  pull-requests: write  # ci-commit opens the PR
+  id-token: write       # required by anthropics/claude-code-action@v1
+
+concurrency:
+  # Serialize per product so two approvals can't race the PLANNING.md edit.
+  group: lite-planner-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  lite-planner:
+    # Fleet PC (WSL2) self-hosted runner. See ~/products/docs/SELF_HOSTED_RUNNER.md.
+    runs-on: [self-hosted, linux, fleet]
+    steps:
+      - uses: actions/checkout@v4        # consumer repo at $GITHUB_WORKSPACE
+        with:
+          fetch-depth: 0                 # planner reads code + git history
+
+      - uses: actions/checkout@v4        # fleet-skills (CI skills under ci/)
+        with:
+          repository: Aethrix-Labs/fleet-skills
+          path: .fleet-ci
+          ref: main
+          token: ${{ secrets.FLEET_SKILLS_PAT }}
+
+      - name: Set up gh CLI
+        run: gh --version
+
+      - name: Configure git for commits
+        run: |
+          git config user.name  "lite-planner[bot]"
+          git config user.email "lite-planner@aethrix-labs.local"
+
+      - name: Run lite-planner agent
+        id: agent
+        uses: anthropics/claude-code-action@v1
+        env:
+          QUEUE_SERVICE_ROLE_KEY: ${{ secrets.QUEUE_SERVICE_ROLE_KEY }}
+          AUTONOMOUS_TICK_TOKEN: ${{ secrets.AUTONOMOUS_TICK_TOKEN }}
+          LP_PRODUCT_SLUG: ${{ inputs.product_slug }}
+          LP_HUB_URL: ${{ inputs.hub_url }}
+          LP_QUEUE_ENTRY_ID: ${{ inputs.queue_entry_id }}
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            You are running as the **lite-planner agent** in CI.
+
+            Read `.fleet-ci/ci/lite-planner/SKILL.md` and follow it exactly.
+
+            The APPROVED auto-feature is queue entry $LP_QUEUE_ENTRY_ID — fetch it
+            from the hub to read its `goal` (value case) and `recommendation`
+            (SCOPE + ACCEPTANCE sketch).
+
+            Step 0 safety valve: re-verify it is genuinely "small" (no new screens /
+            no design-system divergence, ONE implementer milestone, no
+            auth/payments/PII/migration). If it FAILS any clause, emit the `exception`
+            queue entry the skill specifies and STOP — do not write a plan.
+
+            Otherwise: plan ONE no-design milestone (with the `**Auto-feature:**`
+            marker), run plan-reviewer, then commit the PLANNING.md edit by reading
+            `.fleet-ci/ci/ci-commit/SKILL.md` and following it (Tier Low, auto-ship).
+            Do NOT implement — the autonomous implementer loop builds it.
+
+            Runtime context:
+            - Working directory has the full consumer repo (fetch-depth: 0).
+            - Product slug: $LP_PRODUCT_SLUG (or derive from $GITHUB_REPOSITORY).
+            - Hub base URL: $LP_HUB_URL.
+          claude_args: |
+            --model claude-sonnet-4-6
+            --max-turns 80
+            --allowedTools Read,Bash,Write,Edit,Glob,Grep
+
+      - name: Emit failure queue entry on agent death
+        # The agent step died (max-turns, crash, infra) before its own exit path —
+        # surface it in the decision queue so an approved auto-feature doesn't vanish.
+        if: failure() && steps.agent.outcome == 'failure'
+        env:
+          QUEUE_SERVICE_ROLE_KEY: ${{ secrets.QUEUE_SERVICE_ROLE_KEY }}
+          LP_PRODUCT_SLUG: ${{ inputs.product_slug }}
+          LP_HUB_URL: ${{ inputs.hub_url }}
+          LP_QUEUE_ENTRY_ID: ${{ inputs.queue_entry_id }}
+        run: |
+          SLUG="${LP_PRODUCT_SLUG:-$(basename "$GITHUB_REPOSITORY")}"
+          HUB="${LP_HUB_URL:-https://sethgibson.com}"
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          if [ -n "$QUEUE_SERVICE_ROLE_KEY" ]; then
+            REQUEST_ID=$(printf '%s' "${GITHUB_RUN_ID}lite-planner-failed" | sha256sum | cut -d' ' -f1)
+            curl -sf -X POST "${HUB}/api/v1/queue/entries" \
+              -H "Content-Type: application/json" \
+              -H "x-service-role-key: $QUEUE_SERVICE_ROLE_KEY" \
+              -H "User-Agent: aethrix-fleet-ci/1.0 (lite-planner-callable)" \
+              -d "{
+                \"request_id\": \"$REQUEST_ID\",
+                \"entry_type\": \"exception\",
+                \"risk_tier\": \"high\",
+                \"agent_name\": \"lite-planner\",
+                \"product_slug\": \"$SLUG\",
+                \"title\": \"[$SLUG] lite-planner failed on auto-feature ${LP_QUEUE_ENTRY_ID}\",
+                \"goal\": \"Plan the approved auto-feature into one no-design milestone\",
+                \"attempts\": [\"claude-code-action step failed before the skill's exit path. Run: $RUN_URL\"],
+                \"ask\": \"Inspect the run log; re-plan manually or re-dispatch\",
+                \"recommendation\": \"If the candidate was actually too big for auto-feature, route it to feature-spec / design instead\"
+              }" \
+            || echo "::warning::lite-planner-callable: failure queue-entry POST failed"
+          else
+            echo "::warning::lite-planner-callable: QUEUE_SERVICE_ROLE_KEY missing; skipping failure queue entry"
+          fi
