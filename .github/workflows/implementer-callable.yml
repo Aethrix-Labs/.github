@@ -108,7 +108,7 @@ jobs:
             Do not chain into the next step.
           claude_args: |
             --model claude-sonnet-4-6
-            --max-turns 80
+            --max-turns 100
             --allowedTools Read,Bash,Write,Edit,Glob,Grep
 
       - name: Emit failure queue entry + tick-report
@@ -133,6 +133,19 @@ jobs:
           RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           HUB="${IMPLEMENTER_HUB_URL:-https://sethgibson.com}"
 
+          # Phase breadcrumb — the agent overwrites this single-line marker at
+          # each phase boundary (implementer SKILL.md "Phase breadcrumb"). On a
+          # max-turns/crash death the agent never reached its exit path, so this
+          # file is the only signal for WHERE it died. Localizes the failure to
+          # a phase (step-identified | building | testing | adversary |
+          # committing) instead of a bare workflow-failed. Absent → "unknown".
+          PHASE_FILE="${GITHUB_WORKSPACE:-.}/.implementer-phase"
+          LAST_PHASE="unknown"
+          if [ -f "$PHASE_FILE" ]; then
+            LAST_PHASE="$(tr -d '\r\n' < "$PHASE_FILE" | head -c 200)"
+          fi
+          echo "::notice::implementer-callable: workflow failed at phase=${LAST_PHASE}"
+
           # Queue entry — exception, high tier. request_id is rooted in the
           # GitHub run ID (one entry per failed run; reruns get a new run ID,
           # which is correct — a new failure is a new event). Shape per
@@ -151,9 +164,9 @@ jobs:
                 \"product_slug\": \"$SLUG\",
                 \"title\": \"[$SLUG] implementer workflow failed on ${IMPLEMENTER_TARGET_REF:-unknown target}\",
                 \"goal\": \"Advance ${IMPLEMENTER_TARGET_KIND:-?}/${IMPLEMENTER_TARGET_REF:-?} by one step\",
-                \"attempts\": [\"claude-code-action step failed (max-turns, crash, or infra error) before the skill's own exit path; no in-band queue entry or tick-report was sent. Run: $RUN_URL\"],
+                \"attempts\": [\"claude-code-action step failed (max-turns, crash, or infra error) before the skill's own exit path; no in-band queue entry or tick-report was sent. Last phase reached: ${LAST_PHASE}. Run: $RUN_URL\"],
                 \"ask\": \"Inspect the workflow run log; decide retry, fix the step/criteria, or restructure the target\",
-                \"recommendation\": \"Check the last tool calls in the log — max-turns deaths usually mean the agent was attempting work outside its lane (e.g. an unmarked human-only step)\"
+                \"recommendation\": \"Died at phase '${LAST_PHASE}'. building/testing/adversary → the step is likely over-sized for the effective build budget (split it) or a green command is stuck (see the Step 4 debug cap); committing → check the commit skill's mid-flight activity records; step-identified → the agent may have walked into work outside its lane (e.g. an unmarked human-only step).\"
               }" \
             || echo "::warning::implementer-callable: failure queue-entry POST failed"
           else
@@ -171,7 +184,8 @@ jobs:
                 \"session_id\": \"$IMPLEMENTER_SESSION_ID\",
                 \"run_id\": \"$GITHUB_RUN_ID\",
                 \"outcome\": \"workflow-failed\",
-                \"run_url\": \"$RUN_URL\"
+                \"run_url\": \"$RUN_URL\",
+                \"last_phase\": \"$LAST_PHASE\"
               }" \
             || echo "::warning::implementer-callable: failure tick-report POST failed; defensive cron sweep will reconcile"
           fi
