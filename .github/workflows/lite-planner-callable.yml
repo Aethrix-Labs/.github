@@ -98,8 +98,15 @@ jobs:
             - Hub base URL: $LP_HUB_URL.
           claude_args: |
             --model claude-sonnet-4-6
-            --max-turns 80
+            --max-turns 100
             --allowedTools Read,Bash,Write,Edit,Glob,Grep
+            # --max-turns 100 matches implementer-callable. lite-planner shares the
+            # same commit tax (plan-reviewer up to 3 passes -> ci-commit ->
+            # canonical-doc-update across docs -> tier-classify) plus open-ended
+            # repo exploration to map the candidate; 80 left no headroom and a
+            # correctly-sized small auto-feature still over-ran it (run 27623308777,
+            # 2026-06-16). Raised 80 -> 100 on 2026-06-16. The durable fix is the
+            # skill's Step-0 cheap bounce + bounded exploration, not raising further.
 
       - name: Emit failure queue entry on agent death
         # The agent step died (max-turns, crash, infra) before its own exit path —
@@ -114,6 +121,21 @@ jobs:
           SLUG="${LP_PRODUCT_SLUG:-$(basename "$GITHUB_REPOSITORY")}"
           HUB="${LP_HUB_URL:-https://sethgibson.com}"
           RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+          # Phase breadcrumb — the agent overwrites this single-line marker at each
+          # phase boundary (lite-planner SKILL.md "Phase breadcrumb"). On a
+          # max-turns/crash death the agent never reached its exit path, so this
+          # file is the only signal for WHERE it died. Localizes the failure to a
+          # phase (fetch | size-recheck | mapping | planning | adversary |
+          # committing) instead of a bare death. Absent → "unknown". Mirrors
+          # implementer-callable's handler (2026-06-16 parity).
+          PHASE_FILE="${GITHUB_WORKSPACE:-.}/.lite-planner-phase"
+          LAST_PHASE="unknown"
+          if [ -f "$PHASE_FILE" ]; then
+            LAST_PHASE="$(tr -d '\r\n' < "$PHASE_FILE" | head -c 200)"
+          fi
+          echo "::notice::lite-planner-callable: workflow failed at phase=${LAST_PHASE}"
+
           if [ -n "$QUEUE_SERVICE_ROLE_KEY" ]; then
             REQUEST_ID=$(printf '%s' "${GITHUB_RUN_ID}lite-planner-failed" | sha256sum | cut -d' ' -f1)
             curl -sf -X POST "${HUB}/api/v1/queue/entries" \
@@ -128,9 +150,9 @@ jobs:
                 \"product_slug\": \"$SLUG\",
                 \"title\": \"[$SLUG] lite-planner failed on auto-feature ${LP_QUEUE_ENTRY_ID}\",
                 \"goal\": \"Plan the approved auto-feature into one no-design milestone\",
-                \"attempts\": [\"claude-code-action step failed before the skill's exit path. Run: $RUN_URL\"],
+                \"attempts\": [\"claude-code-action step failed (max-turns, crash, or infra error) before the skill's own exit path. Last phase reached: ${LAST_PHASE}. Run: $RUN_URL\"],
                 \"ask\": \"Inspect the run log; re-plan manually or re-dispatch\",
-                \"recommendation\": \"If the candidate was actually too big for auto-feature, route it to feature-spec / design instead\"
+                \"recommendation\": \"Died at phase '${LAST_PHASE}'. mapping → exploration likely over-ran the budget (the candidate's scope/acceptance is the plan — don't re-derive the whole repo); planning/adversary → the candidate may not be 'small' (Step 0 should have bounced it to feature-spec / design) or the plan-reviewer loop is thrashing; committing → check the ci-commit / canonical-doc-update tail. If the candidate was genuinely too big for auto-feature, route it to feature-spec / design instead.\"
               }" \
             || echo "::warning::lite-planner-callable: failure queue-entry POST failed"
           else
