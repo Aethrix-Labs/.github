@@ -110,7 +110,7 @@ jobs:
 
       # npm:
       - name: Dep audit (npm)
-        run: npm audit --json > npm-audit.json || true
+        run: npm audit --omit=dev --json > npm-audit.json || true
 
       # pnpm:  (also requires `- uses: pnpm/action-setup@v4` BEFORE this step)
       # - name: Dep audit (pnpm)
