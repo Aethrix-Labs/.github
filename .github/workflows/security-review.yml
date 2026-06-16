@@ -54,8 +54,9 @@ jobs:
       - name: Run gitleaks
         run: |
           # The fleet baseline config is always the foundation: it carries the full
-          # default ruleset (`[extend] useDefault = true`) plus the docs/mockups/**
-          # allowlist. A consumer repo may ALSO commit a root .gitleaks.toml to
+          # default ruleset (`[extend] useDefault = true`) plus the fleet path
+          # allowlists (docs/mockups/**, .gitleaksignore — §17.11). A consumer
+          # repo may ALSO commit a root .gitleaks.toml to
           # allowlist its own confirmed false positives (public-by-design tokens,
           # synthetic test fixtures). gitleaks loads exactly ONE config file, so we
           # OVERLAY the repo's allowlist onto the baseline at runtime instead of
@@ -103,7 +104,7 @@ jobs:
       - name: Semgrep
         run: |
           python3 -m pip install semgrep
-          semgrep --config p/security-audit --exclude docs/mockups --json --output semgrep-results.json || true
+          semgrep --config p/security-audit --exclude docs/mockups --exclude .gitleaksignore --json --output semgrep-results.json || true
 
       # --- DEP-AUDIT VARIANT (pick ONE; delete the others) ---
 
