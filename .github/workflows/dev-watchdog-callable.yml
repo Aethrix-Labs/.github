@@ -69,19 +69,22 @@ jobs:
         run: |
           SLUG="${PRODUCT_SLUG:-$(basename "$GITHUB_REPOSITORY")}"
           HUB="${HUB_URL:-https://sethgibson.com}"
-          # Fail-safe: master ON, features OFF (suppress net-new) on any error —
-          # a hub outage must never trigger an auto-build (STANDARDS §24.4).
-          WD=true; AF=false; INSP=false
+          # On a reachable 200, parse-flags.sh normalizes the body: it defaults
+          # ONLY on a null/absent field and PRESERVES an explicit `false`. (Do NOT
+          # inline `jq -r '.watchdog_enabled // true'` here — jq's `//` coalesces a
+          # literal false to its default, which silently ignored the master OFF
+          # switch and ran the watchdog anyway. See parse-flags.sh.)
+          # Fail-safe on any fetch error: master ON, features OFF (suppress
+          # net-new) — a hub outage must never trigger an auto-build (§24.4).
           if RESP=$(curl -sf "${HUB}/api/v1/watchdog/flags?product=${SLUG}" \
                       -H "x-service-role-key: ${QUEUE_SERVICE_ROLE_KEY}"); then
-            WD=$(echo "$RESP"   | jq -r '.watchdog_enabled    // true')
-            AF=$(echo "$RESP"   | jq -r '.auto_feature_enabled // false')
-            INSP=$(echo "$RESP" | jq -r '.inspiration_enabled  // false')
+            FLAGS="$(printf '%s' "$RESP" | bash .fleet-ci/ci/dev-watchdog/parse-flags.sh)"
           else
             echo "::warning::dev-watchdog: flags fetch failed — net-new suppressed"
+            FLAGS=$'watchdog_enabled=true\nauto_feature_enabled=false\ninspiration_enabled=false'
           fi
-          { echo "watchdog_enabled=$WD"; echo "auto_feature_enabled=$AF"; echo "inspiration_enabled=$INSP"; } >> "$GITHUB_OUTPUT"
-          echo "flags: watchdog=$WD auto_feature=$AF inspiration=$INSP"
+          printf '%s\n' "$FLAGS" >> "$GITHUB_OUTPUT"
+          echo "flags: $(printf '%s' "$FLAGS" | tr '\n' ' ')"
 
       # ---- Phase 0: cheap, deterministic gate (no LLM) ----
       - name: Gate
