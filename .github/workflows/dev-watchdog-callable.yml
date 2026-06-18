@@ -158,8 +158,13 @@ jobs:
             - Product slug: $DEV_WATCHDOG_PRODUCT_SLUG (or derive from $GITHUB_REPOSITORY).
             - Hub base URL: $DEV_WATCHDOG_HUB_URL (queue POST per STANDARDS §8).
 
-            Emit at most ONE follow-up queue entry. Do not author PLANNING.md
-            steps or net-new committed scope.
+            CARDINALITY (hard limit, STANDARDS §24.7): this entire run may open
+            AT MOST ONE drift PR and POST AT MOST ONE follow-up queue entry. If
+            several deferred items exist, pick the single highest-priority one.
+            POST exactly once, then STOP — do NOT POST a second entry for another
+            framing of the same finding, a reworded variant, or a different
+            finding, and do NOT open a second PR. One curl POST, one PR, done.
+            Do not author PLANNING.md steps or net-new committed scope.
           claude_args: |
             --model claude-opus-4-8
             --max-turns 60
@@ -195,6 +200,12 @@ jobs:
               - auto_feature_enabled = $PROPOSER_AUTO_FEATURE_ENABLED
               - inspiration_enabled  = $PROPOSER_INSPIRATION_ENABLED
             Dedup by candidate-fingerprint. Ideate only — never plan, design, or build.
+
+            CARDINALITY (hard limit, STANDARDS §24.7): POST AT MOST ONE entry per
+            enabled type — the single best auto-feature and/or the single best
+            inspiration. Pick the one best candidate per type; this is not a
+            backlog dump. POST once per enabled type, then STOP — do NOT POST a
+            second candidate of the same type, even a different idea.
 
             Runtime context:
             - Working directory has the full consumer repo (fetch-depth: 0).
