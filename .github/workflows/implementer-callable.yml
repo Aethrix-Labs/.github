@@ -28,6 +28,11 @@ on:
         type: string
         required: false
         default: ""
+      runner_label:
+        description: "Self-hosted runner label to dispatch to (STANDARDS §9 surface routing). 'fleet' = PC (web/backend), 'fleet-mac' = Mac (mobile/both; has simulator)."
+        type: string
+        required: false
+        default: "fleet"
 
 permissions:
   contents: write # commit + push from the implementer agent
@@ -43,9 +48,11 @@ concurrency:
 
 jobs:
   implementer:
-    # Fleet PC (WSL2) self-hosted runner — agentic jobs run locally to avoid
-    # GitHub-hosted minute billing. See ~/products/docs/SELF_HOSTED_RUNNER.md.
-    runs-on: [self-hosted, linux, fleet]
+    # Self-hosted runner, label set per dispatch (STANDARDS §9 surface routing):
+    # 'fleet' (default) is the Fleet PC (WSL2, web/backend); 'fleet-mac' is Seth's
+    # Mac (mobile/both; has the simulator). Avoids GitHub-hosted minute billing.
+    # See ~/products/docs/SELF_HOSTED_RUNNER.md.
+    runs-on: [self-hosted, "${{ inputs.runner_label }}"]
     steps:
       - uses: actions/checkout@v4 # consumer repo at $GITHUB_WORKSPACE
         with:
@@ -85,6 +92,11 @@ jobs:
           # Directed target — required by the skill's Guard 2.
           IMPLEMENTER_TARGET_KIND: ${{ inputs.target_kind }}
           IMPLEMENTER_TARGET_REF: ${{ inputs.target_ref }}
+          # Runner-capability flag for the mobile self-check (STANDARDS §23.9
+          # Track A). The implementer keys off this flag, not off the milestone's
+          # Surface marker directly, so a mobile step that lands on `fleet` (no
+          # simulator) safely no-ops instead of thrashing.
+          UI_SELF_CHECK_MOBILE: ${{ inputs.runner_label == 'fleet-mac' && '1' || '0' }}
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           prompt: |
