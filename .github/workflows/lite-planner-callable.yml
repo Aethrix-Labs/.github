@@ -98,15 +98,17 @@ jobs:
             - Hub base URL: $LP_HUB_URL.
           claude_args: |
             --model claude-sonnet-4-6
-            --max-turns 100
+            --max-turns 180
             --allowedTools Read,Bash,Write,Edit,Glob,Grep
-            # --max-turns 100 matches implementer-callable. lite-planner shares the
+            # --max-turns 180 matches implementer-callable. lite-planner shares the
             # same commit tax (plan-reviewer up to 3 passes -> ci-commit ->
             # canonical-doc-update across docs -> tier-classify) plus open-ended
             # repo exploration to map the candidate; 80 left no headroom and a
             # correctly-sized small auto-feature still over-ran it (run 27623308777,
-            # 2026-06-16). Raised 80 -> 100 on 2026-06-16. The durable fix is the
-            # skill's Step-0 cheap bounce + bounded exploration, not raising further.
+            # 2026-06-16). Raised 80 -> 100 on 2026-06-16, 100 -> 180 on 2026-07-07
+            # (parity with the implementer's 130 -> 180 turn-budget recalibration).
+            # The durable fix is the skill's Step-0 cheap bounce + bounded
+            # exploration (and plan-reviewer's margin sizing), not raising further.
 
       - name: Emit failure queue entry on agent death
         # The agent step died (max-turns, crash, infra) before its own exit path —
