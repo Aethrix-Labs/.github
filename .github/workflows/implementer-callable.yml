@@ -120,7 +120,7 @@ jobs:
             Do not chain into the next step.
           claude_args: |
             --model claude-sonnet-4-6
-            --max-turns 130
+            --max-turns 180
             --allowedTools Read,Bash,Write,Edit,Glob,Grep
 
       - name: Emit failure queue entry + tick-report
