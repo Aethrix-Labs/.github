@@ -123,15 +123,20 @@ jobs:
             --max-turns 180
             --allowedTools Read,Bash,Write,Edit,Glob,Grep
 
-      - name: Emit failure queue entry + tick-report
-        # The agent step died (max-turns, crash, infra error) without reaching
-        # its own exit path — so no queue entry and no tick-report were sent.
-        # This handler is the skill's "claude-code-action itself errors" failure
-        # mode (implementer SKILL.md failure-modes table): surface the death in
-        # the decision queue and tell the orchestrator the tick failed so the
-        # session goes `errored` instead of hanging until the cron sweep.
-        # Writes are observability, not gates — both POSTs warn-and-continue.
-        if: failure() && steps.agent.outcome == 'failure'
+      - name: Ensure the hub heard back (tick-report guard)
+        # Always-run backstop (widened 2026-07-08 from an `if: failure()`-only handler).
+        # Fires whenever the skill's `.tick-report-sent` breadcrumb is ABSENT at job end
+        # — covering BOTH (a) the agent step dying (crash, infra error) and (b) the step
+        # exiting `success` while the agent never sent a tick-report, most importantly a
+        # `--max-turns` cutoff: claude-code-action reports max-turns as a SUCCESSFUL
+        # step, so the old `if: failure()` form silently missed it and the session
+        # stranded until the 30-min reconcile cron force-errored it as "tick-report
+        # drop". In both cases the agent produced no in-band queue entry or tick-report:
+        # surface the death in the decision queue and tell the orchestrator the tick
+        # failed so the session goes `errored` instead of hanging. When the breadcrumb
+        # IS present the skill already reported and this guard no-ops.
+        # Writes are observability, not gates — POSTs warn-and-continue.
+        if: always()
         env:
           QUEUE_SERVICE_ROLE_KEY: ${{ secrets.QUEUE_SERVICE_ROLE_KEY }}
           AUTONOMOUS_TICK_TOKEN: ${{ secrets.AUTONOMOUS_TICK_TOKEN }}
@@ -141,6 +146,14 @@ jobs:
           IMPLEMENTER_TARGET_KIND: ${{ inputs.target_kind }}
           IMPLEMENTER_TARGET_REF: ${{ inputs.target_ref }}
         run: |
+          # If the skill delivered its own tick-report it dropped this breadcrumb —
+          # the hub already heard back, so this guard has nothing to do. Absent → fall
+          # through and report on the workflow's behalf.
+          if [ -f "${GITHUB_WORKSPACE:-.}/.tick-report-sent" ]; then
+            echo "::notice::implementer-callable: skill already sent its tick-report; ensure-report guard idle"
+            exit 0
+          fi
+
           SLUG="${IMPLEMENTER_PRODUCT_SLUG:-$(basename "$GITHUB_REPOSITORY")}"
           RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           HUB="${IMPLEMENTER_HUB_URL:-https://sethgibson.com}"
@@ -188,16 +201,26 @@ jobs:
           # Tick-report — outcome `workflow-failed` (reserved for this handler
           # per implementer SKILL.md Step 7; orchestrator maps it to `errored`).
           if [ -n "$IMPLEMENTER_SESSION_ID" ] && [ -n "$AUTONOMOUS_TICK_TOKEN" ]; then
-            curl -sf -X POST \
-              -H "Authorization: Bearer $AUTONOMOUS_TICK_TOKEN" \
-              -H "Content-Type: application/json" \
-              "${HUB}/api/autonomous/tick-report" \
-              -d "{
-                \"session_id\": \"$IMPLEMENTER_SESSION_ID\",
-                \"run_id\": \"$GITHUB_RUN_ID\",
-                \"outcome\": \"workflow-failed\",
-                \"run_url\": \"$RUN_URL\",
-                \"last_phase\": \"$LAST_PHASE\"
-              }" \
-            || echo "::warning::implementer-callable: failure tick-report POST failed; defensive cron sweep will reconcile"
+            TICK_SENT=""
+            for attempt in 1 2 3; do
+              if curl -sf -X POST \
+                  -H "Authorization: Bearer $AUTONOMOUS_TICK_TOKEN" \
+                  -H "Content-Type: application/json" \
+                  "${HUB}/api/autonomous/tick-report" \
+                  -d "{
+                    \"session_id\": \"$IMPLEMENTER_SESSION_ID\",
+                    \"run_id\": \"$GITHUB_RUN_ID\",
+                    \"outcome\": \"workflow-failed\",
+                    \"run_url\": \"$RUN_URL\",
+                    \"last_phase\": \"$LAST_PHASE\"
+                  }"; then
+                TICK_SENT=1
+                break
+              fi
+              echo "::warning::implementer-callable: ensure-report tick-report POST attempt ${attempt}/3 failed"
+              sleep $((attempt * 3))
+            done
+            if [ -z "$TICK_SENT" ]; then
+              echo "::error::implementer-callable: ensure-report tick-report POST failed after 3 attempts; defensive cron sweep will reconcile"
+            fi
           fi
