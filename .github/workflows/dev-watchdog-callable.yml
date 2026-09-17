@@ -148,7 +148,7 @@ jobs:
             and run the recommender from the pre-build re-confirm onward:
             continuity-drift sweep (low-tier drift PR via gh, NOT touching
             PLANNING.md boxes), then the single highest-priority finding —
-            a deferred-work `follow-up` queue entry carrying a paste-ready Cowork
+            a deferred-work `follow-up` queue entry carrying a paste-ready session
             prompt. If NOTHING is deferred: the separate proposer step owns net-new
             ideation, so emit the graduate/maintenance/sunset "what now?" entry ONLY
             if BOTH feature toggles are off
