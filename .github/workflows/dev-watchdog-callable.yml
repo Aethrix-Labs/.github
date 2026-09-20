@@ -2,12 +2,16 @@ name: dev-watchdog (callable)
 
 # Daily per-product development health check (STANDARDS §24; SYSTEM_VISION Phase 14).
 # The thin per-product .github/workflows/dev-watchdog.yml (cron + workflow_dispatch)
-# `uses:` this. Flow: cheap no-LLM gate -> branch on token -> (recommend only)
-# open-entry precheck -> Opus recommender. Opus runs ONLY on an idle product with
-# no unactioned suggestion outstanding.
+# `uses:` this. Flow (revised 2026-09-20, STANDARDS §24.1-24.2b):
+#   flags -> gate (local docs: PLANNING/BACKLOG/ROUTING_BOARD) -> open-queue-entries
+#   check (only when the gate said the product looks idle) -> decide: signals-pending
+#   (from either source) -> debrief (no LLM); else idle -> recommender (deferred-scan
+#   only) -> proposer. Doc reconciliation runs every day, unconditionally, as long as
+#   the product isn't pre-build — independent of the signals-pending/idle branch.
 #
-# Requires the dev-watchdog bundle to be vended to fleet-skills `ci/dev-watchdog/`
-# (SKILL.md + gate.sh), reached here at .fleet-ci/ci/dev-watchdog/.
+# Requires the dev-watchdog bundle vended to fleet-skills `ci/dev-watchdog/`
+# (SKILL.md, gate.sh, brief_collect.py, debrief_emit.py), reached here at
+# .fleet-ci/ci/dev-watchdog/.
 
 on:
   workflow_call:
@@ -86,22 +90,28 @@ jobs:
           printf '%s\n' "$FLAGS" >> "$GITHUB_OUTPUT"
           echo "flags: $(printf '%s' "$FLAGS" | tr '\n' ' ')"
 
-      # ---- Phase 0: cheap, deterministic gate (no LLM) ----
+      # ---- Phase 0: cheap, deterministic local-docs gate (no LLM), STANDARDS §24.1 ----
       - name: Gate
         id: gate
         if: steps.flags.outputs.watchdog_enabled == 'true'
         run: |
-          DECISION="$(bash .fleet-ci/ci/dev-watchdog/gate.sh "$GITHUB_WORKSPACE" 2>/tmp/gate.err)"
+          DIGEST="$RUNNER_TEMP/dev-watchdog-digest.json"
+          DECISION="$(bash .fleet-ci/ci/dev-watchdog/gate.sh "$GITHUB_WORKSPACE" "$DIGEST" 2>/tmp/gate.err)"
           cat /tmp/gate.err || true
           echo "decision=$DECISION" >> "$GITHUB_OUTPUT"
+          echo "digest_path=$DIGEST" >> "$GITHUB_OUTPUT"
           echo "dev-watchdog gate decision: $DECISION"
 
-      # ---- Open-entry precheck: only meaningful on the idle path ----
-      # If an unactioned dev-watchdog suggestion already exists, don't stack
-      # another (and don't spin up Opus). Any open follow-up for the product
-      # suppresses; narrow to agent_name=dev-watchdog if/when the hub supports it.
-      - name: Open-entry precheck
-        id: precheck
+      # ---- Open queue-entries check (STANDARDS §24.1) — only meaningful when the
+      # local gate says the product looks idle. Any open entry for this product,
+      # of any entry_type (a milestone-test pointer, a stale suggestion, anything),
+      # overrides `recommend` to the same signals-pending outcome as the "Decide"
+      # step below. Not the old entry_type=follow-up-only precheck — that shape
+      # was never actually valid against the endpoint (always 400'd, so the old
+      # precheck always silently proceeded); this uses the endpoint's generalized
+      # no-entry_type shape instead. ----
+      - name: Open queue-entries check
+        id: queuecheck
         if: steps.gate.outputs.decision == 'recommend'
         env:
           QUEUE_SERVICE_ROLE_KEY: ${{ secrets.QUEUE_SERVICE_ROLE_KEY }}
@@ -110,24 +120,92 @@ jobs:
         run: |
           SLUG="${PRODUCT_SLUG:-$(basename "$GITHUB_REPOSITORY")}"
           HUB="${HUB_URL:-https://sethgibson.com}"
+          ENTRIES_OUT="$RUNNER_TEMP/dev-watchdog-open-entries.json"
           if [ -z "$QUEUE_SERVICE_ROLE_KEY" ]; then
-            echo "::warning::dev-watchdog: QUEUE_SERVICE_ROLE_KEY missing; skipping precheck (proceeding)"
-            echo "proceed=true" >> "$GITHUB_OUTPUT"; exit 0
+            echo "::warning::dev-watchdog: QUEUE_SERVICE_ROLE_KEY missing; skipping open-entry check (treating as none open)"
+            echo '{"count":0,"entries":[]}' > "$ENTRIES_OUT"
+            echo "open_count=0" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
-          COUNT="$(curl -s "${HUB}/api/v1/queue/entries?product=${SLUG}&status=open&entry_type=follow-up" \
-            -H "x-service-role-key: $QUEUE_SERVICE_ROLE_KEY" | jq -r '.count // 0')"
-          echo "open follow-up entries for ${SLUG}: ${COUNT}"
-          if [ "${COUNT:-0}" -gt 0 ]; then
-            echo "proceed=false" >> "$GITHUB_OUTPUT"
-            echo "An unactioned suggestion already exists — not invoking the recommender."
-          else
-            echo "proceed=true" >> "$GITHUB_OUTPUT"
-          fi
+          RESP="$(curl -s "${HUB}/api/v1/queue/entries?product=${SLUG}&status=open" \
+            -H "x-service-role-key: $QUEUE_SERVICE_ROLE_KEY")"
+          printf '%s' "$RESP" > "$ENTRIES_OUT"
+          COUNT="$(printf '%s' "$RESP" | jq -r '.count // 0' 2>/dev/null || echo 0)"
+          echo "open queue entries for ${SLUG}: ${COUNT}"
+          echo "open_count=${COUNT:-0}" >> "$GITHUB_OUTPUT"
 
-      # ---- Phase 1: Opus recommender (idle path, no pending suggestion) ----
+      # ---- Decide: signals-pending (debrief) vs. genuinely idle. STANDARDS §24.1 ----
+      - name: Decide
+        id: decide
+        if: steps.flags.outputs.watchdog_enabled == 'true' && steps.gate.outputs.decision != 'pre-build'
+        run: |
+          DECISION="${{ steps.gate.outputs.decision }}"
+          QCOUNT="${{ steps.queuecheck.outputs.open_count }}"
+          if [ "$DECISION" = "signals-pending" ] || [ "${QCOUNT:-0}" -gt 0 ]; then
+            echo "path=debrief" >> "$GITHUB_OUTPUT"
+          else
+            echo "path=idle" >> "$GITHUB_OUTPUT"
+          fi
+          echo "dev-watchdog decide: gate=$DECISION open_queue_entries=${QCOUNT:-0}"
+
+      # ---- Debrief (no LLM), STANDARDS §24.1a. Deterministic — built from the
+      # gate's digest + the open-entries list, never an Opus call. ----
+      - name: Debrief
+        if: steps.decide.outputs.path == 'debrief'
+        env:
+          QUEUE_SERVICE_ROLE_KEY: ${{ secrets.QUEUE_SERVICE_ROLE_KEY }}
+          HUB_URL: ${{ inputs.hub_url }}
+          PRODUCT_SLUG: ${{ inputs.product_slug }}
+        run: |
+          SLUG="${PRODUCT_SLUG:-$(basename "$GITHUB_REPOSITORY")}"
+          python3 .fleet-ci/ci/dev-watchdog/debrief_emit.py \
+            --digest "${{ steps.gate.outputs.digest_path }}" \
+            --open-entries "$RUNNER_TEMP/dev-watchdog-open-entries.json" \
+            --product-slug "$SLUG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --hub-url "${HUB_URL:-https://sethgibson.com}" \
+            --service-role-key "$QUEUE_SERVICE_ROLE_KEY"
+
+      # ---- Doc reconciliation (Opus, every day, unconditional), STANDARDS §24.2.
+      # Runs regardless of signals-pending vs. idle — only pre-build (nothing
+      # shipped yet, no reconciliation target) and the master switch gate it. ----
+      - name: Doc reconciliation
+        if: steps.flags.outputs.watchdog_enabled == 'true' && steps.gate.outputs.decision != 'pre-build'
+        uses: anthropics/claude-code-action@v1
+        env:
+          DEV_WATCHDOG_PRODUCT_SLUG: ${{ inputs.product_slug }}
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            You are running as the **dev-watchdog doc-reconciliation** step in CI.
+
+            Read `.fleet-ci/ci/dev-watchdog/SKILL.md`'s "Doc reconciliation" section
+            and follow it exactly. This is a standing daily hygiene pass — it runs
+            regardless of whether the product has open PLANNING/BACKLOG/ROUTING_BOARD
+            work or is fully idle. Do ONLY the continuity-drift sweep of the canonical
+            docs OTHER than PLANNING.md boxes (stale LIFECYCLE stage:/next_milestone:,
+            LIFECYCLE body bloat, PRD<->design contradictions, DECISIONS lines
+            contradicting what shipped, flagged PLANNING "Open questions"). Do NOT
+            scan for deferred work, do NOT touch PLANNING.md boxes, do NOT post any
+            queue entry — that's handled by separate steps in this same workflow run.
+
+            Runtime context:
+            - Working directory has the full consumer repo (fetch-depth: 0).
+            - Product slug: $DEV_WATCHDOG_PRODUCT_SLUG (or derive from $GITHUB_REPOSITORY).
+
+            CARDINALITY (hard limit, STANDARDS §24.7): this step may open AT MOST ONE
+            doc-only drift PR. If several drifts exist, fix them all in that one PR.
+            If nothing is faithfully reconcilable, open no PR — don't guess.
+          claude_args: |
+            --model claude-opus-4-8
+            --max-turns 40
+            --allowedTools Read,Bash,Write,Edit,Glob,Grep
+
+      # ---- Phase 1: Opus recommender — deferred-work scan only (idle path,
+      # nothing already pending). STANDARDS §24.2b. ----
       - name: Run recommender
         id: recommender
-        if: steps.gate.outputs.decision == 'recommend' && steps.precheck.outputs.proceed == 'true'
+        if: steps.decide.outputs.path == 'idle'
         uses: anthropics/claude-code-action@v1
         env:
           QUEUE_SERVICE_ROLE_KEY: ${{ secrets.QUEUE_SERVICE_ROLE_KEY }}
@@ -140,18 +218,17 @@ jobs:
           prompt: |
             You are running as the **dev-watchdog recommender** in CI.
 
-            Read `.fleet-ci/ci/dev-watchdog/SKILL.md` and follow it exactly.
+            Read `.fleet-ci/ci/dev-watchdog/SKILL.md` and follow its "Recommender"
+            section exactly.
 
-            The cheap gate already returned `recommend` (this product is built-out
-            and idle) and the open-entry precheck already passed (no unactioned
-            suggestion outstanding) — so SKIP the gate and SKIP precheck Step 1,
-            and run the recommender from the pre-build re-confirm onward:
-            continuity-drift sweep (low-tier drift PR via gh, NOT touching
-            PLANNING.md boxes), then the single highest-priority finding —
-            a deferred-work `follow-up` queue entry carrying a paste-ready session
-            prompt. If NOTHING is deferred: the separate proposer step owns net-new
-            ideation, so emit the graduate/maintenance/sunset "what now?" entry ONLY
-            if BOTH feature toggles are off
+            The signals check already confirmed: this product is built-out and idle,
+            PLANNING/BACKLOG/ROUTING_BOARD are all clear, and there are zero open
+            queue entries for it — so do NOT re-scan any of those, and do NOT do doc
+            reconciliation (a separate step in this run already handles that). Run
+            ONLY the deferred-work scan (PRD Post-MVP, PLANNING Out-of-scope items
+            flagged "earns a feature-spec", an un-planned docs/specs/FEATURE_*.md,
+            noted design-system divergence) and, if nothing is deferred, the
+            graduate/maintenance/sunset fallback ONLY if BOTH feature toggles are off
             (auto_feature=$DEV_WATCHDOG_AUTO_FEATURE_ENABLED,
             inspiration=$DEV_WATCHDOG_INSPIRATION_ENABLED); if either is on, emit
             nothing and let the proposer handle the nothing-deferred path.
@@ -161,26 +238,28 @@ jobs:
             - Product slug: $DEV_WATCHDOG_PRODUCT_SLUG (or derive from $GITHUB_REPOSITORY).
             - Hub base URL: $DEV_WATCHDOG_HUB_URL (queue POST per STANDARDS §8).
 
-            CARDINALITY (hard limit, STANDARDS §24.7): this entire run may open
-            AT MOST ONE drift PR and POST AT MOST ONE follow-up queue entry. If
-            several deferred items exist, pick the single highest-priority one.
-            POST exactly once, then STOP — do NOT POST a second entry for another
-            framing of the same finding, a reworded variant, or a different
-            finding, and do NOT open a second PR. One curl POST, one PR, done.
-            Do not author PLANNING.md steps or net-new committed scope.
+            CARDINALITY (hard limit, STANDARDS §24.7): this step may POST AT MOST ONE
+            follow-up queue entry. If several deferred items exist, pick the single
+            highest-priority one. POST exactly once, then STOP — do NOT POST a second
+            entry for another framing of the same finding, a reworded variant, or a
+            different finding. Do not author PLANNING.md steps or net-new committed
+            scope. Do not open a PR — that's the doc-reconciliation step's job, not
+            this one's.
           claude_args: |
             --model claude-opus-4-8
-            --max-turns 60
-            --allowedTools Read,Bash,Write,Edit,Glob,Grep
+            --max-turns 40
+            --allowedTools Read,Bash,Glob,Grep
 
       # ---- Phase 2: proposer — nothing-deferred net-new ideation (STANDARDS §24.6) ----
-      # Realizes dev-watchdog Step 5. Independent of the precheck so net-new runs
-      # daily under toggle control (§24.7); self-gates on "nothing deferred" inside
-      # the skill. Writes no code → no Write/Edit tools.
+      # Realizes dev-watchdog's "nothing deferred" branch. Only dispatched on the
+      # idle path (decide.path == 'idle'), i.e. only after the signals check has
+      # already deterministically confirmed zero local signals and zero open queue
+      # entries for this product (STANDARDS §24.7, revised 2026-09-20 — this used
+      # to run independent of any precheck; it no longer does). Writes no code ->
+      # no Write/Edit tools. ----
       - name: Run proposer
         if: >
-          steps.flags.outputs.watchdog_enabled == 'true' &&
-          steps.gate.outputs.decision == 'recommend' &&
+          steps.decide.outputs.path == 'idle' &&
           (steps.flags.outputs.auto_feature_enabled == 'true' ||
            steps.flags.outputs.inspiration_enabled == 'true')
         uses: anthropics/claude-code-action@v1
@@ -197,9 +276,9 @@ jobs:
 
             Read `.fleet-ci/ci/proposer/SKILL.md` and follow it exactly.
 
-            Proceed ONLY if the product is built-out, idle, and NOTHING is deferred
-            (re-confirm — the recommender ran the drift + deferred scans this run when
-            it wasn't suppressed). Emit ONLY the enabled entry types:
+            The signals check already confirmed the product is built-out, idle, and
+            nothing is deferred or already pending — proceed straight to ideation.
+            Emit ONLY the enabled entry types:
               - auto_feature_enabled = $PROPOSER_AUTO_FEATURE_ENABLED
               - inspiration_enabled  = $PROPOSER_INSPIRATION_ENABLED
             Dedup by candidate-fingerprint. Ideate only — never plan, design, or build.
@@ -229,16 +308,16 @@ jobs:
           fi
           D="${{ steps.gate.outputs.decision }}"
           case "$D" in
-            open-work) echo "Bailed: PLANNING.md has open work — implementer's lane." ;;
-            pre-build) echo "Bailed: pre-build — early-phase skills own this product." ;;
-            recommend)
-              if [ "${{ steps.precheck.outputs.proceed }}" = "true" ]; then
-                echo "Idle: ran the recommender."
+            pre-build) echo "Bailed: pre-build — early-phase skills own this product. No doc reconciliation, no debrief." ;;
+            signals-pending|recommend)
+              echo "Doc reconciliation ran (every day, per STANDARDS §24.2)."
+              if [ "${{ steps.decide.outputs.path }}" = "debrief" ]; then
+                echo "Signals pending (gate=$D, open queue entries=${{ steps.queuecheck.outputs.open_count || 0 }}) — posted/refreshed the debrief."
               else
-                echo "Idle, but a deferred suggestion is already pending — skipped the recommender."
-              fi
-              if [ "${{ steps.flags.outputs.auto_feature_enabled }}" = "true" ] || [ "${{ steps.flags.outputs.inspiration_enabled }}" = "true" ]; then
-                echo "Proposer step ran (net-new ideation, per toggles)."
+                echo "Idle, nothing pending: ran the recommender."
+                if [ "${{ steps.flags.outputs.auto_feature_enabled }}" = "true" ] || [ "${{ steps.flags.outputs.inspiration_enabled }}" = "true" ]; then
+                  echo "Proposer step ran (net-new ideation, per toggles)."
+                fi
               fi ;;
             *) echo "Gate returned: '$D'." ;;
           esac
