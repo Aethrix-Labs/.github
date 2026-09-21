@@ -85,6 +85,11 @@ jobs:
           QUEUE_SERVICE_ROLE_KEY: ${{ secrets.QUEUE_SERVICE_ROLE_KEY }}
           # Tick-report auth token (separate from QUEUE_SERVICE_ROLE_KEY per m2m convention).
           AUTONOMOUS_TICK_TOKEN: ${{ secrets.AUTONOMOUS_TICK_TOKEN }}
+          # Shared password for the local-only test accounts (vault `fleet-test-local`,
+          # STANDARDS §23.5). Product seed scripts (`seed:test`, `seed:review`, …) and
+          # UI self-checks that sign in to the local stack read it. Empty when the org
+          # secret is unset — scripts that need it fail fast with their own message.
+          FLEET_TEST_PASSWORD: ${{ secrets.FLEET_TEST_PASSWORD }}
           # Dispatch payload passed through to the agent via env.
           IMPLEMENTER_PRODUCT_SLUG: ${{ inputs.product_slug }}
           IMPLEMENTER_SESSION_ID: ${{ inputs.session_id }}
