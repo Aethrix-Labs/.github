@@ -1,0 +1,209 @@
+name: milestone-test (callable)
+
+# Per-milestone testing session, autonomous mode (STANDARDS §23.7 Mode A).
+#
+# The thin per-product .github/workflows/milestone-test.yml `uses:` this. Its gate job
+# turns a push to `main` into (milestone, runner) — a milestone close is the merge of the
+# PR that archived the milestone into docs/PLANNING_ARCHIVE.md — and dispatches here.
+#
+# Flow: scope from the milestone diff -> classify each built behavior (e2e / checklist /
+# neither) -> author + run the e2e headless to green -> headless visual pass with
+# screenshots -> route residual findings via shakedown's autonomous posture -> commit via
+# ci-commit. Emits a `follow-up` ONLY when something actually needs Seth; a clean session
+# emits nothing, which is the whole point of the mode.
+#
+# Requires the milestone-test + shakedown bundles vended to fleet-skills `ci/`, reached
+# here at .fleet-ci/ci/milestone-test/ and .fleet-ci/ci/shakedown/.
+
+on:
+  workflow_call:
+    inputs:
+      product_slug:
+        description: "Product slug (defaults to repo basename)."
+        type: string
+        required: false
+        default: ""
+      hub_url:
+        description: "Hub base URL for the queue POST. Defaults to https://sethgibson.com."
+        type: string
+        required: false
+        default: "https://sethgibson.com"
+      milestone:
+        description: "The closed milestone to test, e.g. M35. Resolved by the caller's gate job."
+        type: string
+        required: true
+      runner_label:
+        description: "Self-hosted runner label (STANDARDS §9 surface routing). 'fleet' = PC (web/backend), 'fleet-mac' = Mac (mobile; has the simulator)."
+        type: string
+        required: false
+        default: "fleet"
+
+permissions:
+  contents: write # the session commits specs, seed scripts and docs
+  pull-requests: write # ci-commit opens the PR
+  id-token: write # required by anthropics/claude-code-action@v1
+
+concurrency:
+  # Serialize milestone-test runs per product. Deliberately NOT shared with the
+  # implementer's group: a queued implementer run strands its hub session (the dispatch
+  # endpoint returns 204 with no body, so the hub never learns the run id).
+  group: milestone-test-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  milestone-test:
+    runs-on: [self-hosted, "${{ inputs.runner_label }}"]
+    steps:
+      - uses: actions/checkout@v4 # consumer repo at $GITHUB_WORKSPACE
+        with:
+          fetch-depth: 0 # the session reads the milestone's diff + git history
+
+      - uses: actions/checkout@v4 # fleet-skills (CI skills under ci/)
+        with:
+          repository: Aethrix-Labs/fleet-skills
+          path: .fleet-ci
+          ref: main
+          token: ${{ secrets.FLEET_SKILLS_PAT }} # fleet-skills is private
+
+      - name: Set up gh CLI
+        run: gh --version
+
+      - name: Configure git for commits
+        run: |
+          git config user.name  "milestone-test[bot]"
+          git config user.email "milestone-test@aethrix-labs.local"
+
+      - name: Run milestone-test agent
+        id: agent
+        uses: anthropics/claude-code-action@v1
+        env:
+          QUEUE_SERVICE_ROLE_KEY: ${{ secrets.QUEUE_SERVICE_ROLE_KEY }}
+          AUTONOMOUS_TICK_TOKEN: ${{ secrets.AUTONOMOUS_TICK_TOKEN }}
+          # Shared password for the local-only test accounts (vault `fleet-test-local`,
+          # STANDARDS §23.5). seed:test and any spec that signs in read it. Empty when the
+          # org secret is unset — the skill treats that as a stop, not something to work around.
+          FLEET_TEST_PASSWORD: ${{ secrets.FLEET_TEST_PASSWORD }}
+          MT_PRODUCT_SLUG: ${{ inputs.product_slug }}
+          MT_HUB_URL: ${{ inputs.hub_url }}
+          MT_MILESTONE: ${{ inputs.milestone }}
+          # Runner capability, not the milestone's surface marker — so a mobile milestone
+          # that somehow lands on `fleet` degrades instead of thrashing against no simulator.
+          MT_MOBILE_CAPABLE: ${{ inputs.runner_label == 'fleet-mac' && '1' || '0' }}
+          MT_ARTIFACT_DIR: ${{ github.workspace }}/.milestone-test-artifacts
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            You are running as the **milestone-test agent** in CI, in **Mode A (autonomous)**.
+
+            Read `.fleet-ci/ci/milestone-test/SKILL.md` and follow it exactly. Every
+            "Mode A" rule in it applies to you; every "Mode B" instruction does not.
+
+            The milestone to test is $MT_MILESTONE — it was just closed and archived into
+            `docs/PLANNING_ARCHIVE.md` by the PR that merged to `main`. The diff for that
+            milestone is your scope. Do not sweep the rest of the app.
+
+            Hard rules, restated because they are the ones that matter unattended:
+            - **No harness, or a harness that can't run headless from a cold start?**
+              STOP. Emit the `follow-up` pointing at `e2e-setup` and exit without a PR.
+              Do NOT bootstrap a harness here.
+            - **Never** delete, skip, `.only`/`.skip`, loosen an assertion, or extend a
+              timeout to manufacture a green. A spec you can't fix in 3 attempts is ROUTED
+              as a finding.
+            - **Never** mark a behavior verified that you did not actually observe. What a
+              headless runner can't check is `⏸ not verified — needs human`, and it goes in
+              the follow-up `ask`.
+            - The session record's `**Tester:**` line reads `CI (autonomous)` with this
+              run's URL. Screenshots go to $MT_ARTIFACT_DIR so this workflow uploads them.
+
+            Route residual findings by reading `.fleet-ci/ci/shakedown/SKILL.md` and
+            following its **Mode A autonomous routing posture** — tell it you are Mode A.
+            Anything ambiguous parks on `ROUTING_BOARD.md` with `needs: decision`; do not
+            invoke `lite-planner`.
+
+            Then commit by reading `.fleet-ci/ci/ci-commit/SKILL.md` and following it.
+
+            Finally, emit AT MOST ONE `follow-up` queue entry, and only if the skill's
+            Step 6 table says to. A clean session emits NOTHING — no FYI, no "all green"
+            note. Silence is the success case.
+
+            Runtime context:
+            - Working directory has the full consumer repo (fetch-depth: 0).
+            - Product slug: $MT_PRODUCT_SLUG (or derive from $GITHUB_REPOSITORY).
+            - Hub base URL: $MT_HUB_URL.
+            - Mobile/simulator capable: $MT_MOBILE_CAPABLE (1 = this runner has one).
+          claude_args: |
+            --model claude-sonnet-4-6
+            --max-turns 180
+            --allowedTools Read,Bash,Write,Edit,Glob,Grep
+            # --max-turns 180 matches implementer-callable and lite-planner-callable. The
+            # session shares the same commit tax (shakedown -> ci-commit ->
+            # canonical-doc-update) on top of authoring specs, running the suite, and the
+            # visual pass. The skill's own turn-budget rule (~120 for Steps 1-4, ~50 in
+            # reserve for Step 5) is the durable fix, plus its instruction to stop and
+            # route what it has rather than grind into a max-turns death — NOT raising
+            # this further.
+
+      - name: Upload session artifacts
+        # Screenshots + the suite's report. §23.9 evidence: a verification claim with
+        # nothing attached does not satisfy the bar. Never fails the run.
+        if: always()
+        uses: actions/upload-artifact@v4
+        continue-on-error: true
+        with:
+          name: milestone-test-${{ inputs.milestone }}
+          path: |
+            .milestone-test-artifacts/**
+            test-results/**
+            playwright-report/**
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Emit failure queue entry on agent death
+        # The agent step died (max-turns, crash, infra) before its own exit path — surface
+        # it so a closed milestone doesn't silently go untested.
+        if: failure() && steps.agent.outcome == 'failure'
+        env:
+          QUEUE_SERVICE_ROLE_KEY: ${{ secrets.QUEUE_SERVICE_ROLE_KEY }}
+          MT_PRODUCT_SLUG: ${{ inputs.product_slug }}
+          MT_HUB_URL: ${{ inputs.hub_url }}
+          MT_MILESTONE: ${{ inputs.milestone }}
+        run: |
+          SLUG="${MT_PRODUCT_SLUG:-$(basename "$GITHUB_REPOSITORY")}"
+          HUB="${MT_HUB_URL:-https://sethgibson.com}"
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+          # Phase breadcrumb — the agent overwrites this single-line marker at each phase
+          # boundary (milestone-test SKILL.md "Phase breadcrumb"). On a max-turns/crash
+          # death the agent never reached its exit path, so this file is the only signal
+          # for WHERE it died. Localizes the failure to a phase (scope | classify | e2e |
+          # visual | routing | committing) instead of a bare death. Mirrors
+          # implementer-callable and lite-planner-callable.
+          PHASE_FILE="${GITHUB_WORKSPACE:-.}/.milestone-test-phase"
+          LAST_PHASE="unknown"
+          if [ -f "$PHASE_FILE" ]; then
+            LAST_PHASE="$(tr -d '\r\n' < "$PHASE_FILE" | head -c 200)"
+          fi
+          echo "::notice::milestone-test-callable: workflow failed at phase=${LAST_PHASE}"
+
+          if [ -n "$QUEUE_SERVICE_ROLE_KEY" ]; then
+            REQUEST_ID=$(printf '%s' "${GITHUB_RUN_ID}milestone-test-failed" | sha256sum | cut -d' ' -f1)
+            curl -sf -X POST "${HUB}/api/v1/queue/entries" \
+              -H "Content-Type: application/json" \
+              -H "x-service-role-key: $QUEUE_SERVICE_ROLE_KEY" \
+              -H "User-Agent: aethrix-fleet-ci/1.0 (milestone-test-callable)" \
+              -d "{
+                \"request_id\": \"$REQUEST_ID\",
+                \"entry_type\": \"exception\",
+                \"risk_tier\": \"high\",
+                \"agent_name\": \"milestone-test\",
+                \"product_slug\": \"$SLUG\",
+                \"title\": \"[$SLUG] milestone-test failed on ${MT_MILESTONE}\",
+                \"goal\": \"Run the per-milestone testing session for ${MT_MILESTONE} (STANDARDS 23.7 Mode A)\",
+                \"attempts\": [\"claude-code-action step failed (max-turns, crash, or infra error) before the skill's own exit path. Last phase reached: ${LAST_PHASE}. Run: $RUN_URL\"],
+                \"ask\": \"Inspect the run log, then run milestone-test interactively for ${MT_MILESTONE} or re-dispatch the workflow\",
+                \"recommendation\": \"Died at phase '${LAST_PHASE}'. scope/classify -> the milestone diff is probably large; consider running the session interactively. e2e -> a spec likely thrashed past the 3-attempt cap, or the harness is not CI-ready (run e2e-setup). visual -> Playwright may lack its OS deps on the runner (SELF_HOSTED_RUNNER.md 'Playwright readiness'). routing/committing -> check the shakedown / ci-commit tail; the specs may already be written and just need committing.\"
+              }" \
+            || echo "::warning::milestone-test-callable: failure queue-entry POST failed"
+          else
+            echo "::warning::milestone-test-callable: QUEUE_SERVICE_ROLE_KEY missing; skipping failure queue entry"
+          fi
