@@ -54,6 +54,10 @@ concurrency:
 jobs:
   milestone-test:
     runs-on: [self-hosted, "${{ inputs.runner_label }}"]
+    # STANDARDS §28.6. No completed run yet to measure; sized off the implementer (same
+    # 180-turn budget, observed max 60m) plus e2e suite runs inside those turns. fleet-mac
+    # adds 30 for Maestro calls queueing on the fleet_maestro lock (FLEET_MAESTRO_LOCK_WAIT_SECS=1800).
+    timeout-minutes: ${{ inputs.runner_label == 'fleet-mac' && 180 || 150 }}
     steps:
       - uses: actions/checkout@v4 # consumer repo at $GITHUB_WORKSPACE
         with:
