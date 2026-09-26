@@ -12,8 +12,9 @@ name: milestone-test (callable)
 # ci-commit. Emits a `follow-up` ONLY when something actually needs Seth; a clean session
 # emits nothing, which is the whole point of the mode.
 #
-# Requires the milestone-test + shakedown bundles vended to fleet-skills `ci/`, reached
-# here at .fleet-ci/ci/milestone-test/ and .fleet-ci/ci/shakedown/.
+# Requires these bundles vended to fleet-skills `ci/`, reached at .fleet-ci/ci/<name>/:
+# milestone-test, shakedown, ci-commit (incl. PACKETS.md — the `verification-unavailable`
+# template), and implementer (its tooling-probe.mjs, run pre-agent and by the skill's Step 0).
 
 on:
   workflow_call:
@@ -73,6 +74,41 @@ jobs:
           git config user.name  "milestone-test[bot]"
           git config user.email "milestone-test@aethrix-labs.local"
 
+      - name: Probe verification tooling (Playwright / Maestro / simulator)
+        # Records what THIS runner can actually launch, so the run log and the agent start from
+        # facts instead of the runner label's promise (STANDARDS §23.9 "When the tool can't run").
+        # Advisory: never a gate and never fails the job. The agent's own probe run is authoritative
+        # (it can heal, and it is scoped to the repo's Playwright version). A missing script only means
+        # the fleet-skills vending PR has not landed yet; that must not break CI for every product.
+        # Bounded: a hung probe must not hold this product's concurrency group for the default 6h.
+        continue-on-error: true
+        timeout-minutes: 10
+        shell: bash
+        env:
+          # Through env, never interpolated into the script body.
+          RUNNER_LABEL: ${{ inputs.runner_label }}
+        run: |
+          PROBE=".fleet-ci/ci/implementer/tooling-probe.mjs"
+          if [ ! -f "$PROBE" ]; then
+            echo "::notice::tooling-probe not present in .fleet-ci (fleet-skills vending not landed yet); skipping"
+            exit 0
+          fi
+          if ! command -v node >/dev/null 2>&1; then
+            echo "::notice::node is not on PATH for this runner; skipping the tooling probe"
+            exit 0
+          fi
+          # The probe prints only single-line values behind fixed prefixes, so its output cannot start a
+          # workflow command (`::…`) at column 0.
+          node "$PROBE" --runner --github-env 2> "$RUNNER_TEMP/tooling-probe.txt" >/dev/null || true
+          cat "$RUNNER_TEMP/tooling-probe.txt"
+          {
+            echo "### Verification tooling on \`${RUNNER_LABEL}\`"
+            echo '```'
+            cat "$RUNNER_TEMP/tooling-probe.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          rm -f "$RUNNER_TEMP/tooling-probe.txt"
+
       - name: Run milestone-test agent
         id: agent
         uses: anthropics/claude-code-action@v1
@@ -87,7 +123,8 @@ jobs:
           MT_HUB_URL: ${{ inputs.hub_url }}
           MT_MILESTONE: ${{ inputs.milestone }}
           # Runner capability, not the milestone's surface marker — so a mobile milestone
-          # that somehow lands on `fleet` degrades instead of thrashing against no simulator.
+          # that somehow lands on `fleet` STOPS with the `verification-unavailable` hold (the probe
+          # reports no simulator) instead of thrashing against one.
           MT_MOBILE_CAPABLE: ${{ inputs.runner_label == 'fleet-mac' && '1' || '0' }}
           MT_ARTIFACT_DIR: ${{ github.workspace }}/.milestone-test-artifacts
         with:
@@ -106,12 +143,23 @@ jobs:
             - **No harness, or a harness that can't run headless from a cold start?**
               STOP. Emit the `follow-up` pointing at `e2e-setup` and exit without a PR.
               Do NOT bootstrap a harness here.
+            - **A required tool (Playwright / Maestro / the simulator) that will not
+              launch?** This is decided AFTER the harness check, never before: no harness
+              means the non-blocking `follow-up` above, with no probe and no hold. With a
+              harness, run the tooling probe exactly as the skill's Step 0 says. Only exit
+              `20` means unavailable — then STOP WITHOUT A PR and emit the blocking
+              `verification-unavailable` exception INSTEAD OF the follow-up (template:
+              `.fleet-ci/ci/ci-commit/PACKETS.md`), and exit cleanly. It holds the next
+              dispatch so the loop cannot build on an unverified milestone. Any other exit
+              is "could not decide", not a verdict. A missing probe script is never a reason
+              to hold. This is not a failure: do not bootstrap, and do not run ci-commit.
             - **Never** delete, skip, `.only`/`.skip`, loosen an assertion, or extend a
               timeout to manufacture a green. A spec you can't fix in 3 attempts is ROUTED
               as a finding.
             - **Never** mark a behavior verified that you did not actually observe. What a
-              headless runner can't check is `⏸ not verified — needs human`, and it goes in
-              the follow-up `ask`.
+              headless runner can't check (behavior that is inherently unobservable — not
+              a tool that failed to launch) is `⏸ not verified — needs human`, and it goes
+              in the follow-up `ask`.
             - The session record's `**Tester:**` line reads `CI (autonomous)` with this
               run's URL. Screenshots go to $MT_ARTIFACT_DIR so this workflow uploads them.
 
@@ -122,9 +170,10 @@ jobs:
 
             Then commit by reading `.fleet-ci/ci/ci-commit/SKILL.md` and following it.
 
-            Finally, emit AT MOST ONE `follow-up` queue entry, and only if the skill's
-            Step 6 table says to. A clean session emits NOTHING — no FYI, no "all green"
-            note. Silence is the success case.
+            Finally, emit AT MOST ONE queue entry — a `follow-up`, or the blocking
+            `verification-unavailable` exception when a required tool would not run — and
+            only if the skill's Step 6 table says to. A clean session emits NOTHING — no
+            FYI, no "all green" note. Silence is the success case.
 
             Runtime context:
             - Working directory has the full consumer repo (fetch-depth: 0).
