@@ -75,6 +75,41 @@ jobs:
           git config user.name  "implementer-agent[bot]"
           git config user.email "implementer-agent@aethrix-labs.local"
 
+      - name: Probe verification tooling (Playwright / Maestro / simulator)
+        # Records what THIS runner can actually launch, so the run log and the agent start from
+        # facts instead of the runner label's promise (STANDARDS §23.9 "When the tool can't run").
+        # Advisory: never a gate and never fails the job. The agent's own probe run is authoritative
+        # (it can heal, and it is scoped to the repo's Playwright version). A missing script only means
+        # the fleet-skills vending PR has not landed yet; that must not break CI for every product.
+        # Bounded: a hung probe must not hold this product's concurrency group for the default 6h.
+        continue-on-error: true
+        timeout-minutes: 10
+        shell: bash
+        env:
+          # Through env, never interpolated into the script body.
+          RUNNER_LABEL: ${{ inputs.runner_label }}
+        run: |
+          PROBE=".fleet-ci/ci/implementer/tooling-probe.mjs"
+          if [ ! -f "$PROBE" ]; then
+            echo "::notice::tooling-probe not present in .fleet-ci (fleet-skills vending not landed yet); skipping"
+            exit 0
+          fi
+          if ! command -v node >/dev/null 2>&1; then
+            echo "::notice::node is not on PATH for this runner; skipping the tooling probe"
+            exit 0
+          fi
+          # The probe prints only single-line values behind fixed prefixes, so its output cannot start a
+          # workflow command (`::…`) at column 0.
+          node "$PROBE" --runner --github-env 2> "$RUNNER_TEMP/tooling-probe.txt" >/dev/null || true
+          cat "$RUNNER_TEMP/tooling-probe.txt"
+          {
+            echo "### Verification tooling on \`${RUNNER_LABEL}\`"
+            echo '```'
+            cat "$RUNNER_TEMP/tooling-probe.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          rm -f "$RUNNER_TEMP/tooling-probe.txt"
+
       - name: Run implementer agent
         id: agent
         uses: anthropics/claude-code-action@v1
@@ -100,7 +135,8 @@ jobs:
           # Runner-capability flag for the mobile self-check (STANDARDS §23.9
           # Track A). The implementer keys off this flag, not off the milestone's
           # Surface marker directly, so a mobile step that lands on `fleet` (no
-          # simulator) safely no-ops instead of thrashing.
+          # simulator) does not thrash: it takes the blocked path and the loop is held
+          # (`verification-unavailable`, STANDARDS §23.9) — it no longer silently no-ops.
           UI_SELF_CHECK_MOBILE: ${{ inputs.runner_label == 'fleet-mac' && '1' || '0' }}
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
