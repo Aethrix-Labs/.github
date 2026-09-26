@@ -43,6 +43,9 @@ jobs:
     # Fleet PC (WSL2) self-hosted runner — agentic jobs run locally to avoid
     # GitHub-hosted minute billing. See ~/products/docs/SELF_HOSTED_RUNNER.md.
     runs-on: [self-hosted, linux, fleet]
+    # STANDARDS §28.6. Observed max 16m (successes <=12m); the three agent steps cap at
+    # 140 turns total, ~47m at the implementer's worst observed ~20s/turn.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4        # consumer repo at $GITHUB_WORKSPACE
         with:

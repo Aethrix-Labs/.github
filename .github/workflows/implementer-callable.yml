@@ -53,6 +53,9 @@ jobs:
     # Mac (mobile/both; has the simulator). Avoids GitHub-hosted minute billing.
     # See ~/products/docs/SELF_HOSTED_RUNNER.md.
     runs-on: [self-hosted, "${{ inputs.runner_label }}"]
+    # STANDARDS §28.6. Observed max 60m on either runner (a 181-turn max-turns death;
+    # 180 turns ~= 50-60m). 120 = 2x.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4 # consumer repo at $GITHUB_WORKSPACE
         with:
