@@ -23,9 +23,17 @@ permissions:
   contents: read
   pull-requests: read # harmless without PR-comment integrations; kept for future use
 
+# Runner (STANDARDS §28.1 / §17.12). Private repos run on the fleet PC's self-hosted runners
+# — GitHub-hosted minutes on a private repo are the cost this avoids. When the runners are
+# offline the jobs queue until one is back (no hosted fallback, by design). Public repos
+# keep ubuntu-latest: they don't bill minutes, and the self-hosted runner group is
+# private-repos-only. The self-hosted runner has no sudo, no pip and a persistent home, so
+# every tool below installs into the per-runner tool cache instead of /usr/local.
+
 jobs:
   deterministic:
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.repository.private && fromJSON('["self-hosted","linux","fleet"]') || 'ubuntu-latest' }}
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4 # consumer repo at $GITHUB_WORKSPACE
         with:
@@ -42,14 +50,36 @@ jobs:
         run: |
           set -ex
           GITLEAKS_VERSION=8.24.3
-          URL="https://github.com/zricethezav/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
-          # zricethezav (the original org) hosts release artifacts; the
-          # gitleaks/gitleaks rename's redirect does NOT cover asset URLs.
-          # `curl -fsSL` fails loudly on 404 instead of silently downloading
-          # an HTML error page that tar then chokes on.
-          curl -fsSL -o gitleaks.tar.gz "$URL"
-          sudo tar -xzf gitleaks.tar.gz -C /usr/local/bin gitleaks
-          gitleaks version
+          # Tool cache, not /usr/local/bin: the self-hosted runner has no sudo. Cached per
+          # runner by version, so only the first run on each runner downloads.
+          DIR="${RUNNER_TOOL_CACHE}/gitleaks/${GITLEAKS_VERSION}"
+          if [ ! -x "$DIR/gitleaks" ]; then
+            URL="https://github.com/zricethezav/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+            # zricethezav (the original org) hosts release artifacts; the
+            # gitleaks/gitleaks rename's redirect does NOT cover asset URLs.
+            # `curl -fsSL` fails loudly on 404 instead of silently downloading
+            # an HTML error page that tar then chokes on.
+            mkdir -p "$DIR"
+            curl -fsSL -o "$RUNNER_TEMP/gitleaks.tar.gz" "$URL"
+            tar -xzf "$RUNNER_TEMP/gitleaks.tar.gz" -C "$DIR" gitleaks
+            rm -f "$RUNNER_TEMP/gitleaks.tar.gz"
+          fi
+          echo "$DIR" >> "$GITHUB_PATH"
+          "$DIR/gitleaks" version
+
+      - name: Install uv (runs Semgrep)
+        run: |
+          set -ex
+          # The self-hosted runner's python3 has no pip/venv, so Semgrep runs through uvx
+          # (uv builds its own environments). Same path on ubuntu-latest.
+          UV_VERSION=0.12.19
+          DIR="${RUNNER_TOOL_CACHE}/uv/${UV_VERSION}"
+          if [ ! -x "$DIR/uv" ]; then
+            mkdir -p "$DIR"
+            curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh"               | env UV_INSTALL_DIR="$DIR" UV_NO_MODIFY_PATH=1 sh
+          fi
+          echo "$DIR" >> "$GITHUB_PATH"
+          "$DIR/uv" --version
 
       - name: Run gitleaks
         run: |
@@ -103,8 +133,9 @@ jobs:
 
       - name: Semgrep
         run: |
-          python3 -m pip install semgrep
-          semgrep --config p/security-audit --exclude docs/mockups --exclude .gitleaksignore --json --output semgrep-results.json || true
+          # Pinned so a Semgrep release can't change findings under us; bump deliberately.
+          # --exclude .fleet-ci: the helper checkout lives inside the workspace and is not the PR's code.
+          uvx --from 'semgrep==1.178.0' semgrep --config p/security-audit --exclude docs/mockups --exclude .gitleaksignore --exclude .fleet-ci --json --output semgrep-results.json || true
 
       # --- DEP-AUDIT VARIANT (pick ONE; delete the others) ---
 
@@ -155,7 +186,8 @@ jobs:
           if-no-files-found: ignore
 
   semantic:
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.repository.private && fromJSON('["self-hosted","linux","fleet"]') || 'ubuntu-latest' }}
+    timeout-minutes: 30
     needs: deterministic
     if: always() # run the semantic step even on deterministic failure — triage whatever the deterministic tools found
     permissions:
@@ -304,7 +336,8 @@ jobs:
   # never fires on a red PR. A legitimately-skipped semantic review (§3.3 gate)
   # still leaves the semantic job green, so green-with-skip correctly pings.
   merge-ready:
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.repository.private && fromJSON('["self-hosted","linux","fleet"]') || 'ubuntu-latest' }}
+    timeout-minutes: 5
     needs: [deterministic, semantic]
     if: success()
     permissions:
@@ -326,14 +359,14 @@ jobs:
             echo "::warning::AUTONOMOUS_TICK_TOKEN not set — skipping merge-ready ping"
             exit 0
           fi
-          code=$(curl -sS -m 15 -o /tmp/merge-ready.out -w '%{http_code}' \
+          code=$(curl -sS -m 15 -o "$RUNNER_TEMP/merge-ready.out" -w '%{http_code}' \
             -X POST "$HUB_URL/api/autonomous/merge-ready" \
             -H "Authorization: Bearer $AUTONOMOUS_TICK_TOKEN" \
             -H "Content-Type: application/json" \
             -d "{\"pr_url\":\"$PR_URL\"}") \
             || { echo "::warning::merge-ready ping could not reach the hub — reconcile will recover"; exit 0; }
           echo "merge-ready → HTTP $code for $PR_URL"
-          cat /tmp/merge-ready.out 2>/dev/null || true
+          cat "$RUNNER_TEMP/merge-ready.out" 2>/dev/null || true
           if [ "$code" -ge 400 ]; then
             echo "::warning::merge-ready returned HTTP $code — hub reconcile will recover"
           fi
