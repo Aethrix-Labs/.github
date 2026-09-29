@@ -50,6 +50,11 @@ class ParsingTests(unittest.TestCase):
         self.assertEqual(pins["claude-sonnet-4-6"], ["a.yml", "b.yml"])
         self.assertIsNone(check.parse_version("claude-opus-4-8"))
 
+    def test_pins_collected_from_model_input_defaults(self):
+        body = '      model:\n        type: string\n        default: "claude-sonnet-4-6"\n      effort:\n        default: "medium"\n'
+        pins = check.collect_pins(workflows(a=body))
+        self.assertEqual(pins, {"claude-sonnet-4-6": ["a.yml"]})
+
 
 class MainTests(unittest.TestCase):
     def setUp(self):

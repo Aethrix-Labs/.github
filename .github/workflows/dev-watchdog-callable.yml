@@ -26,6 +26,38 @@ on:
         type: string
         required: false
         default: "https://sethgibson.com"
+      # The three agent steps are tuned independently (MODEL_SELECTION_PROPOSAL §5); the
+      # effort defaults differ on purpose — do not collapse them to one value.
+      doc_reconciliation_model:
+        description: "Claude model for the doc-reconciliation step: an alias (sonnet|opus|haiku|fable) or an exact id."
+        type: string
+        required: false
+        default: "claude-sonnet-5-5"
+      doc_reconciliation_effort:
+        description: "Reasoning effort for the doc-reconciliation step: low|medium|high|xhigh|max."
+        type: string
+        required: false
+        default: "medium"
+      recommender_model:
+        description: "Claude model for the recommender step: an alias (sonnet|opus|haiku|fable) or an exact id."
+        type: string
+        required: false
+        default: "claude-sonnet-5-5"
+      recommender_effort:
+        description: "Reasoning effort for the recommender step: low|medium|high|xhigh|max."
+        type: string
+        required: false
+        default: "low"
+      proposer_model:
+        description: "Claude model for the proposer step: an alias (sonnet|opus|haiku|fable) or an exact id."
+        type: string
+        required: false
+        default: "claude-sonnet-5-5"
+      proposer_effort:
+        description: "Reasoning effort for the proposer step: low|medium|high|xhigh|max."
+        type: string
+        required: false
+        default: "high"
 
 permissions:
   contents: write       # open the low-tier drift-reconciliation PR
@@ -200,7 +232,8 @@ jobs:
             doc-only drift PR. If several drifts exist, fix them all in that one PR.
             If nothing is faithfully reconcilable, open no PR — don't guess.
           claude_args: |
-            --model claude-sonnet-5-5
+            --model ${{ inputs.doc_reconciliation_model }}
+            --effort ${{ inputs.doc_reconciliation_effort }}
             --max-turns 40
             --allowedTools Read,Bash,Write,Edit,Glob,Grep
 
@@ -249,7 +282,8 @@ jobs:
             scope. Do not open a PR — that's the doc-reconciliation step's job, not
             this one's.
           claude_args: |
-            --model claude-sonnet-5-5
+            --model ${{ inputs.recommender_model }}
+            --effort ${{ inputs.recommender_effort }}
             --max-turns 40
             --allowedTools Read,Bash,Glob,Grep
 
@@ -297,7 +331,8 @@ jobs:
             - Product slug: $PROPOSER_PRODUCT_SLUG (or derive from $GITHUB_REPOSITORY).
             - Hub base URL: $PROPOSER_HUB_URL (queue POST per STANDARDS §8).
           claude_args: |
-            --model claude-sonnet-5-5
+            --model ${{ inputs.proposer_model }}
+            --effort ${{ inputs.proposer_effort }}
             --max-turns 60
             --allowedTools Read,Bash,Glob,Grep
 
