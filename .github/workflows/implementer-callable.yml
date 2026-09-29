@@ -189,6 +189,7 @@ jobs:
           IMPLEMENTER_HUB_URL: ${{ inputs.hub_url }}
           IMPLEMENTER_TARGET_KIND: ${{ inputs.target_kind }}
           IMPLEMENTER_TARGET_REF: ${{ inputs.target_ref }}
+          GH_TOKEN: ${{ github.token }} # merge reconcile below
         run: |
           # If the skill delivered its own tick-report it dropped this breadcrumb —
           # the hub already heard back, so this guard has nothing to do. Absent → fall
@@ -215,11 +216,40 @@ jobs:
           fi
           echo "::notice::implementer-callable: workflow failed at phase=${LAST_PHASE}"
 
+          # Merge reconcile (implementer PACKETS.md, workflow-failed).
+          # The exit contract is NOT atomic with the commit side effects: on a
+          # commit-phase death the PR may have opened, gone green and been merged
+          # by the hub while only the in-band tick-report died. Reporting that as
+          # workflow-failed tells Seth to retry an already-closed step.
+          # Only reachable from `committing` — no PR can exist before it.
+          # Best-effort and racy by design; the hub's merge-webhook reconcile
+          # stays authoritative. This is the early exit so the common case never
+          # shows a spurious retry card.
+          RECONCILED=""
+          PR_URL=""
+          if [ "$LAST_PHASE" = "committing" ]; then
+            WORK_BRANCH="$(git -C "${GITHUB_WORKSPACE:-.}" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+            case "$WORK_BRANCH" in
+              ""|HEAD|main|master)
+                echo "::notice::implementer-callable: no working branch to reconcile (HEAD=${WORK_BRANCH:-none})" ;;
+              *)
+                PR_URL="$(gh pr list --head "$WORK_BRANCH" --state merged --limit 1 --json url --jq '.[0].url // empty' 2>/dev/null || true)"
+                if [ -n "$PR_URL" ]; then
+                  RECONCILED=1
+                  echo "::notice::implementer-callable: reconciled - ${PR_URL} merged; the work landed, only the acknowledgment died"
+                else
+                  echo "::notice::implementer-callable: no merged PR for ${WORK_BRANCH}; genuine mid-commit death"
+                fi ;;
+            esac
+          fi
+
           # Queue entry — exception, variant `workflow-failed`. request_id is rooted in the
           # GitHub run ID (one entry per failed run; reruns get a new run ID,
           # which is correct — a new failure is a new event). Shape per
           # implementer PACKETS.md § workflow-failed.
-          if [ -n "$QUEUE_SERVICE_ROLE_KEY" ]; then
+          if [ -n "$RECONCILED" ]; then
+            echo "::notice::implementer-callable: skipping workflow-failed entry (reconciled); the hub emits completed-unacknowledged off the tick-report"
+          elif [ -n "$QUEUE_SERVICE_ROLE_KEY" ]; then
             REQUEST_ID=$(printf '%s' "${GITHUB_RUN_ID}workflow-failed" | sha256sum | cut -d' ' -f1)
             curl -sf -X POST "${HUB}/api/v1/queue/entries" \
               -H "Content-Type: application/json" \
@@ -245,6 +275,14 @@ jobs:
           # Tick-report — outcome `workflow-failed` (reserved for this handler
           # per implementer SKILL.md Step 7; orchestrator maps it to `errored`).
           if [ -n "$IMPLEMENTER_SESSION_ID" ] && [ -n "$AUTONOMOUS_TICK_TOKEN" ]; then
+            # pr_url is z.string().url().optional() hub-side, so omit it entirely
+            # rather than sending an empty string.
+            TICK_OUTCOME="workflow-failed"
+            PR_FIELD=""
+            if [ -n "$RECONCILED" ]; then
+              TICK_OUTCOME="completed-unacknowledged"
+              PR_FIELD="\"pr_url\": \"$PR_URL\","
+            fi
             TICK_SENT=""
             for attempt in 1 2 3; do
               if curl -sf -X POST \
@@ -254,7 +292,8 @@ jobs:
                   -d "{
                     \"session_id\": \"$IMPLEMENTER_SESSION_ID\",
                     \"run_id\": \"$GITHUB_RUN_ID\",
-                    \"outcome\": \"workflow-failed\",
+                    \"outcome\": \"$TICK_OUTCOME\",
+                    ${PR_FIELD}
                     \"run_url\": \"$RUN_URL\",
                     \"last_phase\": \"$LAST_PHASE\"
                   }"; then
