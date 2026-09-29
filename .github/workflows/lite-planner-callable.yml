@@ -27,6 +27,16 @@ on:
         description: "Approved auto-feature entry id; lite-planner fetches goal + recommendation (scope/acceptance) from the hub."
         type: string
         required: true
+      model:
+        description: "Claude model for the agent: an alias (sonnet|opus|haiku|fable) or an exact id. Chosen per run by the hub; the default is the pre-parameterization pin."
+        type: string
+        required: false
+        default: "claude-sonnet-5-5"
+      effort:
+        description: "Reasoning effort for the agent: low|medium|high|xhigh|max. Chosen per run by the hub."
+        type: string
+        required: false
+        default: "medium"
 
 permissions:
   contents: write       # commit the PLANNING.md edit (low-tier auto-ship)
@@ -100,7 +110,8 @@ jobs:
             - Product slug: $LP_PRODUCT_SLUG (or derive from $GITHUB_REPOSITORY).
             - Hub base URL: $LP_HUB_URL.
           claude_args: |
-            --model claude-sonnet-5-5
+            --model ${{ inputs.model }}
+            --effort ${{ inputs.effort }}
             --max-turns 180
             --allowedTools Read,Bash,Write,Edit,Glob,Grep
             # --max-turns 180 matches implementer-callable. lite-planner shares the

@@ -38,7 +38,9 @@ FAMILY = "sonnet"
 # banner or migration note should not trigger a reminder.
 MIN_MENTIONS = 3
 
-PIN_RE = re.compile(r"--model\s+(claude-[a-z]+-\d+(?:-\d{1,2})?)(?![\w-])")
+# A pin is either a literal `--model <id>` or the `default: "<id>"` of a callable's `model` input
+# (the hub overrides that input per run; the default is the fleet-wide fallback that goes stale).
+PIN_RE = re.compile(r'(?:--model\s+|\bdefault:\s*"?)(claude-[a-z]+-\d+(?:-\d{1,2})?)(?![\w-])')
 # Minor is 1-2 digits NOT followed by another digit, so date-suffixed ids
 # (claude-sonnet-4-20250514) parse as major-only instead of 4.20.
 PAGE_RE = re.compile(rf"claude-{FAMILY}-(\d+)(?:-(\d{{1,2}})(?!\d))?")
@@ -106,7 +108,7 @@ def build_packet(latest: tuple[int, int], pins: dict[str, list[str]], behind: di
         "attempts": lines,
         "ask": "Decide whether to bump. To do it, paste the recommendation into a session in the fleet repo (~/products).",
         "recommendation": (
-            f"Bump the Sonnet pins to {latest_id}: edit the `--model` lines in {repo} workflows listed above, "
+            f"Bump the Sonnet pins to {latest_id}: edit the `--model` lines and the `model` input defaults in {repo} workflows listed above, "
             "then update the STANDARDS §14 per-agent matrix and add a DECISIONS.md entry. "
             "Smoke-test one implementer run afterwards to confirm claude-code-action accepts the id. "
             "Dismiss to stay on the current pin; this entry will not repeat until a newer release or a pin change."

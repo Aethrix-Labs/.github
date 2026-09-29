@@ -184,8 +184,12 @@ jobs:
             - Product slug: $MT_PRODUCT_SLUG (or derive from $GITHUB_REPOSITORY).
             - Hub base URL: $MT_HUB_URL.
             - Mobile/simulator capable: $MT_MOBILE_CAPABLE (1 = this runner has one).
+          # Alias, not an exact id: no hub is in this workflow's trigger path (a milestone close landing on main),
+          # so nothing would ever bump a pinned id. "sonnet" tracks the current Sonnet on its
+          # own (MODEL_SELECTION_PROPOSAL 2.2) and keeps this off the manual bump procedure.
           claude_args: |
-            --model claude-sonnet-5-5
+            --model sonnet
+            --effort medium
             --max-turns 180
             --allowedTools Read,Bash,Write,Edit,Glob,Grep
             # --max-turns 180 matches implementer-callable and lite-planner-callable. The

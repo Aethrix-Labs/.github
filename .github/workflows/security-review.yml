@@ -244,8 +244,12 @@ jobs:
               parses this file to gate the workflow.
 
             Do not ask questions. Produce the JSON.
+          # Alias, not an exact id: no hub is in this workflow's trigger path (a PR event),
+          # so nothing would ever bump a pinned id. "sonnet" tracks the current Sonnet on its
+          # own (MODEL_SELECTION_PROPOSAL 2.2) and keeps this off the manual bump procedure.
           claude_args: |
-            --model claude-sonnet-5-5
+            --model sonnet
+            --effort medium
             --max-turns 25
             --allowedTools Read,Bash,Write
 

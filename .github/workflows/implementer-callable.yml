@@ -33,6 +33,25 @@ on:
         type: string
         required: false
         default: "fleet"
+      model:
+        description: "Claude model for the agent: an alias (sonnet|opus|haiku|fable) or an exact id. Chosen per run by the hub; the default is the pre-parameterization pin."
+        type: string
+        required: false
+        default: "claude-sonnet-5-5"
+      effort:
+        description: "Reasoning effort for the agent: low|medium|high|xhigh|max. Chosen per run by the hub."
+        type: string
+        required: false
+        default: "medium"
+      # TODO(STAFF_ENGINEER_PROPOSAL §7, queue-redesign Phase 6): staff_direction is declared
+      # ahead of the staff-engineer agent so product repos forward it in the same pass as
+      # model/effort. It is forwarded to the agent step as IMPLEMENTER_STAFF_DIRECTION but NOT yet
+      # referenced in the prompt or read by implementer/SKILL.md — wire both when Phase 6 lands.
+      staff_direction:
+        description: "Diagnosis and direction from a staff-engineer `return`; authoritative context for a retry. Empty = ordinary run."
+        type: string
+        required: false
+        default: ""
 
 permissions:
   contents: write # commit + push from the implementer agent
@@ -135,6 +154,9 @@ jobs:
           # Directed target — required by the skill's Guard 2.
           IMPLEMENTER_TARGET_KIND: ${{ inputs.target_kind }}
           IMPLEMENTER_TARGET_REF: ${{ inputs.target_ref }}
+          # Staff-engineer `return` direction (STAFF_ENGINEER_PROPOSAL §7). Empty on ordinary
+          # runs. Not yet read by the skill or prompt — see the TODO on the input.
+          IMPLEMENTER_STAFF_DIRECTION: ${{ inputs.staff_direction }}
           # Runner-capability flag for the mobile self-check (STANDARDS §23.9
           # Track A). The implementer keys off this flag, not off the milestone's
           # Surface marker directly, so a mobile step that lands on `fleet` (no
@@ -163,7 +185,8 @@ jobs:
             Exit after ONE step. The verify gate is the loop boundary.
             Do not chain into the next step.
           claude_args: |
-            --model claude-sonnet-5-5
+            --model ${{ inputs.model }}
+            --effort ${{ inputs.effort }}
             --max-turns 180
             --allowedTools Read,Bash,Write,Edit,Glob,Grep
 
