@@ -1,0 +1,158 @@
+name: staff-engineer (callable)
+
+# Escalation triage for ONE queue entry (STANDARDS §29). The hub dispatches this once per
+# entry, BESIDE the entry's own `open` write rather than in front of it. Flow: read the
+# entry -> Guard 3 hard-limit check -> classify against the admissibility test -> write one
+# `triage-started` + one `triage-completed` activity record. SHADOW MODE (Phase 6a): it
+# mutates no queue row, re-dispatches nothing, emits no queue entry, and edits no file.
+#
+# Requires the staff-engineer bundle vended to fleet-skills `ci/staff-engineer/`, reached
+# here at .fleet-ci/ci/staff-engineer/. Model: lite-planner-callable.yml, but DELIBERATELY
+# differs from every other callable in three ways:
+#   1. NO failure handler and NO ensure-report guard. The staff engineer exists to reduce
+#      what reaches the decision queue, so a run that files its own card has failed
+#      definitionally — and shadow mode holds up no entry, so there is nothing to recover.
+#      A crash leaves a triage-started with no triage-completed (the intended signature,
+#      counted on the /staff-engineer page); a red run in the Actions tab is the alarm.
+#   2. Read-only token. contents: read + id-token: write. This agent writes no commit, opens
+#      no PR and edits no file, so it is never handed a write token.
+#   3. No consumer repo by default. It is dispatched against a queue entry, not a product PR,
+#      so $GITHUB_WORKSPACE holds only the vended skills; the entry's repo (if any) is
+#      checked out into ./product/.
+
+on:
+  workflow_call:
+    inputs:
+      entry_id:
+        description: "Queue entry UUID to triage. One entry per run."
+        type: string
+        required: true
+      hub_url:
+        description: "Hub base URL, passed to the agent as SE_HUB_URL. Empty falls through the skill's resolution (SE_HUB_URL, then HUB_BASE_URL, then https://sethgibson.com)."
+        type: string
+        required: false
+        default: ""
+      product_repo:
+        description: "owner/name of the repo the entry concerns. Empty for a fleet-level entry."
+        type: string
+        required: false
+        default: ""
+      model:
+        description: "Claude model for the agent: an alias (sonnet|opus|haiku|fable) or an exact id. The hub normally passes this from the agent_models row; the default is only the fallback for a dispatch that omits it."
+        type: string
+        required: false
+        default: "opus"
+      effort:
+        description: "Reasoning effort for the agent: low|medium|high|xhigh|max. The hub normally passes this from the agent_models row."
+        type: string
+        required: false
+        default: "high"
+  workflow_dispatch:
+    inputs:
+      entry_id:
+        description: "Queue entry UUID to triage. One entry per run."
+        type: string
+        required: true
+      hub_url:
+        description: "Hub base URL, passed to the agent as SE_HUB_URL. Empty falls through the skill's resolution (SE_HUB_URL, then HUB_BASE_URL, then https://sethgibson.com)."
+        type: string
+        required: false
+        default: ""
+      product_repo:
+        description: "owner/name of the repo the entry concerns. Empty for a fleet-level entry."
+        type: string
+        required: false
+        default: ""
+      model:
+        description: "Claude model for the agent: an alias (sonnet|opus|haiku|fable) or an exact id."
+        type: string
+        required: false
+        default: "opus"
+      effort:
+        description: "Reasoning effort for the agent: low|medium|high|xhigh|max."
+        type: string
+        required: false
+        default: "high"
+
+permissions:
+  contents: read    # checkout only — this agent commits nothing
+  id-token: write   # required by anthropics/claude-code-action@v1
+
+concurrency:
+  # Per ENTRY, not per repo: escalations from different products triage in parallel, but the
+  # same entry must never triage twice concurrently.
+  group: staff-engineer-${{ inputs.entry_id }}
+  cancel-in-progress: false
+
+jobs:
+  staff-engineer:
+    # Fleet PC (WSL2) self-hosted runner. See ~/products/docs/SELF_HOSTED_RUNNER.md.
+    # Read-only analysis, no device needed — never fleet-mac.
+    runs-on: [self-hosted, linux, fleet]
+    timeout-minutes: 20 # STANDARDS §28.6
+    steps:
+      - uses: actions/checkout@v4        # fleet-skills (CI skills under ci/)
+        with:
+          repository: Aethrix-Labs/fleet-skills
+          path: .fleet-ci
+          ref: main
+          token: ${{ secrets.FLEET_SKILLS_PAT }} # fleet-skills is private; default GITHUB_TOKEN can't cross repos
+
+      - name: Clear any stale product checkout
+        # Self-hosted workspaces persist between runs. A ./product/ left by an earlier entry
+        # would be read as THIS entry's repo, most dangerously on a fleet-level entry.
+        run: rm -rf product
+
+      - uses: actions/checkout@v4        # the entry's repo, only when it has one
+        if: inputs.product_repo != ''
+        # The skill treats a failed checkout like an absent repo (warn, lower confidence,
+        # carry on) — it must not turn into a red run that hides a triage that could finish.
+        continue-on-error: true
+        with:
+          repository: ${{ inputs.product_repo }}
+          path: product
+          fetch-depth: 0                 # limit-3 check reads the PR diff
+          token: ${{ secrets.FLEET_SKILLS_PAT }}
+
+      - name: Run staff-engineer agent
+        uses: anthropics/claude-code-action@v1
+        env:
+          # An INPUT here, not just a write path: without it the agent cannot read the entry.
+          QUEUE_SERVICE_ROLE_KEY: ${{ secrets.QUEUE_SERVICE_ROLE_KEY }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          SE_ENTRY_ID: ${{ inputs.entry_id }}
+          # SE_HUB_URL only — do NOT also set HUB_BASE_URL. The skill resolves
+          # SE_HUB_URL -> HUB_BASE_URL -> production (STANDARDS §8); a callable that sets only
+          # HUB_BASE_URL sends every write to production whichever hub the run was aimed at.
+          SE_HUB_URL: ${{ inputs.hub_url }}
+          SE_PRODUCT_REPO: ${{ inputs.product_repo }}
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            You are running as the **staff-engineer agent** in CI, in SHADOW MODE.
+
+            Read `.fleet-ci/ci/staff-engineer/SKILL.md` and follow it exactly.
+
+            Triage the single queue entry $SE_ENTRY_ID. Write its `triage-started` and
+            `triage-completed` activity records as the skill specifies, then exit.
+            You mutate nothing: no queue-row change, no re-dispatch, no queue entry, no
+            file edit, no PR. Failures are `::warning::` log lines, never queue entries.
+
+            Runtime context:
+            - Hub base URL: resolve per the skill ($SE_HUB_URL, then $HUB_BASE_URL, then
+              https://sethgibson.com).
+            - Product repo: $SE_PRODUCT_REPO. When non-empty it is checked out at
+              `./product/`; when empty this is a fleet-level entry — skip every
+              repo-derived input. If it is non-empty but `./product/` is missing, the
+              checkout failed: treat it as absent, warn, and lower confidence.
+          claude_args: |
+            --model ${{ inputs.model }}
+            --effort ${{ inputs.effort }}
+            --max-turns 60
+            --allowedTools Read,Bash,Glob,Grep
+            # Read-only tool set: no Write/Edit (this agent edits no file). Bash is needed
+            # for the skill's curl reads/writes against the hub.
+            # --max-turns 60 is a first estimate, not an observed number: one entry, a
+            # bounded evidence ladder, two record writes. Recalibrate from the first real
+            # runs; a run cut off here leaves triage-started with no triage-completed,
+            # which the /staff-engineer page counts.
