@@ -1,0 +1,47 @@
+name: model-watch
+
+# Weekly reminder: is any fleet workflow pinned to an older Sonnet than Anthropic
+# now lists? STANDARDS §14 (Model currency). Deterministic — no Claude call, no
+# Anthropic spend. Posts ONE deduped `follow-up` queue entry when a pin is behind
+# (request_id = hash of latest + pinned set, so an unchanged state never re-nags).
+# Fails loudly (red run) if the models page can't be parsed; it never reports an
+# all-clear it couldn't verify.
+
+on:
+  schedule:
+    - cron: "0 14 * * 1" # Mondays 14:00 UTC
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Print the queue entry instead of posting it."
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: model-watch
+  cancel-in-progress: false
+
+jobs:
+  model-watch:
+    # STANDARDS §28.1: self-hosted fleet runner, never ubuntu-latest in a private repo.
+    runs-on: [self-hosted, linux, fleet]
+    # STANDARDS §28.6. One HTTP GET, a file scan and at most one POST.
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unit tests
+        run: python3 -m unittest discover -s .github/scripts/model-watch -v
+
+      - name: Check Sonnet pins against the latest release
+        env:
+          QUEUE_SERVICE_ROLE_KEY: ${{ secrets.QUEUE_SERVICE_ROLE_KEY }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          EXTRA=""
+          if [ "$DRY_RUN" = "true" ]; then EXTRA="--dry-run"; fi
+          python3 .github/scripts/model-watch/check.py --repo "$GITHUB_REPOSITORY" $EXTRA

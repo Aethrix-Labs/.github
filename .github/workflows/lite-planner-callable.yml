@@ -100,7 +100,7 @@ jobs:
             - Product slug: $LP_PRODUCT_SLUG (or derive from $GITHUB_REPOSITORY).
             - Hub base URL: $LP_HUB_URL.
           claude_args: |
-            --model claude-sonnet-4-6
+            --model claude-sonnet-5-5
             --max-turns 180
             --allowedTools Read,Bash,Write,Edit,Glob,Grep
             # --max-turns 180 matches implementer-callable. lite-planner shares the
