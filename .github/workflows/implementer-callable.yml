@@ -215,7 +215,7 @@ jobs:
           fi
           echo "::notice::implementer-callable: workflow failed at phase=${LAST_PHASE}"
 
-          # Queue entry — exception, high tier. request_id is rooted in the
+          # Queue entry — exception, variant `workflow-failed`. request_id is rooted in the
           # GitHub run ID (one entry per failed run; reruns get a new run ID,
           # which is correct — a new failure is a new event). Shape per
           # implementer PACKETS.md § workflow-failed.
@@ -228,7 +228,7 @@ jobs:
               -d "{
                 \"request_id\": \"$REQUEST_ID\",
                 \"entry_type\": \"exception\",
-                \"risk_tier\": \"high\",
+                \"variant\": \"workflow-failed\",
                 \"agent_name\": \"implementer\",
                 \"product_slug\": \"$SLUG\",
                 \"title\": \"[$SLUG] implementer workflow failed on ${IMPLEMENTER_TARGET_REF:-unknown target}\",
