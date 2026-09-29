@@ -152,7 +152,7 @@ jobs:
           echo "dev-watchdog decide: gate=$DECISION open_queue_entries=${QCOUNT:-0}"
 
       # ---- Debrief (no LLM), STANDARDS §24.1a. Deterministic — built from the
-      # gate's digest + the open-entries list, never an Opus call. ----
+      # gate's digest + the open-entries list, never an LLM call. ----
       - name: Debrief
         if: steps.decide.outputs.path == 'debrief'
         env:
@@ -169,7 +169,7 @@ jobs:
             --hub-url "${HUB_URL:-https://sethgibson.com}" \
             --service-role-key "$QUEUE_SERVICE_ROLE_KEY"
 
-      # ---- Doc reconciliation (Opus, every day, unconditional), STANDARDS §24.2.
+      # ---- Doc reconciliation (Sonnet, every day, unconditional), STANDARDS §24.2.
       # Runs regardless of signals-pending vs. idle — only pre-build (nothing
       # shipped yet, no reconciliation target) and the master switch gate it. ----
       - name: Doc reconciliation
@@ -200,11 +200,11 @@ jobs:
             doc-only drift PR. If several drifts exist, fix them all in that one PR.
             If nothing is faithfully reconcilable, open no PR — don't guess.
           claude_args: |
-            --model claude-opus-4-8
+            --model claude-sonnet-5-5
             --max-turns 40
             --allowedTools Read,Bash,Write,Edit,Glob,Grep
 
-      # ---- Phase 1: Opus recommender — deferred-work scan only (idle path,
+      # ---- Phase 1: Sonnet recommender — deferred-work scan only (idle path,
       # nothing already pending). STANDARDS §24.2b. ----
       - name: Run recommender
         id: recommender
@@ -249,7 +249,7 @@ jobs:
             scope. Do not open a PR — that's the doc-reconciliation step's job, not
             this one's.
           claude_args: |
-            --model claude-opus-4-8
+            --model claude-sonnet-5-5
             --max-turns 40
             --allowedTools Read,Bash,Glob,Grep
 
@@ -297,7 +297,7 @@ jobs:
             - Product slug: $PROPOSER_PRODUCT_SLUG (or derive from $GITHUB_REPOSITORY).
             - Hub base URL: $PROPOSER_HUB_URL (queue POST per STANDARDS §8).
           claude_args: |
-            --model claude-opus-4-8
+            --model claude-sonnet-5-5
             --max-turns 60
             --allowedTools Read,Bash,Glob,Grep
 

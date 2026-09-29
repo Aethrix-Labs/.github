@@ -163,7 +163,7 @@ jobs:
             Exit after ONE step. The verify gate is the loop boundary.
             Do not chain into the next step.
           claude_args: |
-            --model claude-sonnet-4-6
+            --model claude-sonnet-5-5
             --max-turns 180
             --allowedTools Read,Bash,Write,Edit,Glob,Grep
 
