@@ -161,12 +161,13 @@ jobs:
               -d "{
                 \"request_id\": \"$REQUEST_ID\",
                 \"entry_type\": \"exception\",
-                \"risk_tier\": \"high\",
+                \"variant\": \"lite-planner-failed\",
                 \"agent_name\": \"lite-planner\",
                 \"product_slug\": \"$SLUG\",
                 \"title\": \"[$SLUG] lite-planner failed on auto-feature ${LP_QUEUE_ENTRY_ID}\",
                 \"goal\": \"Plan the approved auto-feature into one no-design milestone\",
                 \"attempts\": [\"claude-code-action step failed (max-turns, crash, or infra error) before the skill's own exit path. Last phase reached: ${LAST_PHASE}. Run: $RUN_URL\"],
+                \"artifacts\": [{\"label\": \"Workflow run\", \"href\": \"$RUN_URL\", \"artifact_type\": \"doc\"}],
                 \"ask\": \"Inspect the run log; re-plan manually or re-dispatch\",
                 \"recommendation\": \"Died at phase '${LAST_PHASE}'. mapping → exploration likely over-ran the budget (the candidate's scope/acceptance is the plan — don't re-derive the whole repo); planning/adversary → the candidate may not be 'small' (Step 0 should have bounced it to feature-spec / design) or the plan-reviewer loop is thrashing; committing → check the ci-commit / canonical-doc-update tail. If the candidate was genuinely too big for auto-feature, route it to feature-spec / design instead.\"
               }" \
