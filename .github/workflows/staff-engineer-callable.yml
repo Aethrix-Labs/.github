@@ -105,6 +105,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # Skips the action's OIDC -> GitHub App installation-token exchange, which would
+          # otherwise hand the agent's shell a token with write on actions, checks, code,
+          # issues, pull requests and workflows. The job token is read-only (contents: read +
+          # actions: read above). The action's input is `github_token` (rendered as
+          # OVERRIDE_GITHUB_TOKEN in its config dump). STANDARDS §29.3 item 2.
+          github_token: ${{ github.token }}
+          show_full_output: true # TEMP-PROOF: remove before merge
           prompt: |
             You are running as the **staff-engineer agent** in CI, in SHADOW MODE.
 
@@ -137,9 +144,14 @@ jobs:
             --model ${{ inputs.model }}
             --effort ${{ inputs.effort }}
             --max-turns 60
-            --allowedTools Read,Bash,Glob,Grep
-            # Read-only tool set: no Write/Edit (this agent edits no file). Bash is needed
-            # for the skill's curl reads/writes against the hub.
+            --allowedTools "Read,Glob,Grep,Bash(curl:*),Bash(gh run view:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(mktemp:*),Bash(echo:*)"
+            # Read-only tool set: no Write/Edit (this agent edits no file). Bash is scoped to
+            # what the skill does: curl (hub reads/writes), gh run view (Step 4 rung 2), repo/
+            # diff reads, mktemp/echo. DEFENSE-IN-DEPTH, NOT CONTAINMENT: Bash matching is
+            # prefix-based and pipes/subshells route around it; this stops accidental writes.
+            # A command missing here does not error loudly — a rung fails quietly and confidence
+            # drops — so prove any change to this list (permission_denials_count: 0 and an
+            # unchanged evidence_used) from a product stub before merging.
             # --max-turns 60 is a first estimate, not an observed number: one entry, a
             # bounded evidence ladder, two record writes. Recalibrate from the first real
             # runs; a run cut off here leaves triage-started with no triage-completed,
