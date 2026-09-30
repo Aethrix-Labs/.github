@@ -6,9 +6,17 @@ name: staff-engineer (callable)
 # `triage-started` + one `triage-completed` activity record. SHADOW MODE (Phase 6a): it
 # mutates no queue row, re-dispatches nothing, emits no queue entry, and edits no file.
 #
+# REACHED THROUGH A PER-PRODUCT THIN STUB, never dispatched on this repo (STANDARDS §29.3,
+# §28.6). This repo is public and the org runner group sets allows_public_repositories:
+# false, so a job whose repository context is this repo is never claimed by a fleet runner:
+# it sits `queued` until GitHub expires it (~24h), every runner online and idle, no red run,
+# no log. That is why this file has `workflow_call` and NO `workflow_dispatch` — a Run
+# button here would only produce a silently-queued job. Manual runs go through a product
+# repo's stub, where they work. Do not prove changes to this file by dispatching it here.
+#
 # Requires the staff-engineer bundle vended to fleet-skills `ci/staff-engineer/`, reached
 # here at .fleet-ci/ci/staff-engineer/. Model: lite-planner-callable.yml, but DELIBERATELY
-# differs from every other callable in three ways:
+# differs from every other callable in two ways — both worth preserving through any edit:
 #   1. NO failure handler and NO ensure-report guard. The staff engineer exists to reduce
 #      what reaches the decision queue, so a run that files its own card has failed
 #      definitionally — and shadow mode holds up no entry, so there is nothing to recover.
@@ -16,9 +24,8 @@ name: staff-engineer (callable)
 #      counted on the /staff-engineer page); a red run in the Actions tab is the alarm.
 #   2. Read-only token. contents: read + id-token: write. This agent writes no commit, opens
 #      no PR and edits no file, so it is never handed a write token.
-#   3. No consumer repo by default. It is dispatched against a queue entry, not a product PR,
-#      so $GITHUB_WORKSPACE holds only the vended skills; the entry's repo (if any) is
-#      checked out into ./product/.
+# The consumer repo is the entry's product, checked out at $GITHUB_WORKSPACE like every
+# other callable. A fleet-level entry dispatches the hub's stub with entry_product_slug empty.
 
 on:
   workflow_call:
@@ -32,8 +39,8 @@ on:
         type: string
         required: false
         default: ""
-      product_repo:
-        description: "owner/name of the repo the entry concerns. Empty for a fleet-level entry."
+      entry_product_slug:
+        description: "product_slug of the entry being triaged, passed to the agent as SE_ENTRY_PRODUCT_SLUG. Empty means a fleet-level entry (the hub's stub is the host repo then, and its code is incidental)."
         type: string
         required: false
         default: ""
@@ -44,32 +51,6 @@ on:
         default: "opus"
       effort:
         description: "Reasoning effort for the agent: low|medium|high|xhigh|max. The hub normally passes this from the agent_models row."
-        type: string
-        required: false
-        default: "high"
-  workflow_dispatch:
-    inputs:
-      entry_id:
-        description: "Queue entry UUID to triage. One entry per run."
-        type: string
-        required: true
-      hub_url:
-        description: "Hub base URL, passed to the agent as SE_HUB_URL. Empty falls through the skill's resolution (SE_HUB_URL, then HUB_BASE_URL, then https://sethgibson.com)."
-        type: string
-        required: false
-        default: ""
-      product_repo:
-        description: "owner/name of the repo the entry concerns. Empty for a fleet-level entry."
-        type: string
-        required: false
-        default: ""
-      model:
-        description: "Claude model for the agent: an alias (sonnet|opus|haiku|fable) or an exact id."
-        type: string
-        required: false
-        default: "opus"
-      effort:
-        description: "Reasoning effort for the agent: low|medium|high|xhigh|max."
         type: string
         required: false
         default: "high"
@@ -91,28 +72,16 @@ jobs:
     runs-on: [self-hosted, linux, fleet]
     timeout-minutes: 20 # STANDARDS §28.6
     steps:
+      - uses: actions/checkout@v4        # consumer repo (the entry's product) at $GITHUB_WORKSPACE
+        with:
+          fetch-depth: 0                 # limit-3 check reads the PR diff
+
       - uses: actions/checkout@v4        # fleet-skills (CI skills under ci/)
         with:
           repository: Aethrix-Labs/fleet-skills
           path: .fleet-ci
           ref: main
           token: ${{ secrets.FLEET_SKILLS_PAT }} # fleet-skills is private; default GITHUB_TOKEN can't cross repos
-
-      - name: Clear any stale product checkout
-        # Self-hosted workspaces persist between runs. A ./product/ left by an earlier entry
-        # would be read as THIS entry's repo, most dangerously on a fleet-level entry.
-        run: rm -rf product
-
-      - uses: actions/checkout@v4        # the entry's repo, only when it has one
-        if: inputs.product_repo != ''
-        # The skill treats a failed checkout like an absent repo (warn, lower confidence,
-        # carry on) — it must not turn into a red run that hides a triage that could finish.
-        continue-on-error: true
-        with:
-          repository: ${{ inputs.product_repo }}
-          path: product
-          fetch-depth: 0                 # limit-3 check reads the PR diff
-          token: ${{ secrets.FLEET_SKILLS_PAT }}
 
       - name: Run staff-engineer agent
         uses: anthropics/claude-code-action@v1
@@ -125,7 +94,7 @@ jobs:
           # SE_HUB_URL -> HUB_BASE_URL -> production (STANDARDS §8); a callable that sets only
           # HUB_BASE_URL sends every write to production whichever hub the run was aimed at.
           SE_HUB_URL: ${{ inputs.hub_url }}
-          SE_PRODUCT_REPO: ${{ inputs.product_repo }}
+          SE_ENTRY_PRODUCT_SLUG: ${{ inputs.entry_product_slug }}
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           prompt: |
@@ -141,10 +110,21 @@ jobs:
             Runtime context:
             - Hub base URL: resolve per the skill ($SE_HUB_URL, then $HUB_BASE_URL, then
               https://sethgibson.com).
-            - Product repo: $SE_PRODUCT_REPO. When non-empty it is checked out at
-              `./product/`; when empty this is a fleet-level entry — skip every
-              repo-derived input. If it is non-empty but `./product/` is missing, the
-              checkout failed: treat it as absent, warn, and lower confidence.
+            - The product repo is the workspace root (`$GITHUB_WORKSPACE`, the current
+              directory), NOT `./product/`. Where the skill says `product_repo`,
+              `$SE_PRODUCT_REPO` or `./product/`, read it as this: there is no such variable
+              and no such directory. `.fleet-ci/` is the vended skill bundle, never evidence
+              about the entry.
+            - Entry product slug: $SE_ENTRY_PRODUCT_SLUG. This repo is $GITHUB_REPOSITORY.
+              - Empty: a fleet-level entry. The repo you are in is the hub's stub and is
+                incidental — skip every repo-derived input and classify from the packet and
+                the trail.
+              - Non-empty and it matches this repo's name: read the repo as the skill
+                describes, scoped to the step or section the entry names.
+              - Non-empty and it does NOT match this repo's name: the dispatch was
+                mis-routed. Say so in `reasoning` and in a `::warning::` naming both, lower
+                confidence, and read NO code from this repo. A confident `resolve` grounded
+                in the wrong product's source is the worst output this agent can produce.
           claude_args: |
             --model ${{ inputs.model }}
             --effort ${{ inputs.effort }}
