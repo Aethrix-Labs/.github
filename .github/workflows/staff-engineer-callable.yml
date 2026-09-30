@@ -102,9 +102,17 @@ jobs:
           # GITHUB_TOKEN, and that token lacks actions: read. gh prefers GH_TOKEN, so this
           # hands the agent's gh calls the job token (read-only, repo-scoped, actions: read
           # from the permissions: block). See fleet-command-center/docs/STANDARDS.md §29.3 item 2.
+          # NOW REDUNDANT with `github_token` below (the action no longer mints an App token);
+          # kept for one change so a regression has one cause. Remove in a follow-up.
           GH_TOKEN: ${{ github.token }}
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # Skips the action's OIDC -> GitHub App installation-token exchange, which would
+          # otherwise hand the agent's shell a token with write on actions, checks, code,
+          # issues, pull requests and workflows. The job token is read-only (contents: read +
+          # actions: read above). The action's input is `github_token` (rendered as
+          # OVERRIDE_GITHUB_TOKEN in its config dump). STANDARDS §29.3 item 2.
+          github_token: ${{ github.token }}
           prompt: |
             You are running as the **staff-engineer agent** in CI, in SHADOW MODE.
 
@@ -140,6 +148,11 @@ jobs:
             --allowedTools Read,Bash,Glob,Grep
             # Read-only tool set: no Write/Edit (this agent edits no file). Bash is needed
             # for the skill's curl reads/writes against the hub.
+            # Bash is deliberately BARE. A command-scoped Bash(...) list was tried 2026-09-30
+            # and failed its proof from a product stub: 9 permission denials, because the
+            # skill's own idioms (`curl "${SE_HUB_URL:-...}/api/v1/..."`, `echo "$VAR"`,
+            # printenv, ls, `$(mktemp)`) are denied even with Bash(curl:*) / Bash(echo:*)
+            # allowed. A denial is silent — a rung fails and confidence drops. STANDARDS §29.3.
             # --max-turns 60 is a first estimate, not an observed number: one entry, a
             # bounded evidence ladder, two record writes. Recalibrate from the first real
             # runs; a run cut off here leaves triage-started with no triage-completed,
