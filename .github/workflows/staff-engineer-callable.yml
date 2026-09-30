@@ -144,14 +144,14 @@ jobs:
             --model ${{ inputs.model }}
             --effort ${{ inputs.effort }}
             --max-turns 60
-            --allowedTools "Read,Glob,Grep,Bash(curl:*),Bash(gh run view:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(mktemp:*),Bash(echo:*)"
-            # Read-only tool set: no Write/Edit (this agent edits no file). Bash is scoped to
-            # what the skill does: curl (hub reads/writes), gh run view (Step 4 rung 2), repo/
-            # diff reads, mktemp/echo. DEFENSE-IN-DEPTH, NOT CONTAINMENT: Bash matching is
-            # prefix-based and pipes/subshells route around it; this stops accidental writes.
-            # A command missing here does not error loudly — a rung fails quietly and confidence
-            # drops — so prove any change to this list (permission_denials_count: 0 and an
-            # unchanged evidence_used) from a product stub before merging.
+            --allowedTools Read,Bash,Glob,Grep
+            # Read-only tool set: no Write/Edit (this agent edits no file). Bash is needed
+            # for the skill's curl reads/writes against the hub.
+            # Bash is deliberately BARE. A command-scoped Bash(...) list was tried 2026-09-30
+            # and failed its proof from a product stub: 9 permission denials, because the
+            # skill's own idioms (`curl "${SE_HUB_URL:-...}/api/v1/..."`, `echo "$VAR"`,
+            # printenv, ls, `$(mktemp)`) are denied even with Bash(curl:*) / Bash(echo:*)
+            # allowed. A denial is silent — a rung fails and confidence drops. STANDARDS §29.3.
             # --max-turns 60 is a first estimate, not an observed number: one entry, a
             # bounded evidence ladder, two record writes. Recalibrate from the first real
             # runs; a run cut off here leaves triage-started with no triage-completed,
