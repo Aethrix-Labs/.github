@@ -251,12 +251,13 @@ jobs:
               -d "{
                 \"request_id\": \"$REQUEST_ID\",
                 \"entry_type\": \"exception\",
-                \"risk_tier\": \"high\",
+                \"variant\": \"workflow-failed\",
                 \"agent_name\": \"milestone-test\",
                 \"product_slug\": \"$SLUG\",
                 \"title\": \"[$SLUG] milestone-test failed on ${MT_MILESTONE}\",
                 \"goal\": \"Run the per-milestone testing session for ${MT_MILESTONE} (STANDARDS 23.7 Mode A)\",
                 \"attempts\": [\"claude-code-action step failed (max-turns, crash, or infra error) before the skill's own exit path. Last phase reached: ${LAST_PHASE}. Run: $RUN_URL\"],
+                \"artifacts\": [{\"label\": \"Workflow run\", \"href\": \"$RUN_URL\", \"artifact_type\": \"doc\"}],
                 \"ask\": \"Inspect the run log, then run milestone-test interactively for ${MT_MILESTONE} or re-dispatch the workflow\",
                 \"recommendation\": \"Died at phase '${LAST_PHASE}'. scope/classify -> the milestone diff is probably large; consider running the session interactively. e2e -> a spec likely thrashed past the 3-attempt cap, or the harness is not CI-ready (run e2e-setup). visual -> Playwright may lack its OS deps on the runner (SELF_HOSTED_RUNNER.md 'Playwright readiness'). routing/committing -> check the shakedown / ci-commit tail; the specs may already be written and just need committing.\"
               }" \

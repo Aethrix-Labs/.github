@@ -287,6 +287,7 @@ jobs:
                 \"title\": \"[$SLUG] implementer workflow failed on ${IMPLEMENTER_TARGET_REF:-unknown target}\",
                 \"goal\": \"Advance ${IMPLEMENTER_TARGET_KIND:-?}/${IMPLEMENTER_TARGET_REF:-?} by one step\",
                 \"attempts\": [\"claude-code-action step failed (max-turns, crash, or infra error) before the skill's own exit path; no in-band queue entry or tick-report was sent. Last phase reached: ${LAST_PHASE}. Run: $RUN_URL\"],
+                \"artifacts\": [{\"label\": \"Workflow run\", \"href\": \"$RUN_URL\", \"artifact_type\": \"doc\"}],
                 \"ask\": \"Inspect the workflow run log; decide retry, fix the step/criteria, or restructure the target\",
                 \"recommendation\": \"Died at phase '${LAST_PHASE}'. building/testing/adversary → the step is likely over-sized for the effective build budget (split it) or a green command is stuck (see the Step 4 debug cap); committing → check the commit skill's mid-flight activity records; step-identified → the agent may have walked into work outside its lane (e.g. an unmarked human-only step).\"
               }" \
