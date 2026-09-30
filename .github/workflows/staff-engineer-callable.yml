@@ -102,6 +102,8 @@ jobs:
           # GITHUB_TOKEN, and that token lacks actions: read. gh prefers GH_TOKEN, so this
           # hands the agent's gh calls the job token (read-only, repo-scoped, actions: read
           # from the permissions: block). See fleet-command-center/docs/STANDARDS.md §29.3 item 2.
+          # NOW REDUNDANT with `github_token` below (the action no longer mints an App token);
+          # kept for one change so a regression has one cause. Remove in a follow-up.
           GH_TOKEN: ${{ github.token }}
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
@@ -111,7 +113,6 @@ jobs:
           # actions: read above). The action's input is `github_token` (rendered as
           # OVERRIDE_GITHUB_TOKEN in its config dump). STANDARDS §29.3 item 2.
           github_token: ${{ github.token }}
-          show_full_output: true # TEMP-PROOF: remove before merge
           prompt: |
             You are running as the **staff-engineer agent** in CI, in SHADOW MODE.
 
