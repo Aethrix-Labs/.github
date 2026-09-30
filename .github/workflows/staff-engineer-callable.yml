@@ -98,6 +98,11 @@ jobs:
           # HUB_BASE_URL sends every write to production whichever hub the run was aimed at.
           SE_HUB_URL: ${{ inputs.hub_url }}
           SE_ENTRY_PRODUCT_SLUG: ${{ inputs.entry_product_slug }}
+          # claude-code-action exports a GitHub App installation token to the agent as
+          # GITHUB_TOKEN, and that token lacks actions: read. gh prefers GH_TOKEN, so this
+          # hands the agent's gh calls the job token (read-only, repo-scoped, actions: read
+          # from the permissions: block). See fleet-command-center/docs/STANDARDS.md §29.3 item 2.
+          GH_TOKEN: ${{ github.token }}
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           prompt: |
