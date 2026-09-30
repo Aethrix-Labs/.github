@@ -58,6 +58,9 @@ on:
 permissions:
   contents: read    # checkout only — this agent commits nothing
   id-token: write   # required by anthropics/claude-code-action@v1
+  actions: read     # the agent reads the failed run's log; without it that fetch is a 403
+                    # (first seen 2026-09-30 on a workflow-failed entry, confidence held at 0.6).
+                    # Still read-only. STANDARDS §29.3 (Dispatch contract), item 2.
 
 concurrency:
   # Per ENTRY, not per repo: escalations from different products triage in parallel, but the
