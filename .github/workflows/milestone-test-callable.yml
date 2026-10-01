@@ -59,6 +59,23 @@ jobs:
     # adds 30 for Maestro calls queueing on the fleet_maestro lock (FLEET_MAESTRO_LOCK_WAIT_SECS=1800).
     timeout-minutes: ${{ inputs.runner_label == 'fleet-mac' && 180 || 150 }}
     steps:
+      - name: Guard — claude-code-action supports only some events
+        # A reusable workflow inherits the CALLER's event, and anthropics/claude-code-action@v1 throws
+        # "Unsupported event type" ~200 ms into its step for anything outside this list — before any
+        # skill phase runs, with nothing to say why. Fail here instead, naming the cause.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          case "$EVENT_NAME" in
+            issues|issue_comment|pull_request|pull_request_target|pull_request_review|pull_request_review_comment|workflow_dispatch|repository_dispatch|schedule|workflow_run) ;;
+            *)
+              echo "::error::claude-code-action cannot run under '$EVENT_NAME'; dispatch via workflow_dispatch. The caller's milestone-test.yml must hand off with 'gh workflow run' and run this job only under workflow_dispatch (STANDARDS §28.6)."
+              echo "### milestone-test cannot run under \`$EVENT_NAME\`" >> "$GITHUB_STEP_SUMMARY"
+              echo "claude-code-action rejects this event, so the session was not started and the milestone is UNTESTED. The caller must re-dispatch as workflow_dispatch (see skills/e2e-setup/assets/milestone-test.yml)." >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+              ;;
+          esac
+
       - uses: actions/checkout@v4 # consumer repo at $GITHUB_WORKSPACE
         with:
           fetch-depth: 0 # the session reads the milestone's diff + git history
@@ -224,6 +241,8 @@ jobs:
           MT_PRODUCT_SLUG: ${{ inputs.product_slug }}
           MT_HUB_URL: ${{ inputs.hub_url }}
           MT_MILESTONE: ${{ inputs.milestone }}
+          # Empty when the action died before Claude ran (its `conclusion` output is only set after).
+          AGENT_CONCLUSION: ${{ steps.agent.outputs.conclusion }}
         run: |
           SLUG="${MT_PRODUCT_SLUG:-$(basename "$GITHUB_REPOSITORY")}"
           HUB="${MT_HUB_URL:-https://sethgibson.com}"
@@ -242,6 +261,21 @@ jobs:
           fi
           echo "::notice::milestone-test-callable: workflow failed at phase=${LAST_PHASE}"
 
+          # No phase AND no agent result: the action died at startup (it rejected the trigger event,
+          # or its own setup failed), so the phase-based advice below would be a wrong guess.
+          # Keep the quoting simple: these strings are interpolated into the JSON body below.
+          if [ "$LAST_PHASE" = "unknown" ] && [ -z "${AGENT_CONCLUSION:-}" ]; then
+            TITLE="[$SLUG] milestone-test did not start on ${MT_MILESTONE} - the milestone is UNTESTED"
+            ATTEMPT="claude-code-action failed at startup, before any skill phase ran (no phase breadcrumb, no agent result). Usually the action rejected the trigger event (Unsupported event type) or its setup failed; it is not a large-diff, e2e or Playwright failure. Event: ${GITHUB_EVENT_NAME}. Run: $RUN_URL"
+            ASK="${MT_MILESTONE} has NOT been tested. Read the first lines of the failing step to confirm the cause, then choose: fix the trigger (the session must run under workflow_dispatch, not push) and re-dispatch milestone-test for ${MT_MILESTONE}, or run milestone-test interactively (Mode B) in this repo."
+            RECO="If the trigger is not already known-fixed, run it interactively now; otherwise fix the trigger first and re-dispatch (Actions, milestone-test, Run workflow, milestone=${MT_MILESTONE})."
+          else
+            TITLE="[$SLUG] milestone-test failed on ${MT_MILESTONE}"
+            ATTEMPT="claude-code-action step failed (max-turns, crash, or infra error) before the skill's own exit path. Last phase reached: ${LAST_PHASE}. Run: $RUN_URL"
+            ASK="Inspect the run log, then run milestone-test interactively for ${MT_MILESTONE} or re-dispatch the workflow"
+            RECO="Died at phase '${LAST_PHASE}'. scope/classify -> the milestone diff is probably large; consider running the session interactively. e2e -> a spec likely thrashed past the 3-attempt cap, or the harness is not CI-ready (run e2e-setup). visual -> Playwright may lack its OS deps on the runner (SELF_HOSTED_RUNNER.md 'Playwright readiness'). routing/committing -> check the shakedown / ci-commit tail; the specs may already be written and just need committing."
+          fi
+
           if [ -n "$QUEUE_SERVICE_ROLE_KEY" ]; then
             REQUEST_ID=$(printf '%s' "${GITHUB_RUN_ID}milestone-test-failed" | sha256sum | cut -d' ' -f1)
             curl -sf -X POST "${HUB}/api/v1/queue/entries" \
@@ -254,12 +288,12 @@ jobs:
                 \"variant\": \"workflow-failed\",
                 \"agent_name\": \"milestone-test\",
                 \"product_slug\": \"$SLUG\",
-                \"title\": \"[$SLUG] milestone-test failed on ${MT_MILESTONE}\",
+                \"title\": \"$TITLE\",
                 \"goal\": \"Run the per-milestone testing session for ${MT_MILESTONE} (STANDARDS 23.7 Mode A)\",
-                \"attempts\": [\"claude-code-action step failed (max-turns, crash, or infra error) before the skill's own exit path. Last phase reached: ${LAST_PHASE}. Run: $RUN_URL\"],
+                \"attempts\": [\"$ATTEMPT\"],
                 \"artifacts\": [{\"label\": \"Workflow run\", \"href\": \"$RUN_URL\", \"artifact_type\": \"doc\"}],
-                \"ask\": \"Inspect the run log, then run milestone-test interactively for ${MT_MILESTONE} or re-dispatch the workflow\",
-                \"recommendation\": \"Died at phase '${LAST_PHASE}'. scope/classify -> the milestone diff is probably large; consider running the session interactively. e2e -> a spec likely thrashed past the 3-attempt cap, or the harness is not CI-ready (run e2e-setup). visual -> Playwright may lack its OS deps on the runner (SELF_HOSTED_RUNNER.md 'Playwright readiness'). routing/committing -> check the shakedown / ci-commit tail; the specs may already be written and just need committing.\"
+                \"ask\": \"$ASK\",
+                \"recommendation\": \"$RECO\"
               }" \
             || echo "::warning::milestone-test-callable: failure queue-entry POST failed"
           else
