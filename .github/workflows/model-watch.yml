@@ -30,8 +30,10 @@ concurrency:
 
 jobs:
   model-watch:
-    # STANDARDS §28.1: self-hosted fleet runner, never ubuntu-latest in a private repo.
-    runs-on: [self-hosted, linux, fleet]
+    # STANDARDS §28.6: this repo is PUBLIC and the org runner group disallows public repos, so a
+    # self-hosted label here is never claimed (the job sits `queued`, no log). GitHub-hosted instead;
+    # same as security-review.yml. Stdlib Python, no private checkout, so no fleet hardware is needed.
+    runs-on: ubuntu-latest
     # STANDARDS §28.6. Two HTTP GETs, a file scan and at most two POSTs.
     timeout-minutes: 5
     steps:
