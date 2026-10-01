@@ -286,20 +286,28 @@ jobs:
           fi
           CAP="${AGENT_MAX_TURNS:-}"
           case "$CAP" in ""|*[!0-9]*) CAP="" ;; esac
-          R_KIND=""; R_SUBTYPE=""; R_ERR=""; R_TURNS=""
+          R_KIND=""; R_SUBTYPE=""; R_ERR=""; R_TURNS=""; R_BG=""; R_DONE=""; R_STOP=""
           if [ -f "$EXEC_FILE" ] && command -v jq >/dev/null 2>&1; then
             R_LINE="$(jq -r -s '
                 [.[] | if type == "array" then .[] else . end | select(type == "object" and .type == "result")] | last
                 | if . == null then "none"
-                  else ["result", (.subtype | tostring), (.is_error | tostring), (.num_turns | tostring)] | join("|")
+                  else ["result", (.subtype | tostring), (.is_error | tostring), (.num_turns | tostring),
+                       ((.subagent_stats | objects | .started_in_background | numbers) // "" | tostring),
+                       ((.subagent_stats | objects | .completed | numbers) // "" | tostring),
+                       ((.stop_reason | strings) // "")] | join("|")
                   end' "$EXEC_FILE" 2>/dev/null || true)"
-            IFS='|' read -r R_KIND R_SUBTYPE R_ERR R_TURNS <<< "$R_LINE" || true
+            IFS='|' read -r R_KIND R_SUBTYPE R_ERR R_TURNS R_BG R_DONE R_STOP <<< "$R_LINE" || true
             # These land in the JSON body below: keep them to plain tokens.
             R_SUBTYPE="$(printf '%s' "$R_SUBTYPE" | tr -cd 'A-Za-z0-9_-' | head -c 64)"
             case "$R_ERR" in true|false) ;; *) R_ERR="" ;; esac
             case "$R_TURNS" in ""|*[!0-9]*) R_TURNS="" ;; esac
+            # subagent_stats is absent on older transcripts: absent or unparseable is no evidence, never 0.
+            case "$R_BG" in ""|*[!0-9]*) R_BG="" ;; esac
+            case "$R_DONE" in ""|*[!0-9]*) R_DONE="" ;; esac
+            R_STOP="$(printf '%s' "$R_STOP" | tr -cd 'A-Za-z0-9_-' | head -c 32)"
           fi
           CAUSE="unknown"
+          BG_WAIT=""
           if [ "$R_KIND" = "none" ]; then
             CAUSE="crash"
           elif [ "$R_KIND" = "result" ]; then
@@ -309,9 +317,14 @@ jobs:
               CAUSE="crash"
             elif [ "$R_SUBTYPE" = "success" ] && [ "$R_ERR" = "false" ] && [ -n "$R_TURNS" ] && [ -n "$CAP" ]; then
               CAUSE="clean-exit"
+              # Sub-flag, not a fifth cause: the agent dispatched subagents in the background, none had
+              # completed, and it ended its turn waiting (STANDARDS 28.6). Needs both fields present.
+              if [ -n "$R_BG" ] && [ -n "$R_DONE" ] && [ "$R_BG" -ge 1 ] && [ "$R_DONE" -eq 0 ]; then
+                BG_WAIT=1
+              fi
             fi
           fi
-          echo "::notice::implementer-callable: agent result cause=${CAUSE} subtype=${R_SUBTYPE:-?} is_error=${R_ERR:-?} turns=${R_TURNS:-?}/${CAP:-?}"
+          echo "::notice::implementer-callable: agent result cause=${CAUSE} subtype=${R_SUBTYPE:-?} is_error=${R_ERR:-?} turns=${R_TURNS:-?}/${CAP:-?} bg_started=${R_BG:-?} bg_completed=${R_DONE:-?} stop_reason=${R_STOP:-?}"
 
           # Merge reconcile (implementer PACKETS.md, workflow-failed).
           # The exit contract is NOT atomic with the commit side effects: on a
@@ -366,8 +379,14 @@ jobs:
               fi
               RECO="Died at phase '${LAST_PHASE}'. This reads as a crash or infra error, not a budget death: retry is apt. If it recurs at the same phase, read the run log before changing the step." ;;
             clean-exit)
-              ATTEMPT="The agent step concluded success (result subtype success, is_error false, ${R_TURNS} of ${CAP} turns, well under the cap) but the agent ended its session without running its exit path: no queue entry or tick-report was sent."
-              RECO="Not a budget or infra failure - do not recommend splitting the step on this evidence. The agent stopped on its own at phase '${LAST_PHASE}'; read its final message in the transcript artifact to see why, then re-dispatch or fix the skill. If the phase is committing, check the PR state first: the work may have landed." ;;
+              if [ -n "$BG_WAIT" ]; then
+                # Signature of STANDARDS 28.6 (a headless agent has no next turn).
+                ATTEMPT="The agent step concluded success (result subtype success, is_error false, ${R_TURNS} of ${CAP} turns, well under the cap, stop_reason ${R_STOP:-unreported}) but the agent spawned ${R_BG} subagent(s) in the background, none completed (${R_DONE} completed), and it ended its turn waiting for one. A headless session has no next turn, so that ended the session without running its exit path (STANDARDS 28.6): no queue entry or tick-report was sent."
+                RECO="Died at phase '${LAST_PHASE}'. Do not retry and do not split the step: the step was the right size and the run was nowhere near its budget. The fix is the skill's dispatch instruction (STANDARDS 28.6), and a re-dispatch before that fix lands stops the same way. The finished work should be on the WIP checkpoint branch implementer-wip/${IMPLEMENTER_TARGET_REF:-unknown} (check the ref exists), not on a PR. The agent's final message in the transcript artifact should say what it was waiting for."
+              else
+                ATTEMPT="The agent step concluded success (result subtype success, is_error false, ${R_TURNS} of ${CAP} turns, well under the cap) but the agent ended its session without running its exit path: no queue entry or tick-report was sent."
+                RECO="Not a budget or infra failure - do not recommend splitting the step on this evidence. The agent stopped on its own at phase '${LAST_PHASE}'; read its final message in the transcript artifact to see why, then re-dispatch or fix the skill. If the phase is committing, check the PR state first: the work may have landed."
+              fi ;;
             *)
               ATTEMPT="The agent ended without sending a tick-report or queue entry; cause unknown (the agent step's result object could not be read from this job)."
               RECO="Cause unknown - read the run log (and the transcript artifact, if one is attached) before choosing between retry and splitting the step. The last phase reached was '${LAST_PHASE}'." ;;
