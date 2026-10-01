@@ -75,6 +75,10 @@ jobs:
     # STANDARDS §28.6. Observed max 60m on either runner (a 181-turn max-turns death;
     # 180 turns ~= 50-60m). 120 = 2x.
     timeout-minutes: 120
+    env:
+      # One source for the turn cap: the agent step's --max-turns and the ensure-report guard's
+      # "did it run out of turns?" test both read it, so they cannot drift apart.
+      AGENT_MAX_TURNS: "180"
     steps:
       - uses: actions/checkout@v4 # consumer repo at $GITHUB_WORKSPACE
         with:
@@ -187,10 +191,11 @@ jobs:
           claude_args: |
             --model ${{ inputs.model }}
             --effort ${{ inputs.effort }}
-            --max-turns 180
+            --max-turns ${{ env.AGENT_MAX_TURNS }}
             --allowedTools Read,Bash,Write,Edit,Glob,Grep
 
       - name: Ensure the hub heard back (tick-report guard)
+        id: ensure-report
         # Always-run backstop (widened 2026-07-08 from an `if: failure()`-only handler).
         # Fires whenever the skill's `.tick-report-sent` breadcrumb is ABSENT at job end
         # — covering BOTH (a) the agent step dying (crash, infra error) and (b) the step
@@ -213,6 +218,9 @@ jobs:
           IMPLEMENTER_TARGET_KIND: ${{ inputs.target_kind }}
           IMPLEMENTER_TARGET_REF: ${{ inputs.target_ref }}
           GH_TOKEN: ${{ github.token }} # merge reconcile below
+          # The action's transcript (a JSON array of SDK messages; the last `result` message carries
+          # subtype / is_error / num_turns). Empty when the action died before writing it.
+          AGENT_EXECUTION_FILE: ${{ steps.agent.outputs.execution_file }}
         run: |
           # If the skill delivered its own tick-report it dropped this breadcrumb —
           # the hub already heard back, so this guard has nothing to do. Absent → fall
@@ -238,6 +246,72 @@ jobs:
             LAST_PHASE="$(tr -d '\r\n' < "$PHASE_FILE" | head -c 200)"
           fi
           echo "::notice::implementer-callable: workflow failed at phase=${LAST_PHASE}"
+
+          # Run-id breadcrumb — written by the skill at the moment it generates the loop's run_id
+          # (STANDARDS §18.1a). The packet carries it so the queue entry cross-links to the agent's
+          # activity trail. Absent, empty or malformed → omit the field and say so in `attempts`.
+          # NEVER substitute $GITHUB_RUN_ID: that names the workflow run, not the agent's loop, and
+          # a packet keyed to the wrong identifier space reads as a confident empty trail.
+          RUN_ID_FILE="${GITHUB_WORKSPACE:-.}/.implementer-run-id"
+          AGENT_RUN_ID=""
+          if [ -f "$RUN_ID_FILE" ]; then
+            AGENT_RUN_ID="$(tr -d '\r\n' < "$RUN_ID_FILE" | head -c 128)"
+          fi
+          RUN_ID_FIELD=""
+          RUN_ID_NOTE=""
+          case "$AGENT_RUN_ID" in
+            "")
+              RUN_ID_NOTE=" The agent's run-id breadcrumb (.implementer-run-id) was missing or empty, so this entry carries no run_id and is not linked to an activity trail." ;;
+            *[!A-Za-z0-9_-]*)
+              # Interpolated into the JSON body below; anything outside a plain id is not trusted.
+              AGENT_RUN_ID=""
+              RUN_ID_NOTE=" The agent's run-id breadcrumb (.implementer-run-id) was malformed, so this entry carries no run_id and is not linked to an activity trail." ;;
+            *)
+              RUN_ID_FIELD="\"run_id\": \"$AGENT_RUN_ID\"," ;;
+          esac
+
+          # What the agent step actually reported. claude-code-action writes its transcript to
+          # $RUNNER_TEMP/claude-execution-output.json and prints a {"type":"result", ...} object to the
+          # log; this guard is `if: always()`, so it also fires when the step concluded `success` and
+          # the agent simply ended its session without running its exit path. Asserting "max-turns,
+          # crash, or infra" for that case names a cause the log contradicts. Branch on the result
+          # object instead; where it cannot be read, say so rather than guess.
+          #   max-turns   subtype error_max_turns, or num_turns at/near the cap
+          #   crash       is_error true, a non-success subtype, or no result object in the transcript
+          #   clean-exit  subtype success, is_error false, turns well under the cap
+          #   unknown     transcript or jq unavailable, or a field would not parse
+          EXEC_FILE="${AGENT_EXECUTION_FILE:-}"
+          if [ -z "$EXEC_FILE" ]; then
+            EXEC_FILE="${RUNNER_TEMP:-}/claude-execution-output.json"
+          fi
+          CAP="${AGENT_MAX_TURNS:-}"
+          case "$CAP" in ""|*[!0-9]*) CAP="" ;; esac
+          R_KIND=""; R_SUBTYPE=""; R_ERR=""; R_TURNS=""
+          if [ -f "$EXEC_FILE" ] && command -v jq >/dev/null 2>&1; then
+            R_LINE="$(jq -r -s '
+                [.[] | if type == "array" then .[] else . end | select(type == "object" and .type == "result")] | last
+                | if . == null then "none"
+                  else ["result", (.subtype | tostring), (.is_error | tostring), (.num_turns | tostring)] | join("|")
+                  end' "$EXEC_FILE" 2>/dev/null || true)"
+            IFS='|' read -r R_KIND R_SUBTYPE R_ERR R_TURNS <<< "$R_LINE" || true
+            # These land in the JSON body below: keep them to plain tokens.
+            R_SUBTYPE="$(printf '%s' "$R_SUBTYPE" | tr -cd 'A-Za-z0-9_-' | head -c 64)"
+            case "$R_ERR" in true|false) ;; *) R_ERR="" ;; esac
+            case "$R_TURNS" in ""|*[!0-9]*) R_TURNS="" ;; esac
+          fi
+          CAUSE="unknown"
+          if [ "$R_KIND" = "none" ]; then
+            CAUSE="crash"
+          elif [ "$R_KIND" = "result" ]; then
+            if [ "$R_SUBTYPE" = "error_max_turns" ] || { [ -n "$R_TURNS" ] && [ -n "$CAP" ] && [ "$R_TURNS" -ge $((CAP * 9 / 10)) ]; }; then
+              CAUSE="max-turns"
+            elif [ "$R_ERR" = "true" ] || { [ -n "$R_SUBTYPE" ] && [ "$R_SUBTYPE" != "success" ]; }; then
+              CAUSE="crash"
+            elif [ "$R_SUBTYPE" = "success" ] && [ "$R_ERR" = "false" ] && [ -n "$R_TURNS" ] && [ -n "$CAP" ]; then
+              CAUSE="clean-exit"
+            fi
+          fi
+          echo "::notice::implementer-callable: agent result cause=${CAUSE} subtype=${R_SUBTYPE:-?} is_error=${R_ERR:-?} turns=${R_TURNS:-?}/${CAP:-?}"
 
           # Merge reconcile (implementer PACKETS.md, workflow-failed).
           # The exit contract is NOT atomic with the commit side effects: on a
@@ -266,6 +340,40 @@ jobs:
             esac
           fi
 
+          # The transcript is the only record of the agent's final message ("why did it stop"); the
+          # runner's temp dir is wiped at job end. Hand it to the upload step below — failure path
+          # only, so a reconciled (work landed) run uploads nothing.
+          TRANSCRIPT_NOTE=""
+          if [ -z "$RECONCILED" ] && [ -f "$EXEC_FILE" ]; then
+            TRANSCRIPT_NOTE=" The agent's full transcript is attached to the run as the artifact implementer-transcript-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT:-1} (7-day retention); its last result message is the agent's own account of why it stopped."
+            if [ -n "${GITHUB_OUTPUT:-}" ]; then
+              echo "transcript_path=$EXEC_FILE" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+          # Cause-specific text. Only what the result object supports is asserted; the over-sized-step
+          # advice is reserved for an actual max-turns death. Plain ASCII, no double quotes or
+          # backslashes: these are interpolated into the JSON body below.
+          case "$CAUSE" in
+            max-turns)
+              ATTEMPT="claude-code-action used ${R_TURNS} of ${CAP} turns (result subtype ${R_SUBTYPE}), at or near its turn cap, before the skill's own exit path; no in-band queue entry or tick-report was sent."
+              RECO="Died at phase '${LAST_PHASE}'. building/testing/adversary → the step is likely over-sized for the effective build budget (split it) or a green command is stuck (see the Step 4 debug cap); committing → check the commit skill's mid-flight activity records; step-identified → the agent may have walked into work outside its lane (e.g. an unmarked human-only step)." ;;
+            crash)
+              if [ "$R_KIND" = "none" ]; then
+                ATTEMPT="claude-code-action ended without a result object in its transcript (a crash or infra error) before the skill's own exit path; no in-band queue entry or tick-report was sent."
+              else
+                ATTEMPT="claude-code-action ended in error (result subtype ${R_SUBTYPE:-unknown}, is_error ${R_ERR:-unknown}, ${R_TURNS:-unknown} of ${CAP:-unknown} turns) before the skill's own exit path; no in-band queue entry or tick-report was sent."
+              fi
+              RECO="Died at phase '${LAST_PHASE}'. This reads as a crash or infra error, not a budget death: retry is apt. If it recurs at the same phase, read the run log before changing the step." ;;
+            clean-exit)
+              ATTEMPT="The agent step concluded success (result subtype success, is_error false, ${R_TURNS} of ${CAP} turns, well under the cap) but the agent ended its session without running its exit path: no queue entry or tick-report was sent."
+              RECO="Not a budget or infra failure - do not recommend splitting the step on this evidence. The agent stopped on its own at phase '${LAST_PHASE}'; read its final message in the transcript artifact to see why, then re-dispatch or fix the skill. If the phase is committing, check the PR state first: the work may have landed." ;;
+            *)
+              ATTEMPT="The agent ended without sending a tick-report or queue entry; cause unknown (the agent step's result object could not be read from this job)."
+              RECO="Cause unknown - read the run log (and the transcript artifact, if one is attached) before choosing between retry and splitting the step. The last phase reached was '${LAST_PHASE}'." ;;
+          esac
+          ATTEMPT="${ATTEMPT} Last phase reached: ${LAST_PHASE}. Run: ${RUN_URL}${RUN_ID_NOTE}${TRANSCRIPT_NOTE}"
+
           # Queue entry — exception, variant `workflow-failed`. request_id is rooted in the
           # GitHub run ID (one entry per failed run; reruns get a new run ID,
           # which is correct — a new failure is a new event). Shape per
@@ -282,14 +390,15 @@ jobs:
                 \"request_id\": \"$REQUEST_ID\",
                 \"entry_type\": \"exception\",
                 \"variant\": \"workflow-failed\",
+                ${RUN_ID_FIELD}
                 \"agent_name\": \"implementer\",
                 \"product_slug\": \"$SLUG\",
                 \"title\": \"[$SLUG] implementer workflow failed on ${IMPLEMENTER_TARGET_REF:-unknown target}\",
                 \"goal\": \"Advance ${IMPLEMENTER_TARGET_KIND:-?}/${IMPLEMENTER_TARGET_REF:-?} by one step\",
-                \"attempts\": [\"claude-code-action step failed (max-turns, crash, or infra error) before the skill's own exit path; no in-band queue entry or tick-report was sent. Last phase reached: ${LAST_PHASE}. Run: $RUN_URL\"],
+                \"attempts\": [\"$ATTEMPT\"],
                 \"artifacts\": [{\"label\": \"Workflow run\", \"href\": \"$RUN_URL\", \"artifact_type\": \"doc\"}],
                 \"ask\": \"Inspect the workflow run log; decide retry, fix the step/criteria, or restructure the target\",
-                \"recommendation\": \"Died at phase '${LAST_PHASE}'. building/testing/adversary → the step is likely over-sized for the effective build budget (split it) or a green command is stuck (see the Step 4 debug cap); committing → check the commit skill's mid-flight activity records; step-identified → the agent may have walked into work outside its lane (e.g. an unmarked human-only step).\"
+                \"recommendation\": \"$RECO\"
               }" \
             || echo "::warning::implementer-callable: failure queue-entry POST failed"
           else
@@ -331,3 +440,18 @@ jobs:
               echo "::error::implementer-callable: ensure-report tick-report POST failed after 3 attempts; defensive cron sweep will reconcile"
             fi
           fi
+
+      - name: Upload the agent transcript (failure path only)
+        # The agent step runs with show_full_output: false, so the log carries the result object but
+        # not the agent's final message, and the transcript is deleted with the runner's temp dir.
+        # An artifact rather than show_full_output: true — that would print every tool result,
+        # secrets included, into a log anyone with read access can open. The guard sets
+        # `transcript_path` only when it filed a failure (no tick-report, not reconciled).
+        if: always() && steps.ensure-report.outputs.transcript_path != ''
+        uses: actions/upload-artifact@v4
+        continue-on-error: true
+        with:
+          name: implementer-transcript-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.ensure-report.outputs.transcript_path }}
+          if-no-files-found: warn
+          retention-days: 7
