@@ -58,6 +58,10 @@ jobs:
     # 180-turn budget, observed max 60m) plus e2e suite runs inside those turns. fleet-mac
     # adds 30 for Maestro calls queueing on the fleet_maestro lock (FLEET_MAESTRO_LOCK_WAIT_SECS=1800).
     timeout-minutes: ${{ inputs.runner_label == 'fleet-mac' && 180 || 150 }}
+    env:
+      # One source for the turn cap: the agent step's --max-turns and the failure guard's
+      # "did it run out of turns?" test both read it, so they cannot drift apart.
+      AGENT_MAX_TURNS: "180"
     steps:
       - name: Guard — claude-code-action supports only some events
         # A reusable workflow inherits the CALLER's event, and anthropics/claude-code-action@v1 throws
@@ -207,7 +211,7 @@ jobs:
           claude_args: |
             --model sonnet
             --effort medium
-            --max-turns 180
+            --max-turns ${{ env.AGENT_MAX_TURNS }}
             --allowedTools Read,Bash,Write,Edit,Glob,Grep
             # --max-turns 180 matches implementer-callable and lite-planner-callable. The
             # session shares the same commit tax (shakedown -> ci-commit ->
@@ -233,10 +237,14 @@ jobs:
           retention-days: 30
 
       - name: Emit failure queue entry on agent death
-        # The agent step died (max-turns, crash, infra) before its own exit path — surface
-        # it so a closed milestone doesn't silently go untested.
+        # The agent step failed before its own exit path — surface it so a closed milestone
+        # doesn't silently go untested. The cause is read off the agent's result object, not assumed.
+        id: failure-entry
         if: failure() && steps.agent.outcome == 'failure'
         env:
+          # The action's transcript (a JSON array of SDK messages; the last `result` message carries
+          # subtype / is_error / num_turns). Empty when the action died before writing it.
+          AGENT_EXECUTION_FILE: ${{ steps.agent.outputs.execution_file }}
           QUEUE_SERVICE_ROLE_KEY: ${{ secrets.QUEUE_SERVICE_ROLE_KEY }}
           MT_PRODUCT_SLUG: ${{ inputs.product_slug }}
           MT_HUB_URL: ${{ inputs.hub_url }}
@@ -261,6 +269,81 @@ jobs:
           fi
           echo "::notice::milestone-test-callable: workflow failed at phase=${LAST_PHASE}"
 
+          # Run-id breadcrumb — written by the skill at the moment it generates the loop's run_id
+          # (STANDARDS §18.1a), named after the agent like the phase marker above. The packet carries
+          # it so the queue entry cross-links to the agent's activity trail. Absent, empty or
+          # malformed → omit the field and say so in `attempts`. NEVER substitute $GITHUB_RUN_ID:
+          # that names the workflow run, not the agent's loop, and a packet keyed to the wrong
+          # identifier space reads as a confident empty trail.
+          RUN_ID_FILE="${GITHUB_WORKSPACE:-.}/.milestone-test-run-id"
+          AGENT_RUN_ID=""
+          if [ -f "$RUN_ID_FILE" ]; then
+            AGENT_RUN_ID="$(tr -d '\r\n' < "$RUN_ID_FILE" | head -c 128)"
+          fi
+          RUN_ID_FIELD=""
+          RUN_ID_NOTE=""
+          case "$AGENT_RUN_ID" in
+            "")
+              RUN_ID_NOTE=" The agent's run-id breadcrumb (.milestone-test-run-id) was missing or empty, so this entry carries no run_id and is not linked to an activity trail." ;;
+            *[!A-Za-z0-9_-]*)
+              # Interpolated into the JSON body below; anything outside a plain id is not trusted.
+              AGENT_RUN_ID=""
+              RUN_ID_NOTE=" The agent's run-id breadcrumb (.milestone-test-run-id) was malformed, so this entry carries no run_id and is not linked to an activity trail." ;;
+            *)
+              RUN_ID_FIELD="\"run_id\": \"$AGENT_RUN_ID\"," ;;
+          esac
+
+          # What the agent step actually reported. claude-code-action writes its transcript to
+          # $RUNNER_TEMP/claude-execution-output.json and prints a {"type":"result", ...} object to the
+          # log. Asserting "max-turns, crash, or infra" without looking names a cause the log can
+          # contradict, so branch on the result object; where it cannot be read, say so.
+          #   max-turns   subtype error_max_turns, or num_turns at/near the cap
+          #   crash       is_error true, a non-success subtype, or no result object in the transcript
+          #   clean-exit  subtype success, is_error false, turns well under the cap
+          #   unknown     transcript or jq unavailable, or a field would not parse
+          EXEC_FILE="${AGENT_EXECUTION_FILE:-}"
+          if [ -z "$EXEC_FILE" ]; then
+            EXEC_FILE="${RUNNER_TEMP:-}/claude-execution-output.json"
+          fi
+          CAP="${AGENT_MAX_TURNS:-}"
+          case "$CAP" in ""|*[!0-9]*) CAP="" ;; esac
+          R_KIND=""; R_SUBTYPE=""; R_ERR=""; R_TURNS=""
+          if [ -f "$EXEC_FILE" ] && command -v jq >/dev/null 2>&1; then
+            R_LINE="$(jq -r -s '
+                [.[] | if type == "array" then .[] else . end | select(type == "object" and .type == "result")] | last
+                | if . == null then "none"
+                  else ["result", (.subtype | tostring), (.is_error | tostring), (.num_turns | tostring)] | join("|")
+                  end' "$EXEC_FILE" 2>/dev/null || true)"
+            IFS='|' read -r R_KIND R_SUBTYPE R_ERR R_TURNS <<< "$R_LINE" || true
+            # These land in the JSON body below: keep them to plain tokens.
+            R_SUBTYPE="$(printf '%s' "$R_SUBTYPE" | tr -cd 'A-Za-z0-9_-' | head -c 64)"
+            case "$R_ERR" in true|false) ;; *) R_ERR="" ;; esac
+            case "$R_TURNS" in ""|*[!0-9]*) R_TURNS="" ;; esac
+          fi
+          CAUSE="unknown"
+          if [ "$R_KIND" = "none" ]; then
+            CAUSE="crash"
+          elif [ "$R_KIND" = "result" ]; then
+            if [ "$R_SUBTYPE" = "error_max_turns" ] || { [ -n "$R_TURNS" ] && [ -n "$CAP" ] && [ "$R_TURNS" -ge $((CAP * 9 / 10)) ]; }; then
+              CAUSE="max-turns"
+            elif [ "$R_ERR" = "true" ] || { [ -n "$R_SUBTYPE" ] && [ "$R_SUBTYPE" != "success" ]; }; then
+              CAUSE="crash"
+            elif [ "$R_SUBTYPE" = "success" ] && [ "$R_ERR" = "false" ] && [ -n "$R_TURNS" ] && [ -n "$CAP" ]; then
+              CAUSE="clean-exit"
+            fi
+          fi
+          echo "::notice::milestone-test-callable: agent result cause=${CAUSE} subtype=${R_SUBTYPE:-?} is_error=${R_ERR:-?} turns=${R_TURNS:-?}/${CAP:-?}"
+
+          # The transcript is the only record of the agent's final message ("why did it stop"); the
+          # runner's temp dir is wiped at job end. Hand it to the upload step below.
+          TRANSCRIPT_NOTE=""
+          if [ -f "$EXEC_FILE" ]; then
+            TRANSCRIPT_NOTE=" The agent's full transcript is attached to the run as the artifact milestone-test-transcript-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT:-1} (7-day retention); its last result message is the agent's own account of why it stopped."
+            if [ -n "${GITHUB_OUTPUT:-}" ]; then
+              echo "transcript_path=$EXEC_FILE" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
           # No phase AND no agent result: the action died at startup (it rejected the trigger event,
           # or its own setup failed), so the phase-based advice below would be a wrong guess.
           # Keep the quoting simple: these strings are interpolated into the JSON body below.
@@ -271,10 +354,30 @@ jobs:
             RECO="If the trigger is not already known-fixed, run it interactively now; otherwise fix the trigger first and re-dispatch (Actions, milestone-test, Run workflow, milestone=${MT_MILESTONE})."
           else
             TITLE="[$SLUG] milestone-test failed on ${MT_MILESTONE}"
-            ATTEMPT="claude-code-action step failed (max-turns, crash, or infra error) before the skill's own exit path. Last phase reached: ${LAST_PHASE}. Run: $RUN_URL"
             ASK="Inspect the run log, then run milestone-test interactively for ${MT_MILESTONE} or re-dispatch the workflow"
-            RECO="Died at phase '${LAST_PHASE}'. scope/classify -> the milestone diff is probably large; consider running the session interactively. e2e -> a spec likely thrashed past the 3-attempt cap, or the harness is not CI-ready (run e2e-setup). visual -> Playwright may lack its OS deps on the runner (SELF_HOSTED_RUNNER.md 'Playwright readiness'). routing/committing -> check the shakedown / ci-commit tail; the specs may already be written and just need committing."
+            # Only what the result object supports is asserted; the phase advice (large diff, thrashing
+            # spec) is reserved for an actual max-turns death.
+            case "$CAUSE" in
+              max-turns)
+                ATTEMPT="claude-code-action used ${R_TURNS} of ${CAP} turns (result subtype ${R_SUBTYPE}), at or near its turn cap, before the skill's own exit path."
+                RECO="Died at phase '${LAST_PHASE}'. scope/classify -> the milestone diff is probably large; consider running the session interactively. e2e -> a spec likely thrashed past the 3-attempt cap, or the harness is not CI-ready (run e2e-setup). visual -> Playwright may lack its OS deps on the runner (SELF_HOSTED_RUNNER.md 'Playwright readiness'). routing/committing -> check the shakedown / ci-commit tail; the specs may already be written and just need committing." ;;
+              crash)
+                if [ "$R_KIND" = "none" ]; then
+                  ATTEMPT="claude-code-action ended without a result object in its transcript (a crash or infra error) before the skill's own exit path."
+                else
+                  ATTEMPT="claude-code-action ended in error (result subtype ${R_SUBTYPE:-unknown}, is_error ${R_ERR:-unknown}, ${R_TURNS:-unknown} of ${CAP:-unknown} turns) before the skill's own exit path."
+                fi
+                RECO="Died at phase '${LAST_PHASE}'. This reads as a crash or infra error, not a budget death: re-dispatching is apt. If it recurs at the same phase, read the run log before changing anything." ;;
+              clean-exit)
+                ATTEMPT="The agent's result object reports success (result subtype success, is_error false, ${R_TURNS} of ${CAP} turns, well under the cap) yet the step is marked failed."
+                RECO="Not a budget or infra failure. Read the run log around the end of the agent step, and the agent's final message in the transcript artifact, to see why the step was marked failed (last phase '${LAST_PHASE}')." ;;
+              *)
+                ATTEMPT="claude-code-action failed before the skill's own exit path; cause unknown (the agent step's result object could not be read from this job)."
+                RECO="Cause unknown - read the run log (and the transcript artifact, if one is attached) before choosing between re-dispatching and running the session interactively. The last phase reached was '${LAST_PHASE}'." ;;
+            esac
+            ATTEMPT="${ATTEMPT} Last phase reached: ${LAST_PHASE}. Run: ${RUN_URL}"
           fi
+          ATTEMPT="${ATTEMPT}${RUN_ID_NOTE}${TRANSCRIPT_NOTE}"
 
           if [ -n "$QUEUE_SERVICE_ROLE_KEY" ]; then
             REQUEST_ID=$(printf '%s' "${GITHUB_RUN_ID}milestone-test-failed" | sha256sum | cut -d' ' -f1)
@@ -286,6 +389,7 @@ jobs:
                 \"request_id\": \"$REQUEST_ID\",
                 \"entry_type\": \"exception\",
                 \"variant\": \"workflow-failed\",
+                ${RUN_ID_FIELD}
                 \"agent_name\": \"milestone-test\",
                 \"product_slug\": \"$SLUG\",
                 \"title\": \"$TITLE\",
@@ -299,3 +403,18 @@ jobs:
           else
             echo "::warning::milestone-test-callable: QUEUE_SERVICE_ROLE_KEY missing; skipping failure queue entry"
           fi
+
+      - name: Upload the agent transcript (failure path only)
+        # The agent step runs with show_full_output: false, so the log carries the result object but
+        # not the agent's final message, and the transcript is deleted with the runner's temp dir.
+        # An artifact rather than show_full_output: true — that would print every tool result,
+        # secrets included, into a log anyone with read access can open. The guard above sets
+        # `transcript_path` only when it ran, i.e. the agent step failed.
+        if: always() && steps.failure-entry.outputs.transcript_path != ''
+        uses: actions/upload-artifact@v4
+        continue-on-error: true
+        with:
+          name: milestone-test-transcript-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.failure-entry.outputs.transcript_path }}
+          if-no-files-found: warn
+          retention-days: 7
