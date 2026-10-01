@@ -1,11 +1,14 @@
 name: model-watch
 
-# Weekly reminder: is any fleet workflow pinned to an older Sonnet than Anthropic
-# now lists? STANDARDS §14 (Model currency). Deterministic — no Claude call, no
-# Anthropic spend. Posts ONE deduped `follow-up` queue entry when a pin is behind
-# (request_id = hash of latest + pinned set, so an unchanged state never re-nags).
-# Fails loudly (red run) if the models page can't be parsed; it never reports an
-# all-clear it couldn't verify.
+# Weekly: publish the model catalog to the hub and flag any agent pinned to an
+# older model than Anthropic now lists (MODEL_SELECTION_PROPOSAL.md §3; STANDARDS §14).
+# The staleness check reads the hub's STORED pins, not workflow YAML. Deterministic —
+# no Claude call, no Anthropic spend. Posts ONE deduped `follow-up` queue entry
+# (variant `model-stale`) when an exact-id pin is behind (request_id = hash of the
+# newest ids + the stale pins, so an unchanged state never re-nags).
+# Fails loudly (red run) if the models page can't be parsed or the pins can't be read,
+# posting nothing so the hub keeps last-known-good; it never reports an all-clear it
+# couldn't verify.
 
 on:
   schedule:
@@ -29,7 +32,7 @@ jobs:
   model-watch:
     # STANDARDS §28.1: self-hosted fleet runner, never ubuntu-latest in a private repo.
     runs-on: [self-hosted, linux, fleet]
-    # STANDARDS §28.6. One HTTP GET, a file scan and at most one POST.
+    # STANDARDS §28.6. Two HTTP GETs, a file scan and at most two POSTs.
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
@@ -37,7 +40,7 @@ jobs:
       - name: Unit tests
         run: python3 -m unittest discover -s .github/scripts/model-watch -v
 
-      - name: Check Sonnet pins against the latest release
+      - name: Publish the catalog and check pins against the latest releases
         env:
           QUEUE_SERVICE_ROLE_KEY: ${{ secrets.QUEUE_SERVICE_ROLE_KEY }}
           DRY_RUN: ${{ inputs.dry_run }}
