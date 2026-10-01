@@ -154,6 +154,12 @@ jobs:
           MT_ARTIFACT_DIR: ${{ github.workspace }}/.milestone-test-artifacts
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # The caller's push-triggered `redispatch` job starts this run with `gh workflow run`
+          # under the default GITHUB_TOKEN, so the workflow_dispatch actor is `github-actions`
+          # (type Bot). claude-code-action refuses a bot actor unless it is listed, dying at
+          # startup with "Workflow initiated by non-human actor: github-actions (type: Bot)"
+          # (puzzle-pop M16, run 36913059179). Allow exactly that bot, not '*'.
+          allowed_bots: github-actions
           prompt: |
             You are running as the **milestone-test agent** in CI, in **Mode A (autonomous)**.
 
