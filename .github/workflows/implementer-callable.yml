@@ -460,6 +460,203 @@ jobs:
             fi
           fi
 
+      - name: Record the run's model and turns (calibration)
+        id: record-run
+        # MODEL_CALIBRATION_PROPOSAL §3.7: the workflow-side half of the producer minimum. The agent
+        # cannot write these - claude-code-action writes the result object AFTER the agent's session
+        # ends, so an agent cannot read its own num_turns. Do not move this back into the agent.
+        #
+        # A step of its own, NOT a block inside the ensure-report guard above: that guard exits at its
+        # top whenever the skill sent its own tick-report, which is every healthy run, so a write
+        # placed there would record only the dead agents and leave no denominator to calibrate
+        # against. Here the guard's tick-report/queue behavior cannot be reached by anything this step
+        # does, and this step cannot be skipped by anything the guard does.
+        #
+        # Observability, not a gate (STANDARDS §18.2): every failure path warns and continues, the
+        # step never exits non-zero, and continue-on-error backstops the rest.
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 5
+        env:
+          QUEUE_SERVICE_ROLE_KEY: ${{ secrets.QUEUE_SERVICE_ROLE_KEY }}
+          IMPLEMENTER_PRODUCT_SLUG: ${{ inputs.product_slug }}
+          IMPLEMENTER_SESSION_ID: ${{ inputs.session_id }}
+          IMPLEMENTER_HUB_URL: ${{ inputs.hub_url }}
+          IMPLEMENTER_TARGET_KIND: ${{ inputs.target_kind }}
+          IMPLEMENTER_TARGET_REF: ${{ inputs.target_ref }}
+          # The two chosen values, verbatim: an alias (sonnet) or an exact id. Not the resolution.
+          RECORD_MODEL_AS_CHOSEN: ${{ inputs.model }}
+          RECORD_EFFORT: ${{ inputs.effort }}
+          AGENT_EXECUTION_FILE: ${{ steps.agent.outputs.execution_file }}
+        run: |
+          # Nothing below may fail the run. -e is on by default for this shell; turn it off so a
+          # failed jq/curl reaches its own warning instead of ending the step silently.
+          set +e
+
+          if [ -z "$QUEUE_SERVICE_ROLE_KEY" ]; then
+            echo "::warning::implementer-callable: QUEUE_SERVICE_ROLE_KEY missing; skipping the run-metrics activity record"
+            exit 0
+          fi
+          if ! command -v jq >/dev/null 2>&1; then
+            echo "::warning::implementer-callable: jq is not on PATH for this runner; skipping the run-metrics activity record"
+            exit 0
+          fi
+
+          # run_id comes ONLY from the agent's breadcrumb (STANDARDS §18.1a). The hub requires a
+          # non-empty run_id, and inventing a second scheme (or substituting $GITHUB_RUN_ID, which
+          # names the workflow run, not the agent's loop) is exactly what §18.1a exists to stop. A run
+          # that died before the skill generated its id has no loop to attach to: skip, and say so.
+          RUN_ID_FILE="${GITHUB_WORKSPACE:-.}/.implementer-run-id"
+          AGENT_RUN_ID=""
+          if [ -f "$RUN_ID_FILE" ]; then
+            AGENT_RUN_ID="$(tr -d '\r\n' < "$RUN_ID_FILE" | head -c 128)"
+          fi
+          case "$AGENT_RUN_ID" in
+            ""|*[!A-Za-z0-9_-]*)
+              echo "::notice::implementer-callable: no usable run-id breadcrumb (.implementer-run-id missing, empty or malformed); the agent died before generating its run_id, so there is no loop to attach a run-metrics record to"
+              exit 0 ;;
+          esac
+
+          # sha256sum is GNU coreutils; the macOS runner may only have shasum.
+          if command -v sha256sum >/dev/null 2>&1; then
+            SHA="sha256sum"
+          elif command -v shasum >/dev/null 2>&1; then
+            SHA="shasum -a 256"
+          else
+            echo "::warning::implementer-callable: no sha256 tool on PATH; skipping the run-metrics activity record"
+            exit 0
+          fi
+
+          EXEC_FILE="${AGENT_EXECUTION_FILE:-}"
+          if [ -z "$EXEC_FILE" ]; then
+            EXEC_FILE="${RUNNER_TEMP:-}/claude-execution-output.json"
+          fi
+
+          SLUG="${IMPLEMENTER_PRODUCT_SLUG:-$(basename "$GITHUB_REPOSITORY")}"
+          HUB="${IMPLEMENTER_HUB_URL:-https://sethgibson.com}"
+          CAP="${AGENT_MAX_TURNS:-}"
+          ATTEMPT_NO="${GITHUB_RUN_ATTEMPT:-1}"
+
+          # One request per workflow-run ATTEMPT. §18.1a: run_id repeats across a rerun at an
+          # unchanged HEAD, so keying on run_id + action alone would dedup a second attempt away.
+          REQUEST_ID="$(printf '%s' "${AGENT_RUN_ID}run-metrics${GITHUB_RUN_ID}:${ATTEMPT_NO}" | $SHA | cut -d' ' -f1)"
+
+          # The whole body is built by jq, so nothing from the transcript or the inputs is ever
+          # spliced into JSON by the shell. Every result-derived field is null when the object, or
+          # that field in it, is absent or the wrong type: absent is "unknown", never 0 (§4).
+          # The result file is a JSON array of SDK messages (or an object stream); take the last
+          # {"type":"result"} and the system/init message.
+          #
+          # model_resolved is the key of modelUsage with the highest costUSD: the model that actually
+          # served the bulk of the tokens, ground truth that needs no trust in the agent (§3.3 a).
+          # modelUsage also lists small helper models (claude-haiku-4-5 shows up on every run), so the
+          # highest-cost key, not "the only key", is the primary. The init message's model is the
+          # fallback when modelUsage is absent, and models_used keeps the full per-model breakdown so
+          # a mixed run is visible instead of collapsed.
+          # Two jq traps, both bitten in testing: the "alternative" operator treats false as absent (so
+          # is_error is typed explicitly rather than defaulted), and the program is single-quoted shell,
+          # so it must never contain an apostrophe, comments included.
+          #
+          # An absent or unparseable result file still yields a record (the chosen model, effort and
+          # session, every result field null): a crashed run is the population most worth calibrating.
+          BODY=""
+          for SRC in "$EXEC_FILE" /dev/null; do
+            [ -f "$SRC" ] || [ "$SRC" = "/dev/null" ] || continue
+            BODY="$(jq -s -c \
+            --arg request_id "$REQUEST_ID" \
+            --arg slug "$SLUG" \
+            --arg run_id "$AGENT_RUN_ID" \
+            --arg github_run_id "${GITHUB_RUN_ID:-}" \
+            --arg github_run_attempt "$ATTEMPT_NO" \
+            --arg session_id "${IMPLEMENTER_SESSION_ID:-}" \
+            --arg target_kind "${IMPLEMENTER_TARGET_KIND:-}" \
+            --arg target_ref "${IMPLEMENTER_TARGET_REF:-}" \
+            --arg model_as_chosen "${RECORD_MODEL_AS_CHOSEN:-}" \
+            --arg effort "${RECORD_EFFORT:-}" \
+            --arg cap "$CAP" '
+              def nz: if . == "" then null else . end;
+              ([.[] | if type == "array" then .[] else . end | select(type == "object")]) as $msgs
+              | ($msgs | map(select(.type == "result")) | last) as $r
+              | ($msgs | map(select(.type == "system" and .subtype == "init")) | first) as $init
+              | (($r.modelUsage // null) | if type == "object" then . else null end) as $mu
+              | ($mu | if . == null or length == 0 then null
+                       else to_entries | max_by(.value.costUSD // 0) | .key end) as $top
+              | def slim: {
+                  input_tokens: (.inputTokens | numbers // null),
+                  output_tokens: (.outputTokens | numbers // null),
+                  cache_read_input_tokens: (.cacheReadInputTokens | numbers // null),
+                  cache_creation_input_tokens: (.cacheCreationInputTokens | numbers // null),
+                  cost_usd: (.costUSD | numbers // null)
+                };
+              {
+                request_id: $request_id,
+                product_slug: $slug,
+                agent_name: "implementer",
+                action: "run-metrics",
+                run_id: $run_id,
+                payload: {
+                  source: "implementer-callable",
+                  github_run_id: $github_run_id,
+                  github_run_attempt: $github_run_attempt,
+                  session_id: ($session_id | nz),
+                  target_kind: ($target_kind | nz),
+                  target_ref: ($target_ref | nz),
+                  model_as_chosen: ($model_as_chosen | nz),
+                  model_resolved: ($top // ($init.model | strings // null)),
+                  model_resolved_source: (if $top != null then "modelUsage"
+                                          elif ($init.model | strings // null) != null then "init"
+                                          else null end),
+                  effort: ($effort | nz),
+                  num_turns: ($r.num_turns | numbers // null),
+                  max_turns: (if ($cap | test("^[0-9]+$")) then ($cap | tonumber) else null end),
+                  result_subtype: ($r.subtype | strings // null),
+                  is_error: (if ($r.is_error | type) == "boolean" then $r.is_error else null end),
+                  stop_reason: ($r.stop_reason | strings // null),
+                  terminal_reason: ($r.terminal_reason | strings // null),
+                  duration_ms: ($r.duration_ms | numbers // null),
+                  duration_api_ms: ($r.duration_api_ms | numbers // null),
+                  total_cost_usd: ($r.total_cost_usd | numbers // null),
+                  usage: (($r.usage // null) | if type == "object" then {
+                      input_tokens: (.input_tokens | numbers // null),
+                      output_tokens: (.output_tokens | numbers // null),
+                      cache_read_input_tokens: (.cache_read_input_tokens | numbers // null),
+                      cache_creation_input_tokens: (.cache_creation_input_tokens | numbers // null)
+                    } else null end),
+                  models_used: (if $mu == null then null
+                                else ($mu | with_entries(.value |= (if type == "object" then slim else {} end))) end)
+                }
+              }' "$SRC" 2>/dev/null)"
+            [ -n "$BODY" ] && break
+          done
+          if [ -z "$BODY" ]; then
+            echo "::warning::implementer-callable: could not build the run-metrics activity record (jq failed); skipping it"
+            exit 0
+          fi
+
+          # Up to 3 attempts, only on a network failure or a 5xx: the write is idempotent on
+          # request_id, so a retry cannot double-insert, and a 4xx will not improve by repeating.
+          # --max-time so a hung hub cannot hold this product's concurrency group.
+          SENT=""
+          CODE=""
+          for attempt in 1 2 3; do
+            CODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 -X POST "${HUB}/api/v1/activity/entries" \
+              -H "Content-Type: application/json" \
+              -H "x-service-role-key: $QUEUE_SERVICE_ROLE_KEY" \
+              -H "User-Agent: aethrix-fleet-ci/1.0 (implementer-callable)" \
+              -d "$BODY")"
+            case "$CODE" in
+              2??) SENT=1; break ;;
+              4??) break ;;
+            esac
+            [ "$attempt" -lt 3 ] && sleep $((attempt * 2))
+          done
+          if [ -n "$SENT" ]; then
+            echo "::notice::implementer-callable: run-metrics activity record written (HTTP ${CODE}, run_id ${AGENT_RUN_ID})"
+          else
+            echo "::warning::implementer-callable: run-metrics activity record POST failed (last HTTP ${CODE:-none}); the run is unaffected"
+          fi
+          exit 0
+
       - name: Upload the agent transcript (failure path only)
         # The agent step runs with show_full_output: false, so the log carries the result object but
         # not the agent's final message, and the transcript is deleted with the runner's temp dir.
