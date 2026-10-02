@@ -1,0 +1,159 @@
+name: staff-engineer (callable)
+
+# Escalation triage for ONE queue entry (STANDARDS §29). The hub dispatches this once per
+# entry, BESIDE the entry's own `open` write rather than in front of it. Flow: read the
+# entry -> Guard 3 hard-limit check -> classify against the admissibility test -> write one
+# `triage-started` + one `triage-completed` activity record. SHADOW MODE (Phase 6a): it
+# mutates no queue row, re-dispatches nothing, emits no queue entry, and edits no file.
+#
+# REACHED THROUGH A PER-PRODUCT THIN STUB, never dispatched on this repo (STANDARDS §29.3,
+# §28.6). This repo is public and the org runner group sets allows_public_repositories:
+# false, so a job whose repository context is this repo is never claimed by a fleet runner:
+# it sits `queued` until GitHub expires it (~24h), every runner online and idle, no red run,
+# no log. That is why this file has `workflow_call` and NO `workflow_dispatch` — a Run
+# button here would only produce a silently-queued job. Manual runs go through a product
+# repo's stub, where they work. Do not prove changes to this file by dispatching it here.
+#
+# Requires the staff-engineer bundle vended to fleet-skills `ci/staff-engineer/`, reached
+# here at .fleet-ci/ci/staff-engineer/. Model: lite-planner-callable.yml, but DELIBERATELY
+# differs from every other callable in two ways — both worth preserving through any edit:
+#   1. NO failure handler and NO ensure-report guard. The staff engineer exists to reduce
+#      what reaches the decision queue, so a run that files its own card has failed
+#      definitionally — and shadow mode holds up no entry, so there is nothing to recover.
+#      A crash leaves a triage-started with no triage-completed (the intended signature,
+#      counted on the /staff-engineer page); a red run in the Actions tab is the alarm.
+#   2. Read-only token. contents: read + id-token: write. This agent writes no commit, opens
+#      no PR and edits no file, so it is never handed a write token.
+# The consumer repo is the entry's product, checked out at $GITHUB_WORKSPACE like every
+# other callable. A fleet-level entry dispatches the hub's stub with entry_product_slug empty.
+
+on:
+  workflow_call:
+    inputs:
+      entry_id:
+        description: "Queue entry UUID to triage. One entry per run."
+        type: string
+        required: true
+      hub_url:
+        description: "Hub base URL, passed to the agent as SE_HUB_URL. Empty falls through the skill's resolution (SE_HUB_URL, then HUB_BASE_URL, then https://sethgibson.com)."
+        type: string
+        required: false
+        default: ""
+      entry_product_slug:
+        description: "product_slug of the entry being triaged, passed to the agent as SE_ENTRY_PRODUCT_SLUG. Empty means a fleet-level entry (the hub's stub is the host repo then, and its code is incidental)."
+        type: string
+        required: false
+        default: ""
+      model:
+        description: "Claude model for the agent: an alias (sonnet|opus|haiku|fable) or an exact id. The hub normally passes this from the agent_models row; the default is only the fallback for a dispatch that omits it."
+        type: string
+        required: false
+        default: "opus"
+      effort:
+        description: "Reasoning effort for the agent: low|medium|high|xhigh|max. The hub normally passes this from the agent_models row."
+        type: string
+        required: false
+        default: "high"
+
+permissions:
+  contents: read    # checkout only — this agent commits nothing
+  id-token: write   # required by anthropics/claude-code-action@v1
+  actions: read     # the agent reads the failed run's log; without it that fetch is a 403
+                    # (first seen 2026-09-30 on a workflow-failed entry, confidence held at 0.6).
+                    # Still read-only. STANDARDS §29.3 (Dispatch contract), item 2.
+
+concurrency:
+  # Per ENTRY, not per repo: escalations from different products triage in parallel, but the
+  # same entry must never triage twice concurrently.
+  group: staff-engineer-${{ inputs.entry_id }}
+  cancel-in-progress: false
+
+jobs:
+  staff-engineer:
+    # Fleet PC (WSL2) self-hosted runner. See ~/products/docs/SELF_HOSTED_RUNNER.md.
+    # Read-only analysis, no device needed — never fleet-mac.
+    runs-on: [self-hosted, linux, fleet]
+    timeout-minutes: 20 # STANDARDS §28.6
+    steps:
+      - uses: actions/checkout@v4        # consumer repo (the entry's product) at $GITHUB_WORKSPACE
+        with:
+          fetch-depth: 0                 # limit-3 check reads the PR diff
+
+      - uses: actions/checkout@v4        # fleet-skills (CI skills under ci/)
+        with:
+          repository: Aethrix-Labs/fleet-skills
+          path: .fleet-ci
+          ref: main
+          token: ${{ secrets.FLEET_SKILLS_PAT }} # fleet-skills is private; default GITHUB_TOKEN can't cross repos
+
+      - name: Run staff-engineer agent
+        uses: anthropics/claude-code-action@v1
+        env:
+          # An INPUT here, not just a write path: without it the agent cannot read the entry.
+          QUEUE_SERVICE_ROLE_KEY: ${{ secrets.QUEUE_SERVICE_ROLE_KEY }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          SE_ENTRY_ID: ${{ inputs.entry_id }}
+          # SE_HUB_URL only — do NOT also set HUB_BASE_URL. The skill resolves
+          # SE_HUB_URL -> HUB_BASE_URL -> production (STANDARDS §8); a callable that sets only
+          # HUB_BASE_URL sends every write to production whichever hub the run was aimed at.
+          SE_HUB_URL: ${{ inputs.hub_url }}
+          SE_ENTRY_PRODUCT_SLUG: ${{ inputs.entry_product_slug }}
+          # claude-code-action exports a GitHub App installation token to the agent as
+          # GITHUB_TOKEN, and that token lacks actions: read. gh prefers GH_TOKEN, so this
+          # hands the agent's gh calls the job token (read-only, repo-scoped, actions: read
+          # from the permissions: block). See fleet-command-center/docs/STANDARDS.md §29.3 item 2.
+          # NOW REDUNDANT with `github_token` below (the action no longer mints an App token);
+          # kept for one change so a regression has one cause. Remove in a follow-up.
+          GH_TOKEN: ${{ github.token }}
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # Skips the action's OIDC -> GitHub App installation-token exchange, which would
+          # otherwise hand the agent's shell a token with write on actions, checks, code,
+          # issues, pull requests and workflows. The job token is read-only (contents: read +
+          # actions: read above). The action's input is `github_token` (rendered as
+          # OVERRIDE_GITHUB_TOKEN in its config dump). STANDARDS §29.3 item 2.
+          github_token: ${{ github.token }}
+          prompt: |
+            You are running as the **staff-engineer agent** in CI, in SHADOW MODE.
+
+            Read `.fleet-ci/ci/staff-engineer/SKILL.md` and follow it exactly.
+
+            Triage the single queue entry $SE_ENTRY_ID. Write its `triage-started` and
+            `triage-completed` activity records as the skill specifies, then exit.
+            You mutate nothing: no queue-row change, no re-dispatch, no queue entry, no
+            file edit, no PR. Failures are `::warning::` log lines, never queue entries.
+
+            Runtime context:
+            - Hub base URL: resolve per the skill ($SE_HUB_URL, then $HUB_BASE_URL, then
+              https://sethgibson.com).
+            - The product repo is the workspace root (`$GITHUB_WORKSPACE`, the current
+              directory), NOT `./product/`. Where the skill says `product_repo`,
+              `$SE_PRODUCT_REPO` or `./product/`, read it as this: there is no such variable
+              and no such directory. `.fleet-ci/` is the vended skill bundle, never evidence
+              about the entry.
+            - Entry product slug: $SE_ENTRY_PRODUCT_SLUG. This repo is $GITHUB_REPOSITORY.
+              - Empty: a fleet-level entry. The repo you are in is the hub's stub and is
+                incidental — skip every repo-derived input and classify from the packet and
+                the trail.
+              - Non-empty and it matches this repo's name: read the repo as the skill
+                describes, scoped to the step or section the entry names.
+              - Non-empty and it does NOT match this repo's name: the dispatch was
+                mis-routed. Say so in `reasoning` and in a `::warning::` naming both, lower
+                confidence, and read NO code from this repo. A confident `resolve` grounded
+                in the wrong product's source is the worst output this agent can produce.
+          claude_args: |
+            --model ${{ inputs.model }}
+            --effort ${{ inputs.effort }}
+            --max-turns 60
+            --allowedTools Read,Bash,Glob,Grep
+            # Read-only tool set: no Write/Edit (this agent edits no file). Bash is needed
+            # for the skill's curl reads/writes against the hub.
+            # Bash is deliberately BARE. A command-scoped Bash(...) list was tried 2026-09-30
+            # and failed its proof from a product stub: 9 permission denials, because the
+            # skill's own idioms (`curl "${SE_HUB_URL:-...}/api/v1/..."`, `echo "$VAR"`,
+            # printenv, ls, `$(mktemp)`) are denied even with Bash(curl:*) / Bash(echo:*)
+            # allowed. A denial is silent — a rung fails and confidence drops. STANDARDS §29.3.
+            # --max-turns 60 is a first estimate, not an observed number: one entry, a
+            # bounded evidence ladder, two record writes. Recalibrate from the first real
+            # runs; a run cut off here leaves triage-started with no triage-completed,
+            # which the /staff-engineer page counts.

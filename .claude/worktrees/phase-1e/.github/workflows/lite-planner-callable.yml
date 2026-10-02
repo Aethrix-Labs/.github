@@ -1,0 +1,177 @@
+name: lite-planner (callable)
+
+# No-design planning for an APPROVED auto-feature suggestion (STANDARDS §24.6).
+# The hub workflow_dispatches the thin per-product .github/workflows/lite-planner.yml
+# (on auto-feature approval), which `uses:` this. Flow: fetch the approved entry ->
+# Step-0 size/risk re-check (bounce if not "small") -> plan ONE no-design milestone ->
+# plan-reviewer -> commit PLANNING.md via ci-commit (low-tier auto-ship). The
+# autonomous implementer loop builds it; this skill never implements.
+#
+# Requires the lite-planner bundle vended to fleet-skills `ci/lite-planner/`,
+# reached here at .fleet-ci/ci/lite-planner/.
+
+on:
+  workflow_call:
+    inputs:
+      product_slug:
+        description: "Product slug (defaults to repo basename)."
+        type: string
+        required: false
+        default: ""
+      hub_url:
+        description: "Hub base URL for the entry fetch + queue POST. Defaults to https://sethgibson.com."
+        type: string
+        required: false
+        default: "https://sethgibson.com"
+      queue_entry_id:
+        description: "Approved auto-feature entry id; lite-planner fetches goal + recommendation (scope/acceptance) from the hub."
+        type: string
+        required: true
+      model:
+        description: "Claude model for the agent: an alias (sonnet|opus|haiku|fable) or an exact id. Chosen per run by the hub; the default is the pre-parameterization pin."
+        type: string
+        required: false
+        default: "claude-sonnet-5-5"
+      effort:
+        description: "Reasoning effort for the agent: low|medium|high|xhigh|max. Chosen per run by the hub."
+        type: string
+        required: false
+        default: "medium"
+
+permissions:
+  contents: write       # commit the PLANNING.md edit (low-tier auto-ship)
+  pull-requests: write  # ci-commit opens the PR
+  id-token: write       # required by anthropics/claude-code-action@v1
+
+concurrency:
+  # Serialize per product so two approvals can't race the PLANNING.md edit.
+  group: lite-planner-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  lite-planner:
+    # Fleet PC (WSL2) self-hosted runner. See ~/products/docs/SELF_HOSTED_RUNNER.md.
+    runs-on: [self-hosted, linux, fleet]
+    # STANDARDS §28.6. Observed max 14m; --max-turns 180 is ~60m at the implementer's
+    # worst observed ~20s/turn, so a legitimately long plan is never cut off.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4        # consumer repo at $GITHUB_WORKSPACE
+        with:
+          fetch-depth: 0                 # planner reads code + git history
+
+      - uses: actions/checkout@v4        # fleet-skills (CI skills under ci/)
+        with:
+          repository: Aethrix-Labs/fleet-skills
+          path: .fleet-ci
+          ref: main
+          token: ${{ secrets.FLEET_SKILLS_PAT }}
+
+      - name: Set up gh CLI
+        run: gh --version
+
+      - name: Configure git for commits
+        run: |
+          git config user.name  "lite-planner[bot]"
+          git config user.email "lite-planner@aethrix-labs.local"
+
+      - name: Run lite-planner agent
+        id: agent
+        uses: anthropics/claude-code-action@v1
+        env:
+          QUEUE_SERVICE_ROLE_KEY: ${{ secrets.QUEUE_SERVICE_ROLE_KEY }}
+          AUTONOMOUS_TICK_TOKEN: ${{ secrets.AUTONOMOUS_TICK_TOKEN }}
+          LP_PRODUCT_SLUG: ${{ inputs.product_slug }}
+          LP_HUB_URL: ${{ inputs.hub_url }}
+          LP_QUEUE_ENTRY_ID: ${{ inputs.queue_entry_id }}
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            You are running as the **lite-planner agent** in CI.
+
+            Read `.fleet-ci/ci/lite-planner/SKILL.md` and follow it exactly.
+
+            The APPROVED auto-feature is queue entry $LP_QUEUE_ENTRY_ID — fetch it
+            from the hub to read its `goal` (value case) and `recommendation`
+            (SCOPE + ACCEPTANCE sketch).
+
+            Step 0 safety valve: re-verify it is genuinely "small" (no new screens /
+            no design-system divergence, ONE implementer milestone, no
+            auth/payments/PII/migration). If it FAILS any clause, emit the `exception`
+            queue entry the skill specifies and STOP — do not write a plan.
+
+            Otherwise: plan ONE no-design milestone (with the `**Auto-feature:**`
+            marker), run plan-reviewer, then commit the PLANNING.md edit by reading
+            `.fleet-ci/ci/ci-commit/SKILL.md` and following it (Tier Low, auto-ship).
+            Do NOT implement — the autonomous implementer loop builds it.
+
+            Runtime context:
+            - Working directory has the full consumer repo (fetch-depth: 0).
+            - Product slug: $LP_PRODUCT_SLUG (or derive from $GITHUB_REPOSITORY).
+            - Hub base URL: $LP_HUB_URL.
+          claude_args: |
+            --model ${{ inputs.model }}
+            --effort ${{ inputs.effort }}
+            --max-turns 180
+            --allowedTools Read,Bash,Write,Edit,Glob,Grep
+            # --max-turns 180 matches implementer-callable. lite-planner shares the
+            # same commit tax (plan-reviewer up to 3 passes -> ci-commit ->
+            # canonical-doc-update across docs -> tier-classify) plus open-ended
+            # repo exploration to map the candidate; 80 left no headroom and a
+            # correctly-sized small auto-feature still over-ran it (run 27623308777,
+            # 2026-06-16). Raised 80 -> 100 on 2026-06-16, 100 -> 180 on 2026-07-07
+            # (parity with the implementer's 130 -> 180 turn-budget recalibration).
+            # The durable fix is the skill's Step-0 cheap bounce + bounded
+            # exploration (and plan-reviewer's margin sizing), not raising further.
+
+      - name: Emit failure queue entry on agent death
+        # The agent step died (max-turns, crash, infra) before its own exit path —
+        # surface it in the decision queue so an approved auto-feature doesn't vanish.
+        if: failure() && steps.agent.outcome == 'failure'
+        env:
+          QUEUE_SERVICE_ROLE_KEY: ${{ secrets.QUEUE_SERVICE_ROLE_KEY }}
+          LP_PRODUCT_SLUG: ${{ inputs.product_slug }}
+          LP_HUB_URL: ${{ inputs.hub_url }}
+          LP_QUEUE_ENTRY_ID: ${{ inputs.queue_entry_id }}
+        run: |
+          SLUG="${LP_PRODUCT_SLUG:-$(basename "$GITHUB_REPOSITORY")}"
+          HUB="${LP_HUB_URL:-https://sethgibson.com}"
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+          # Phase breadcrumb — the agent overwrites this single-line marker at each
+          # phase boundary (lite-planner SKILL.md "Phase breadcrumb"). On a
+          # max-turns/crash death the agent never reached its exit path, so this
+          # file is the only signal for WHERE it died. Localizes the failure to a
+          # phase (fetch | size-recheck | mapping | planning | adversary |
+          # committing) instead of a bare death. Absent → "unknown". Mirrors
+          # implementer-callable's handler (2026-06-16 parity).
+          PHASE_FILE="${GITHUB_WORKSPACE:-.}/.lite-planner-phase"
+          LAST_PHASE="unknown"
+          if [ -f "$PHASE_FILE" ]; then
+            LAST_PHASE="$(tr -d '\r\n' < "$PHASE_FILE" | head -c 200)"
+          fi
+          echo "::notice::lite-planner-callable: workflow failed at phase=${LAST_PHASE}"
+
+          if [ -n "$QUEUE_SERVICE_ROLE_KEY" ]; then
+            REQUEST_ID=$(printf '%s' "${GITHUB_RUN_ID}lite-planner-failed" | sha256sum | cut -d' ' -f1)
+            curl -sf -X POST "${HUB}/api/v1/queue/entries" \
+              -H "Content-Type: application/json" \
+              -H "x-service-role-key: $QUEUE_SERVICE_ROLE_KEY" \
+              -H "User-Agent: aethrix-fleet-ci/1.0 (lite-planner-callable)" \
+              -d "{
+                \"request_id\": \"$REQUEST_ID\",
+                \"entry_type\": \"exception\",
+                \"variant\": \"lite-planner-failed\",
+                \"agent_name\": \"lite-planner\",
+                \"product_slug\": \"$SLUG\",
+                \"title\": \"[$SLUG] lite-planner failed on auto-feature ${LP_QUEUE_ENTRY_ID}\",
+                \"goal\": \"Plan the approved auto-feature into one no-design milestone\",
+                \"attempts\": [\"claude-code-action step failed (max-turns, crash, or infra error) before the skill's own exit path. Last phase reached: ${LAST_PHASE}. Run: $RUN_URL\"],
+                \"artifacts\": [{\"label\": \"Workflow run\", \"href\": \"$RUN_URL\", \"artifact_type\": \"doc\"}],
+                \"ask\": \"Inspect the run log; re-plan manually or re-dispatch\",
+                \"recommendation\": \"Died at phase '${LAST_PHASE}'. mapping → exploration likely over-ran the budget (the candidate's scope/acceptance is the plan — don't re-derive the whole repo); planning/adversary → the candidate may not be 'small' (Step 0 should have bounced it to feature-spec / design) or the plan-reviewer loop is thrashing; committing → check the ci-commit / canonical-doc-update tail. If the candidate was genuinely too big for auto-feature, route it to feature-spec / design instead.\"
+              }" \
+            || echo "::warning::lite-planner-callable: failure queue-entry POST failed"
+          else
+            echo "::warning::lite-planner-callable: QUEUE_SERVICE_ROLE_KEY missing; skipping failure queue entry"
+          fi

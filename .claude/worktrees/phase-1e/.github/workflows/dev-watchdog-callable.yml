@@ -1,0 +1,361 @@
+name: dev-watchdog (callable)
+
+# Daily per-product development health check (STANDARDS §24; SYSTEM_VISION Phase 14).
+# The thin per-product .github/workflows/dev-watchdog.yml (cron + workflow_dispatch)
+# `uses:` this. Flow (revised 2026-09-20, STANDARDS §24.1-24.2b):
+#   flags -> gate (local docs: PLANNING/BACKLOG/ROUTING_BOARD) -> open-queue-entries
+#   check (only when the gate said the product looks idle) -> decide: signals-pending
+#   (from either source) -> debrief (no LLM); else idle -> recommender (deferred-scan
+#   only) -> proposer. Doc reconciliation runs every day, unconditionally, as long as
+#   the product isn't pre-build — independent of the signals-pending/idle branch.
+#
+# Requires the dev-watchdog bundle vended to fleet-skills `ci/dev-watchdog/`
+# (SKILL.md, gate.sh, brief_collect.py, debrief_emit.py), reached here at
+# .fleet-ci/ci/dev-watchdog/.
+
+on:
+  workflow_call:
+    inputs:
+      product_slug:
+        description: "Product slug (defaults to repo basename)."
+        type: string
+        required: false
+        default: ""
+      hub_url:
+        description: "Hub base URL for the queue GET/POST. Defaults to https://sethgibson.com."
+        type: string
+        required: false
+        default: "https://sethgibson.com"
+      # The three agent steps are tuned independently (MODEL_SELECTION_PROPOSAL §5); the
+      # effort defaults differ on purpose — do not collapse them to one value.
+      doc_reconciliation_model:
+        description: "Claude model for the doc-reconciliation step: an alias (sonnet|opus|haiku|fable) or an exact id."
+        type: string
+        required: false
+        default: "claude-sonnet-5-5"
+      doc_reconciliation_effort:
+        description: "Reasoning effort for the doc-reconciliation step: low|medium|high|xhigh|max."
+        type: string
+        required: false
+        default: "medium"
+      recommender_model:
+        description: "Claude model for the recommender step: an alias (sonnet|opus|haiku|fable) or an exact id."
+        type: string
+        required: false
+        default: "claude-sonnet-5-5"
+      recommender_effort:
+        description: "Reasoning effort for the recommender step: low|medium|high|xhigh|max."
+        type: string
+        required: false
+        default: "low"
+      proposer_model:
+        description: "Claude model for the proposer step: an alias (sonnet|opus|haiku|fable) or an exact id."
+        type: string
+        required: false
+        default: "claude-sonnet-5-5"
+      proposer_effort:
+        description: "Reasoning effort for the proposer step: low|medium|high|xhigh|max."
+        type: string
+        required: false
+        default: "high"
+
+permissions:
+  contents: write       # open the low-tier drift-reconciliation PR
+  pull-requests: write  # gh pr create for the drift PR
+  id-token: write       # required by anthropics/claude-code-action@v1
+
+concurrency:
+  # Serialize per product; a cron run and a manual dispatch must not race the
+  # drift branch/PR. Queue waits rather than cancelling an in-flight run.
+  group: dev-watchdog-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  dev-watchdog:
+    # Fleet PC (WSL2) self-hosted runner — agentic jobs run locally to avoid
+    # GitHub-hosted minute billing. See ~/products/docs/SELF_HOSTED_RUNNER.md.
+    runs-on: [self-hosted, linux, fleet]
+    # STANDARDS §28.6. Observed max 16m (successes <=12m); the three agent steps cap at
+    # 140 turns total, ~47m at the implementer's worst observed ~20s/turn.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4        # consumer repo at $GITHUB_WORKSPACE
+        with:
+          fetch-depth: 0                 # recommender reads git log / history
+
+      - uses: actions/checkout@v4        # fleet-skills (CI skills under ci/)
+        with:
+          repository: Aethrix-Labs/fleet-skills
+          path: .fleet-ci
+          ref: main
+          token: ${{ secrets.FLEET_SKILLS_PAT }}
+
+      - name: Set up gh CLI
+        run: gh --version                # preinstalled on ubuntu-latest
+
+      - name: Configure git for commits
+        run: |
+          git config user.name  "dev-watchdog[bot]"
+          git config user.email "dev-watchdog@aethrix-labs.local"
+
+      # ---- Per-product toggles (master switch + feature flags), STANDARDS §24.4 ----
+      - name: Fetch watchdog flags
+        id: flags
+        env:
+          QUEUE_SERVICE_ROLE_KEY: ${{ secrets.QUEUE_SERVICE_ROLE_KEY }}
+          HUB_URL: ${{ inputs.hub_url }}
+          PRODUCT_SLUG: ${{ inputs.product_slug }}
+        run: |
+          SLUG="${PRODUCT_SLUG:-$(basename "$GITHUB_REPOSITORY")}"
+          HUB="${HUB_URL:-https://sethgibson.com}"
+          # On a reachable 200, parse-flags.sh normalizes the body: it defaults
+          # ONLY on a null/absent field and PRESERVES an explicit `false`. (Do NOT
+          # inline `jq -r '.watchdog_enabled // true'` here — jq's `//` coalesces a
+          # literal false to its default, which silently ignored the master OFF
+          # switch and ran the watchdog anyway. See parse-flags.sh.)
+          # Fail-safe on any fetch error: master ON, features OFF (suppress
+          # net-new) — a hub outage must never trigger an auto-build (§24.4).
+          if RESP=$(curl -sf "${HUB}/api/v1/watchdog/flags?product=${SLUG}" \
+                      -H "x-service-role-key: ${QUEUE_SERVICE_ROLE_KEY}"); then
+            FLAGS="$(printf '%s' "$RESP" | bash .fleet-ci/ci/dev-watchdog/parse-flags.sh)"
+          else
+            echo "::warning::dev-watchdog: flags fetch failed — net-new suppressed"
+            FLAGS=$'watchdog_enabled=true\nauto_feature_enabled=false\ninspiration_enabled=false'
+          fi
+          printf '%s\n' "$FLAGS" >> "$GITHUB_OUTPUT"
+          echo "flags: $(printf '%s' "$FLAGS" | tr '\n' ' ')"
+
+      # ---- Phase 0: cheap, deterministic local-docs gate (no LLM), STANDARDS §24.1 ----
+      - name: Gate
+        id: gate
+        if: steps.flags.outputs.watchdog_enabled == 'true'
+        run: |
+          DIGEST="$RUNNER_TEMP/dev-watchdog-digest.json"
+          DECISION="$(bash .fleet-ci/ci/dev-watchdog/gate.sh "$GITHUB_WORKSPACE" "$DIGEST" 2>/tmp/gate.err)"
+          cat /tmp/gate.err || true
+          echo "decision=$DECISION" >> "$GITHUB_OUTPUT"
+          echo "digest_path=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "dev-watchdog gate decision: $DECISION"
+
+      # ---- Open queue-entries check (STANDARDS §24.1) — only meaningful when the
+      # local gate says the product looks idle. Any open entry for this product,
+      # of any entry_type (a milestone-test pointer, a stale suggestion, anything),
+      # overrides `recommend` to the same signals-pending outcome as the "Decide"
+      # step below. Not the old entry_type=follow-up-only precheck — that shape
+      # was never actually valid against the endpoint (always 400'd, so the old
+      # precheck always silently proceeded); this uses the endpoint's generalized
+      # no-entry_type shape instead. ----
+      - name: Open queue-entries check
+        id: queuecheck
+        if: steps.gate.outputs.decision == 'recommend'
+        env:
+          QUEUE_SERVICE_ROLE_KEY: ${{ secrets.QUEUE_SERVICE_ROLE_KEY }}
+          HUB_URL: ${{ inputs.hub_url }}
+          PRODUCT_SLUG: ${{ inputs.product_slug }}
+        run: |
+          SLUG="${PRODUCT_SLUG:-$(basename "$GITHUB_REPOSITORY")}"
+          HUB="${HUB_URL:-https://sethgibson.com}"
+          ENTRIES_OUT="$RUNNER_TEMP/dev-watchdog-open-entries.json"
+          if [ -z "$QUEUE_SERVICE_ROLE_KEY" ]; then
+            echo "::warning::dev-watchdog: QUEUE_SERVICE_ROLE_KEY missing; skipping open-entry check (treating as none open)"
+            echo '{"count":0,"entries":[]}' > "$ENTRIES_OUT"
+            echo "open_count=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          RESP="$(curl -s "${HUB}/api/v1/queue/entries?product=${SLUG}&status=open" \
+            -H "x-service-role-key: $QUEUE_SERVICE_ROLE_KEY")"
+          printf '%s' "$RESP" > "$ENTRIES_OUT"
+          COUNT="$(printf '%s' "$RESP" | jq -r '.count // 0' 2>/dev/null || echo 0)"
+          echo "open queue entries for ${SLUG}: ${COUNT}"
+          echo "open_count=${COUNT:-0}" >> "$GITHUB_OUTPUT"
+
+      # ---- Decide: signals-pending (debrief) vs. genuinely idle. STANDARDS §24.1 ----
+      - name: Decide
+        id: decide
+        if: steps.flags.outputs.watchdog_enabled == 'true' && steps.gate.outputs.decision != 'pre-build'
+        run: |
+          DECISION="${{ steps.gate.outputs.decision }}"
+          QCOUNT="${{ steps.queuecheck.outputs.open_count }}"
+          if [ "$DECISION" = "signals-pending" ] || [ "${QCOUNT:-0}" -gt 0 ]; then
+            echo "path=debrief" >> "$GITHUB_OUTPUT"
+          else
+            echo "path=idle" >> "$GITHUB_OUTPUT"
+          fi
+          echo "dev-watchdog decide: gate=$DECISION open_queue_entries=${QCOUNT:-0}"
+
+      # ---- Debrief (no LLM), STANDARDS §24.1a. Deterministic — built from the
+      # gate's digest + the open-entries list, never an LLM call. ----
+      - name: Debrief
+        if: steps.decide.outputs.path == 'debrief'
+        env:
+          QUEUE_SERVICE_ROLE_KEY: ${{ secrets.QUEUE_SERVICE_ROLE_KEY }}
+          HUB_URL: ${{ inputs.hub_url }}
+          PRODUCT_SLUG: ${{ inputs.product_slug }}
+        run: |
+          SLUG="${PRODUCT_SLUG:-$(basename "$GITHUB_REPOSITORY")}"
+          python3 .fleet-ci/ci/dev-watchdog/debrief_emit.py \
+            --digest "${{ steps.gate.outputs.digest_path }}" \
+            --open-entries "$RUNNER_TEMP/dev-watchdog-open-entries.json" \
+            --product-slug "$SLUG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --hub-url "${HUB_URL:-https://sethgibson.com}" \
+            --service-role-key "$QUEUE_SERVICE_ROLE_KEY"
+
+      # ---- Doc reconciliation (Sonnet, every day, unconditional), STANDARDS §24.2.
+      # Runs regardless of signals-pending vs. idle — only pre-build (nothing
+      # shipped yet, no reconciliation target) and the master switch gate it. ----
+      - name: Doc reconciliation
+        if: steps.flags.outputs.watchdog_enabled == 'true' && steps.gate.outputs.decision != 'pre-build'
+        uses: anthropics/claude-code-action@v1
+        env:
+          DEV_WATCHDOG_PRODUCT_SLUG: ${{ inputs.product_slug }}
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            You are running as the **dev-watchdog doc-reconciliation** step in CI.
+
+            Read `.fleet-ci/ci/dev-watchdog/SKILL.md`'s "Doc reconciliation" section
+            and follow it exactly. This is a standing daily hygiene pass — it runs
+            regardless of whether the product has open PLANNING/BACKLOG/ROUTING_BOARD
+            work or is fully idle. Do ONLY the continuity-drift sweep of the canonical
+            docs OTHER than PLANNING.md boxes (stale LIFECYCLE stage:/next_milestone:,
+            LIFECYCLE body bloat, PRD<->design contradictions, DECISIONS lines
+            contradicting what shipped, flagged PLANNING "Open questions"). Do NOT
+            scan for deferred work, do NOT touch PLANNING.md boxes, do NOT post any
+            queue entry — that's handled by separate steps in this same workflow run.
+
+            Runtime context:
+            - Working directory has the full consumer repo (fetch-depth: 0).
+            - Product slug: $DEV_WATCHDOG_PRODUCT_SLUG (or derive from $GITHUB_REPOSITORY).
+
+            CARDINALITY (hard limit, STANDARDS §24.7): this step may open AT MOST ONE
+            doc-only drift PR. If several drifts exist, fix them all in that one PR.
+            If nothing is faithfully reconcilable, open no PR — don't guess.
+          claude_args: |
+            --model ${{ inputs.doc_reconciliation_model }}
+            --effort ${{ inputs.doc_reconciliation_effort }}
+            --max-turns 40
+            --allowedTools Read,Bash,Write,Edit,Glob,Grep
+
+      # ---- Phase 1: Sonnet recommender — deferred-work scan only (idle path,
+      # nothing already pending). STANDARDS §24.2b. ----
+      - name: Run recommender
+        id: recommender
+        if: steps.decide.outputs.path == 'idle'
+        uses: anthropics/claude-code-action@v1
+        env:
+          QUEUE_SERVICE_ROLE_KEY: ${{ secrets.QUEUE_SERVICE_ROLE_KEY }}
+          DEV_WATCHDOG_PRODUCT_SLUG: ${{ inputs.product_slug }}
+          DEV_WATCHDOG_HUB_URL: ${{ inputs.hub_url }}
+          DEV_WATCHDOG_AUTO_FEATURE_ENABLED: ${{ steps.flags.outputs.auto_feature_enabled }}
+          DEV_WATCHDOG_INSPIRATION_ENABLED: ${{ steps.flags.outputs.inspiration_enabled }}
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            You are running as the **dev-watchdog recommender** in CI.
+
+            Read `.fleet-ci/ci/dev-watchdog/SKILL.md` and follow its "Recommender"
+            section exactly.
+
+            The signals check already confirmed: this product is built-out and idle,
+            PLANNING/BACKLOG/ROUTING_BOARD are all clear, and there are zero open
+            queue entries for it — so do NOT re-scan any of those, and do NOT do doc
+            reconciliation (a separate step in this run already handles that). Run
+            ONLY the deferred-work scan (PRD Post-MVP, PLANNING Out-of-scope items
+            flagged "earns a feature-spec", an un-planned docs/specs/FEATURE_*.md,
+            noted design-system divergence) and, if nothing is deferred, the
+            graduate/maintenance/sunset fallback ONLY if BOTH feature toggles are off
+            (auto_feature=$DEV_WATCHDOG_AUTO_FEATURE_ENABLED,
+            inspiration=$DEV_WATCHDOG_INSPIRATION_ENABLED); if either is on, emit
+            nothing and let the proposer handle the nothing-deferred path.
+
+            Runtime context:
+            - Working directory has the full consumer repo (fetch-depth: 0).
+            - Product slug: $DEV_WATCHDOG_PRODUCT_SLUG (or derive from $GITHUB_REPOSITORY).
+            - Hub base URL: $DEV_WATCHDOG_HUB_URL (queue POST per STANDARDS §8).
+
+            CARDINALITY (hard limit, STANDARDS §24.7): this step may POST AT MOST ONE
+            follow-up queue entry. If several deferred items exist, pick the single
+            highest-priority one. POST exactly once, then STOP — do NOT POST a second
+            entry for another framing of the same finding, a reworded variant, or a
+            different finding. Do not author PLANNING.md steps or net-new committed
+            scope. Do not open a PR — that's the doc-reconciliation step's job, not
+            this one's.
+          claude_args: |
+            --model ${{ inputs.recommender_model }}
+            --effort ${{ inputs.recommender_effort }}
+            --max-turns 40
+            --allowedTools Read,Bash,Glob,Grep
+
+      # ---- Phase 2: proposer — nothing-deferred net-new ideation (STANDARDS §24.6) ----
+      # Realizes dev-watchdog's "nothing deferred" branch. Only dispatched on the
+      # idle path (decide.path == 'idle'), i.e. only after the signals check has
+      # already deterministically confirmed zero local signals and zero open queue
+      # entries for this product (STANDARDS §24.7, revised 2026-09-20 — this used
+      # to run independent of any precheck; it no longer does). Writes no code ->
+      # no Write/Edit tools. ----
+      - name: Run proposer
+        if: >
+          steps.decide.outputs.path == 'idle' &&
+          (steps.flags.outputs.auto_feature_enabled == 'true' ||
+           steps.flags.outputs.inspiration_enabled == 'true')
+        uses: anthropics/claude-code-action@v1
+        env:
+          QUEUE_SERVICE_ROLE_KEY: ${{ secrets.QUEUE_SERVICE_ROLE_KEY }}
+          PROPOSER_PRODUCT_SLUG: ${{ inputs.product_slug }}
+          PROPOSER_HUB_URL: ${{ inputs.hub_url }}
+          PROPOSER_AUTO_FEATURE_ENABLED: ${{ steps.flags.outputs.auto_feature_enabled }}
+          PROPOSER_INSPIRATION_ENABLED: ${{ steps.flags.outputs.inspiration_enabled }}
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            You are running as the **proposer agent** in CI.
+
+            Read `.fleet-ci/ci/proposer/SKILL.md` and follow it exactly.
+
+            The signals check already confirmed the product is built-out, idle, and
+            nothing is deferred or already pending — proceed straight to ideation.
+            Emit ONLY the enabled entry types:
+              - auto_feature_enabled = $PROPOSER_AUTO_FEATURE_ENABLED
+              - inspiration_enabled  = $PROPOSER_INSPIRATION_ENABLED
+            Dedup by candidate-fingerprint. Ideate only — never plan, design, or build.
+
+            CARDINALITY (hard limit, STANDARDS §24.7): POST AT MOST ONE entry per
+            enabled type — the single best auto-feature and/or the single best
+            inspiration. Pick the one best candidate per type; this is not a
+            backlog dump. POST once per enabled type, then STOP — do NOT POST a
+            second candidate of the same type, even a different idea.
+
+            Runtime context:
+            - Working directory has the full consumer repo (fetch-depth: 0).
+            - Product slug: $PROPOSER_PRODUCT_SLUG (or derive from $GITHUB_REPOSITORY).
+            - Hub base URL: $PROPOSER_HUB_URL (queue POST per STANDARDS §8).
+          claude_args: |
+            --model ${{ inputs.proposer_model }}
+            --effort ${{ inputs.proposer_effort }}
+            --max-turns 60
+            --allowedTools Read,Bash,Glob,Grep
+
+      # ---- Summary for the bail paths (no LLM spent) ----
+      - name: Summary
+        if: always()
+        run: |
+          if [ "${{ steps.flags.outputs.watchdog_enabled }}" != "true" ]; then
+            echo "Bailed: watchdog_enabled is off for this product (master switch)."
+            exit 0
+          fi
+          D="${{ steps.gate.outputs.decision }}"
+          case "$D" in
+            pre-build) echo "Bailed: pre-build — early-phase skills own this product. No doc reconciliation, no debrief." ;;
+            signals-pending|recommend)
+              echo "Doc reconciliation ran (every day, per STANDARDS §24.2)."
+              if [ "${{ steps.decide.outputs.path }}" = "debrief" ]; then
+                echo "Signals pending (gate=$D, open queue entries=${{ steps.queuecheck.outputs.open_count || 0 }}) — posted/refreshed the debrief."
+              else
+                echo "Idle, nothing pending: ran the recommender."
+                if [ "${{ steps.flags.outputs.auto_feature_enabled }}" = "true" ] || [ "${{ steps.flags.outputs.inspiration_enabled }}" = "true" ]; then
+                  echo "Proposer step ran (net-new ideation, per toggles)."
+                fi
+              fi ;;
+            *) echo "Gate returned: '$D'." ;;
+          esac
