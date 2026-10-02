@@ -78,6 +78,14 @@ jobs:
     # STANDARDS §28.6. Observed max 16m (successes <=12m); the three agent steps cap at
     # 140 turns total, ~47m at the implementer's worst observed ~20s/turn.
     timeout-minutes: 60
+    env:
+      # One source per step for its turn cap: the step's own --max-turns and the
+      # calibration record's max_turns both read these (the implementer-callable
+      # AGENT_MAX_TURNS pattern). The three values differ on purpose and sum to the
+      # 140 the job timeout above is reasoned against - do not collapse them.
+      DOC_RECONCILIATION_MAX_TURNS: "40"
+      RECOMMENDER_MAX_TURNS: "40"
+      PROPOSER_MAX_TURNS: "60"
     steps:
       - uses: actions/checkout@v4        # consumer repo at $GITHUB_WORKSPACE
         with:
@@ -205,6 +213,11 @@ jobs:
       # Runs regardless of signals-pending vs. idle — only pre-build (nothing
       # shipped yet, no reconciliation target) and the master switch gate it. ----
       - name: Doc reconciliation
+        # id: so the calibration step can read THIS step's own execution_file and
+        # outcome. Every claude-code-action invocation in this job defaults to the same
+        # $RUNNER_TEMP/claude-execution-output.json, so the three overwrite each other -
+        # per-step outputs are the only correct source. Do not remove.
+        id: doc-reconciliation
         if: steps.flags.outputs.watchdog_enabled == 'true' && steps.gate.outputs.decision != 'pre-build'
         uses: anthropics/claude-code-action@v1
         env:
@@ -234,7 +247,7 @@ jobs:
           claude_args: |
             --model ${{ inputs.doc_reconciliation_model }}
             --effort ${{ inputs.doc_reconciliation_effort }}
-            --max-turns 40
+            --max-turns ${{ env.DOC_RECONCILIATION_MAX_TURNS }}
             --allowedTools Read,Bash,Write,Edit,Glob,Grep
 
       # ---- Phase 1: Sonnet recommender — deferred-work scan only (idle path,
@@ -284,7 +297,7 @@ jobs:
           claude_args: |
             --model ${{ inputs.recommender_model }}
             --effort ${{ inputs.recommender_effort }}
-            --max-turns 40
+            --max-turns ${{ env.RECOMMENDER_MAX_TURNS }}
             --allowedTools Read,Bash,Glob,Grep
 
       # ---- Phase 2: proposer — nothing-deferred net-new ideation (STANDARDS §24.6) ----
@@ -295,6 +308,9 @@ jobs:
       # to run independent of any precheck; it no longer does). Writes no code ->
       # no Write/Edit tools. ----
       - name: Run proposer
+        # id: for the calibration step's per-step execution_file / outcome - see the
+        # Doc reconciliation step's note. Do not remove.
+        id: proposer
         if: >
           steps.decide.outputs.path == 'idle' &&
           (steps.flags.outputs.auto_feature_enabled == 'true' ||
@@ -333,8 +349,271 @@ jobs:
           claude_args: |
             --model ${{ inputs.proposer_model }}
             --effort ${{ inputs.proposer_effort }}
-            --max-turns 60
+            --max-turns ${{ env.PROPOSER_MAX_TURNS }}
             --allowedTools Read,Bash,Glob,Grep
+
+      - name: Record each agent step's model and turns (calibration)
+        id: record-run-metrics
+        # MODEL_CALIBRATION_PROPOSAL §3.7 / §3.4: the workflow-side producer minimum for
+        # dev-watchdog. §3.4 is the reason this agent is instrumented at all - its three steps
+        # run at three different efforts on fixed, repeating, near-identical work, which is the
+        # fleet's only free effort contrast. The agent cannot write these: claude-code-action
+        # writes each result object AFTER that step's session ends, so no agent can read its own
+        # num_turns. Do not move this into a skill.
+        #
+        # ONE record per agent step that ACTUALLY RAN. The three steps are conditional and
+        # largely mutually exclusive (doc-reconciliation on most runs, recommender only on the
+        # idle path, proposer only on idle plus a toggle), and the bail paths mean some runs run
+        # no LLM step at all. Zero records on a bail path is correct, not a gap.
+        #
+        # *** THE OVERWRITE TRAP. Every claude-code-action invocation defaults to writing
+        # $RUNNER_TEMP/claude-execution-output.json, so these three sequential steps in one job
+        # overwrite each other. Reading that default path at job end yields the LAST step's
+        # result, which would then be attributed to whichever step the reader had in mind. Each
+        # record therefore reads ONLY its own step's steps.<id>.outputs.execution_file, and there
+        # is deliberately NO fallback to the default path (implementer-callable can afford that
+        # fallback; it has one agent step in its job). An empty execution_file yields a record
+        # with every result-derived field null, which is the honest answer. ***
+        #
+        # Observability, not a gate (STANDARDS §18.2): every failure path warns and continues,
+        # the step never exits non-zero, and continue-on-error backstops the rest. Nothing here
+        # can reach the flags/gate/decide logic, the drift PR, the queue entries or the Summary.
+        if: always()
+        continue-on-error: true
+        # 10, not #58's 5: this step writes up to THREE records, and each one costs up to
+        # 3 curl attempts x 20s --max-time plus backoff (~66s). At 5 minutes a slow hub could
+        # time the step out midway, and because it is continue-on-error the job would still
+        # pass - silently dropping the LATER records and biasing the data toward
+        # doc-reconciliation, which is emitted first.
+        timeout-minutes: 10
+        env:
+          QUEUE_SERVICE_ROLE_KEY: ${{ secrets.QUEUE_SERVICE_ROLE_KEY }}
+          WATCHDOG_PRODUCT_SLUG: ${{ inputs.product_slug }}
+          WATCHDOG_HUB_URL: ${{ inputs.hub_url }}
+          # Per step: did it run, where is ITS result object, and the model/effort it ran on.
+          # The models and efforts are the chosen values verbatim (an alias or an exact id), not
+          # the resolution. The turn caps are NOT repeated here - the job env above is already in
+          # every step's shell, so the script reads *_MAX_TURNS straight from it, which is the
+          # same thing the steps' own --max-turns reads (one source, no second copy to drift).
+          DOC_OUTCOME: ${{ steps.doc-reconciliation.outcome }}
+          DOC_EXEC_FILE: ${{ steps.doc-reconciliation.outputs.execution_file }}
+          DOC_MODEL: ${{ inputs.doc_reconciliation_model }}
+          DOC_EFFORT: ${{ inputs.doc_reconciliation_effort }}
+          REC_OUTCOME: ${{ steps.recommender.outcome }}
+          REC_EXEC_FILE: ${{ steps.recommender.outputs.execution_file }}
+          REC_MODEL: ${{ inputs.recommender_model }}
+          REC_EFFORT: ${{ inputs.recommender_effort }}
+          PROP_OUTCOME: ${{ steps.proposer.outcome }}
+          PROP_EXEC_FILE: ${{ steps.proposer.outputs.execution_file }}
+          PROP_MODEL: ${{ inputs.proposer_model }}
+          PROP_EFFORT: ${{ inputs.proposer_effort }}
+        run: |
+          # Nothing below may fail the run. -e is on by default for this shell; turn it off so a
+          # failed jq/curl reaches its own warning instead of ending the step silently.
+          set +e
+
+          if [ -z "$QUEUE_SERVICE_ROLE_KEY" ]; then
+            echo "::warning::dev-watchdog: QUEUE_SERVICE_ROLE_KEY missing; skipping the run-metrics activity records"
+            exit 0
+          fi
+          if ! command -v jq >/dev/null 2>&1; then
+            echo "::warning::dev-watchdog: jq is not on PATH for this runner; skipping the run-metrics activity records"
+            exit 0
+          fi
+          # sha256sum is GNU coreutils; the macOS runner may only have shasum.
+          if command -v sha256sum >/dev/null 2>&1; then
+            SHA="sha256sum"
+          elif command -v shasum >/dev/null 2>&1; then
+            SHA="shasum -a 256"
+          else
+            echo "::warning::dev-watchdog: no sha256 tool on PATH; skipping the run-metrics activity records"
+            exit 0
+          fi
+
+          SLUG="${WATCHDOG_PRODUCT_SLUG:-$(basename "$GITHUB_REPOSITORY")}"
+          HUB="${WATCHDOG_HUB_URL:-https://sethgibson.com}"
+          ATTEMPT_NO="${GITHUB_RUN_ATTEMPT:-1}"
+
+          # ---- run_id: dev-watchdog declares its own scheme (STANDARDS §18.1a) ----
+          # dev-watchdog is NOT a dispatched build loop: it has no target_ref to hash, no
+          # session, and no .dev-watchdog-run-id breadcrumb (it needs none - no CI guard files
+          # packets for a dead watchdog step). The hub requires a non-empty run_id, so it
+          # declares its own, in the §18.1a family shape of repo + what the run is keyed to:
+          #
+          #   run_id = sha256("<owner>/<repo>" + "dev-watchdog" + "<github_run_id>:<attempt>")
+          #
+          # ONE id per watchdog run, shared by all three records, because §18.1 defines run_id
+          # as what correlates the records of a single run - and a watchdog run IS one run that
+          # happens to spend up to three agent steps. Three unrelated ids would make the one
+          # query §3.4 exists for (compare the three efforts within one run) impossible.
+          #
+          # The workflow-run id appears here as the run-keying component, NOT as a substitute
+          # for run_id (§18.1a). For a scheduled single-job watchdog the workflow run and the
+          # agent loop are 1:1 - unlike the implementer, whose session spans up to three
+          # workflow runs on one target - so this names the loop rather than keying to nothing,
+          # and it stays reconstructible by a second reader holding only the run URL.
+          # The attempt is inside the id on purpose: a re-run of a scheduled scan is a genuinely
+          # fresh scan, not a resumption, so each attempt is its own lineage. That sidesteps the
+          # §18.1a rerun-collision limit rather than inheriting it. Hashing the repo in keeps the
+          # id from colliding across products, and the literal agent name keeps it from colliding
+          # with any other agent that might key off the same workflow run.
+          RUN_ID="$(printf '%s' "${GITHUB_REPOSITORY}dev-watchdog${GITHUB_RUN_ID}:${ATTEMPT_NO}" | $SHA | cut -d' ' -f1)"
+
+          WROTE=0
+          SKIPPED=0
+
+          # emit_record <step-key> <step-outcome> <execution-file> <model> <effort> <max-turns>
+          emit_record() {
+            STEP_KEY="$1"; STEP_OUTCOME="$2"; EXEC_FILE="$3"
+            STEP_MODEL="$4"; STEP_EFFORT="$5"; STEP_CAP="$6"
+
+            # A step that did not run has nothing to calibrate. `skipped` is its `if:` evaluating
+            # false; an empty outcome is a step the runner never reached at all.
+            if [ -z "$STEP_OUTCOME" ] || [ "$STEP_OUTCOME" = "skipped" ]; then
+              SKIPPED=$((SKIPPED + 1))
+              return 0
+            fi
+
+            # request_id = implementer-callable #58's formula with the STEP KEY added. Without it
+            # the formula is identical for all three records (one shared run_id, one action, one
+            # workflow run and attempt) and the hub would dedup three real records into one
+            # server-side. The run id and attempt are kept for shape-parity with #58.
+            REQUEST_ID="$(printf '%s' "${RUN_ID}run-metrics${STEP_KEY}${GITHUB_RUN_ID}:${ATTEMPT_NO}" | $SHA | cut -d' ' -f1)"
+
+            # ONLY this step's own result object. No default-path fallback - see the trap note.
+            SRC="/dev/null"
+            if [ -n "$EXEC_FILE" ] && [ -f "$EXEC_FILE" ]; then
+              SRC="$EXEC_FILE"
+            else
+              echo "::notice::dev-watchdog: no result object for step ${STEP_KEY} (execution_file '${EXEC_FILE:-unset}'); recording the chosen model and effort with every result field null"
+            fi
+
+            # The whole body is built by jq, so nothing from the transcript or the inputs is ever
+            # spliced into JSON by the shell. Every result-derived field is null when the object,
+            # or that field in it, is absent or the wrong type: absent is "unknown", never 0 (§4).
+            # The result file is a JSON array of SDK messages (or an object stream); take the last
+            # {"type":"result"} and the system/init message.
+            #
+            # model_resolved is the key of modelUsage with the highest costUSD: the model that
+            # actually served the bulk of the tokens, ground truth needing no trust in the agent
+            # (§3.3 a). modelUsage also lists small helper models, so the highest-cost key, not
+            # "the only key", is the primary. The init message model is the fallback, and
+            # model_resolved_source says which was used so a null resolution is distinguishable
+            # from an unexamined one; models_used keeps the full per-model breakdown.
+            # Two jq traps, both bitten in #58 testing: the "alternative" operator treats false as
+            # absent (so is_error is typed explicitly rather than defaulted), and the program is
+            # single-quoted shell, so it must never contain an apostrophe, comments included.
+            BODY="$(jq -s -c \
+              --arg request_id "$REQUEST_ID" \
+              --arg slug "$SLUG" \
+              --arg run_id "$RUN_ID" \
+              --arg step "$STEP_KEY" \
+              --arg step_outcome "$STEP_OUTCOME" \
+              --arg github_run_id "${GITHUB_RUN_ID:-}" \
+              --arg github_run_attempt "$ATTEMPT_NO" \
+              --arg model_as_chosen "${STEP_MODEL:-}" \
+              --arg effort "${STEP_EFFORT:-}" \
+              --arg cap "${STEP_CAP:-}" '
+              def nz: if . == "" then null else . end;
+              ([.[] | if type == "array" then .[] else . end | select(type == "object")]) as $msgs
+              | ($msgs | map(select(.type == "result")) | last) as $r
+              | ($msgs | map(select(.type == "system" and .subtype == "init")) | first) as $init
+              | (($r.modelUsage // null) | if type == "object" then . else null end) as $mu
+              | ($mu | if . == null or length == 0 then null
+                       else to_entries | max_by(.value.costUSD // 0) | .key end) as $top
+              | def slim: {
+                  input_tokens: (.inputTokens | numbers // null),
+                  output_tokens: (.outputTokens | numbers // null),
+                  cache_read_input_tokens: (.cacheReadInputTokens | numbers // null),
+                  cache_creation_input_tokens: (.cacheCreationInputTokens | numbers // null),
+                  cost_usd: (.costUSD | numbers // null)
+                };
+              {
+                request_id: $request_id,
+                product_slug: $slug,
+                agent_name: "dev-watchdog",
+                action: "run-metrics",
+                run_id: $run_id,
+                payload: {
+                  source: "dev-watchdog-callable",
+                  step: $step,
+                  # The GitHub step conclusion, and NOT an outcome denominator: claude-code-action
+                  # reports a max-turns cutoff as a SUCCESSFUL step (implementer-callable.yml, the
+                  # ensure-report guard note), so a step that died at its cap reads "success" here.
+                  # It earns its place on the crash/infra path, where no result object exists at
+                  # all and every field below is null. The §3.5 quality side - a turn reduction
+                  # bought by worse work - must be read from result_subtype and is_error instead.
+                  step_outcome: $step_outcome,
+                  github_run_id: $github_run_id,
+                  github_run_attempt: $github_run_attempt,
+                  model_as_chosen: ($model_as_chosen | nz),
+                  model_resolved: ($top // ($init.model | strings // null)),
+                  model_resolved_source: (if $top != null then "modelUsage"
+                                          elif ($init.model | strings // null) != null then "init"
+                                          else null end),
+                  effort: ($effort | nz),
+                  num_turns: ($r.num_turns | numbers // null),
+                  max_turns: (if ($cap | test("^[0-9]+$")) then ($cap | tonumber) else null end),
+                  result_subtype: ($r.subtype | strings // null),
+                  is_error: (if ($r.is_error | type) == "boolean" then $r.is_error else null end),
+                  stop_reason: ($r.stop_reason | strings // null),
+                  terminal_reason: ($r.terminal_reason | strings // null),
+                  duration_ms: ($r.duration_ms | numbers // null),
+                  duration_api_ms: ($r.duration_api_ms | numbers // null),
+                  total_cost_usd: ($r.total_cost_usd | numbers // null),
+                  usage: (($r.usage // null) | if type == "object" then {
+                      input_tokens: (.input_tokens | numbers // null),
+                      output_tokens: (.output_tokens | numbers // null),
+                      cache_read_input_tokens: (.cache_read_input_tokens | numbers // null),
+                      cache_creation_input_tokens: (.cache_creation_input_tokens | numbers // null)
+                    } else null end),
+                  models_used: (if $mu == null then null
+                                else ($mu | with_entries(.value |= (if type == "object" then slim else {} end))) end)
+                }
+              }' "$SRC" 2>/dev/null)"
+
+            if [ -z "$BODY" ]; then
+              echo "::warning::dev-watchdog: could not build the run-metrics record for step ${STEP_KEY} (jq failed); skipping it"
+              return 0
+            fi
+
+            # Up to 3 attempts, only on a network failure or a 5xx: the write is idempotent on
+            # request_id, so a retry cannot double-insert, and a 4xx will not improve by
+            # repeating. --max-time so a hung hub cannot hold this product's concurrency group.
+            SENT=""
+            CODE=""
+            for attempt in 1 2 3; do
+              CODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 -X POST "${HUB}/api/v1/activity/entries" \
+                -H "Content-Type: application/json" \
+                -H "x-service-role-key: $QUEUE_SERVICE_ROLE_KEY" \
+                -H "User-Agent: aethrix-fleet-ci/1.0 (dev-watchdog-callable)" \
+                -d "$BODY")"
+              case "$CODE" in
+                2??) SENT=1; break ;;
+                4??) break ;;
+              esac
+              [ "$attempt" -lt 3 ] && sleep $((attempt * 2))
+            done
+            if [ -n "$SENT" ]; then
+              WROTE=$((WROTE + 1))
+              echo "::notice::dev-watchdog: run-metrics record written for step ${STEP_KEY} (HTTP ${CODE}, run_id ${RUN_ID})"
+            else
+              echo "::warning::dev-watchdog: run-metrics record POST failed for step ${STEP_KEY} (last HTTP ${CODE:-none}); the run is unaffected"
+            fi
+            return 0
+          }
+
+          # The caps come straight from the job env the steps' own --max-turns reads. These are
+          # known constants, not unknowns: recording null for a cap that is literally 40 would be
+          # wrong data, and num_turns is only interpretable against the cap it ran under.
+          emit_record doc-reconciliation "$DOC_OUTCOME"  "$DOC_EXEC_FILE"  "$DOC_MODEL"  "$DOC_EFFORT"  "${DOC_RECONCILIATION_MAX_TURNS:-}"
+          emit_record recommender        "$REC_OUTCOME"  "$REC_EXEC_FILE"  "$REC_MODEL"  "$REC_EFFORT"  "${RECOMMENDER_MAX_TURNS:-}"
+          emit_record proposer           "$PROP_OUTCOME" "$PROP_EXEC_FILE" "$PROP_MODEL" "$PROP_EFFORT" "${PROPOSER_MAX_TURNS:-}"
+
+          # Zero records is a correct outcome on every bail path (master switch off, the pre-build
+          # gate, or a debrief run that spent no LLM step). Say so rather than warning.
+          echo "dev-watchdog calibration: ${WROTE} run-metrics record(s) written, ${SKIPPED} agent step(s) did not run (run_id ${RUN_ID})"
+          exit 0
 
       # ---- Summary for the bail paths (no LLM spent) ----
       - name: Summary
