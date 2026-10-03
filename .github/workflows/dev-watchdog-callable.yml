@@ -355,11 +355,21 @@ jobs:
       - name: Record each agent step's model and turns (calibration)
         id: record-run-metrics
         # MODEL_CALIBRATION_PROPOSAL §3.7 / §3.4: the workflow-side producer minimum for
-        # dev-watchdog. §3.4 is the reason this agent is instrumented at all - its three steps
-        # run at three different efforts on fixed, repeating, near-identical work, which is the
-        # fleet's only free effort contrast. The agent cannot write these: claude-code-action
-        # writes each result object AFTER that step's session ends, so no agent can read its own
-        # num_turns. Do not move this into a skill.
+        # dev-watchdog. §3.4, as corrected 2026-10-02, is the reason this agent is instrumented
+        # at all - and what the instrumentation buys is the BASELINE, not the answer to §3.5.
+        # The watchdog was the activity trail's largest coverage gap (the fleet's highest-volume
+        # agent, emitting nothing), and its work is the most repetitive the fleet has, which is
+        # what makes a before/after readable at all. It is NOT a free effort contrast: the three
+        # steps are three DIFFERENT tasks - cross-document contradiction detection, a
+        # four-location ranked scan, open-ended ideation - so comparing their low/medium/high
+        # efforts against each other compares tasks, not efforts, and their volumes are wildly
+        # unbalanced besides. Answering §3.5 needs the Phase 4 intervention instead: change ONE
+        # step's effort and compare that step against itself. Canonical declaration of this
+        # record lives in skills/dev-watchdog/SKILL.md, "Activity trail writes".
+        #
+        # The agent cannot write these: claude-code-action writes each result object AFTER that
+        # step's session ends, so no agent can read its own num_turns. Do not move this into a
+        # skill.
         #
         # ONE record per agent step that ACTUALLY RAN. The three steps are conditional and
         # largely mutually exclusive (doc-reconciliation on most runs, recommender only on the
