@@ -1,0 +1,49 @@
+# .gitignore for Aethrix-Labs/.github — the org-level CI plumbing repo.
+#
+# Derived from ~/products/gitignore.baseline (STANDARDS §2.4), trimmed to what this repo
+# can actually produce: it holds reusable workflow YAML and a README, and nothing here
+# builds, installs or tests, so the baseline's build/cache, coverage and Node blocks are
+# deliberately omitted.
+#
+# `.claude/` is the load-bearing entry. Its absence is why bb8f086 committed a full copy of
+# every workflow under `.claude/worktrees/phase-1e/`, which then drifted into a stale
+# pre-#59 duplicate a reader or an agent could grep and believe — the tracked-stale-copy trap
+# of STANDARDS §18.1a. Agent worktrees and session state are runtime artifacts of working in
+# this repo; they are never part of it.
+
+# --- Claude ---
+.claude/
+.commit_state
+
+# --- OS noise ---
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# --- Editor / IDE metadata ---
+.vscode/
+.idea/
+.vs/
+.history/
+*.swp
+*.swo
+*~
+
+# --- Secrets (nothing here should ever hold one; cheap insurance anyway) ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+.secrets/
+
+# --- Misc ---
+*.bak
+*.orig
+*.log
