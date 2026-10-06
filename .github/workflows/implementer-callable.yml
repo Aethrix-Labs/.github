@@ -194,6 +194,71 @@ jobs:
             --max-turns ${{ env.AGENT_MAX_TURNS }}
             --allowedTools Read,Bash,Write,Edit,Glob,Grep
 
+      - name: Print the agent's activity breadcrumb
+        # STANDARDS §18.2 (breadcrumb rule, added 2026-10-06) — this step is the PRINTING HALF that
+        # rule names, and the §11.1 row (a) owed against it (fleet #184). The agent-side writers
+        # append one line per ATTEMPTED hub write — `<agent> <action> <http_code>` — to
+        # $GITHUB_WORKSPACE/.agent-activity; until this step existed the file was written and never
+        # surfaced.
+        #
+        # It exists because an agent's own `::warning::` is invisible: the agent step runs with
+        # show_full_output: false and its transcript is uploaded only on failure, so NOTHING an agent
+        # echoes from a Bash call reaches this log. Without the breadcrumb a lost activity write is
+        # indistinguishable from a write never attempted — which is exactly how FIVE successful runs
+        # across two products lost their whole activity bracket undetected: moneycomb M39 twice on
+        # 2026-10-04 (23:07:09, 23:13:55), then sethgibson-com M52 (2026-10-05 08:56:02), BL-115
+        # (18:19:51) and M54.10 (2026-10-06 11:19:05). Their run logs are identical in shape and
+        # wording to their healthy neighbours (STANDARDS_HISTORY §18; hub BL-128).
+        #
+        # Placed here, directly after the agent step, so the writes read in the log next to the
+        # session that attempted them and ahead of the guard's own notices. The file carries no agent
+        # name on purpose: implementer, ci-commit and staff-engineer all append to the same file in
+        # the same workspace, so this one step prints every AGENT-side write of the run. The
+        # workflow's own writes are not in it — they echo their status directly, which the log keeps.
+        #
+        # Lines are printed verbatim rather than parsed. The three-token form is the common case, but
+        # a write can record `no-key` or `no-encoder` in place of a code, and §18.2's block sends
+        # curl's stderr to the same file (`2>>"$CRUMB"`), so raw transport errors legitimately appear
+        # between the breadcrumbs. Those are the diagnosis, so print them too.
+        #
+        # Observability, not a gate (§18.2): notices only, and it exits 0 on every path.
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 2
+        run: |
+          # Nothing below may fail the run.
+          set +e
+
+          FILE="${GITHUB_WORKSPACE:-.}/.agent-activity"
+          if [ ! -f "$FILE" ]; then
+            # Not an error on its own, and the three causes are not distinguishable from here, so
+            # name all three rather than asserting one. The third is routine right now: §18.2's
+            # breadcrumb rule binds only three skills so far, and a product repo whose vendored
+            # `.fleet-ci` copy predates 2026-10-06 writes its records without a breadcrumb — the same
+            # vending lag the verification probe above already allows for.
+            echo "::notice::implementer-callable: no activity breadcrumb (.agent-activity absent); either no hub write was attempted, or the agent died before its first one, or this repo's vendored skill copy predates the breadcrumb rule"
+            exit 0
+          fi
+
+          # `grep -c ''` rather than `wc -l`: the writers append with printf and a crashed one can
+          # leave the last line unterminated, which wc undercounts by one while the loop below still
+          # prints it. A line count, not a write count — curl's stderr lands here too.
+          LINES="$(grep -c '' "$FILE" 2>/dev/null | tr -d ' \t')"
+          case "$LINES" in ""|*[!0-9]*) LINES="?" ;; esac
+          echo "::notice::implementer-callable: activity breadcrumb present (${LINES} line(s)); hub writes read as <agent> <action> <http_code>, interleaved with any transport error the writers redirected here"
+
+          # Bounded on both axes. The file is appended to by an LLM-driven Bash call, so its size is
+          # not trusted: cap the bytes read, the lines printed and each line's length rather than
+          # letting a runaway write flood the log. A `::notice::` inside a line cannot inject an
+          # annotation (a workflow command must start its own line), but strip CR and non-printables
+          # so a mangled line still reads as text.
+          head -c 20000 "$FILE" | head -n 200 | while IFS= read -r LINE || [ -n "$LINE" ]; do
+            LINE="$(printf '%s' "$LINE" | tr -d '\r' | tr -cd '[:print:]' | cut -c1-200)"
+            [ -n "$LINE" ] || continue
+            echo "::notice::implementer-callable: activity ${LINE}"
+          done
+          exit 0
+
       - name: Ensure the hub heard back (tick-report guard)
         id: ensure-report
         # Always-run backstop (widened 2026-07-08 from an `if: failure()`-only handler).
@@ -517,6 +582,64 @@ jobs:
               exit 0 ;;
           esac
 
+          # step_id_hint — the work-item id out of the `<phase>:<work-item-id>` phase breadcrumb this
+          # workflow already parses for the failure handler (implementer PACKETS.md, run-metrics;
+          # hub BL-128). The hub fills run_metrics.step_id / outcome / iterations_used by copying
+          # them off this run's agent-written `run-completed`; no run-completed, no values, and the
+          # table cannot tell that case from a crashed run. This is the callable's own second-best
+          # answer to "which step was this", and NEVER the authority — hence the name: a hint is
+          # what a workflow inferred from a local file, `step_id` is what the agent asserted about
+          # its own run. The hub prefers run-completed and falls back to this.
+          #
+          # The key is OMITTED, not sent as null, when there is no usable id — the published rule is
+          # "format ^(M\d+\.\d+[a-z]?|BL-\d+)$, or the key is omitted", and a reader owes the same
+          # degradation for an omitted key as for a run whose breadcrumb was missing. Absent, empty,
+          # malformed, or the literal `unknown` (what the skill writes before Step 1 resolves the
+          # work item — implementer SKILL.md, "Phase breadcrumb") all take that path: a literal
+          # "unknown" in run_metrics.step_id is worse than NULL, because the **Sizing:** join would
+          # match it against nothing while looking answered.
+          #
+          # The regex is the validation, not a charset check, and that distinction is the point: it
+          # rejects a bare `M54`, which is what the dispatch inputs carry. The hint must name the STEP
+          # (M54.10); the target is not a second-best answer to that question, it is a wrong one.
+          #
+          # There is deliberately NO hint for `outcome` or `iterations_used`. The callable cannot
+          # know either one without the agent's own record, and inventing them breaks
+          # MODEL_CALIBRATION_PROPOSAL §4 — absent is NULL, never 0. A missing `iterations_used`
+          # means "unrecorded"; a 0 means "the adversary never ran", and those are different runs.
+          PHASE_FILE="${GITHUB_WORKSPACE:-.}/.implementer-phase"
+          WORK_ITEM=""
+          if [ -f "$PHASE_FILE" ]; then
+            # First line only (the skill overwrites a single line; a stray second one is noise), and
+            # the half after the first colon. No colon at all is malformed, not a bare work-item id.
+            PHASE_RAW="$(head -n 1 "$PHASE_FILE" | tr -d '\r\n' | head -c 200)"
+            case "$PHASE_RAW" in
+              *:*) WORK_ITEM="${PHASE_RAW#*:}" ;;
+            esac
+          fi
+
+          # Two values off one breadcrumb, deliberately not the same test:
+          #   STEP_RESOLVED — did the agent get past Step 1 at all? Any work-item half that is not
+          #     empty and not `unknown` answers yes. Used ONLY by the bracket check below, which must
+          #     not demand a well-formed id: a real trail loss on a run whose breadcrumb reads
+          #     `committing:M39` (a target where a step id was expected) is still a real trail loss,
+          #     and coupling the alarm to the strict format would silence exactly those.
+          #   STEP_ID_HINT — is it a step id fit to SEND? That is the published format, below.
+          STEP_RESOLVED=""
+          case "$WORK_ITEM" in
+            ""|unknown) ;;
+            *) STEP_RESOLVED=1 ;;
+          esac
+          STEP_ID_HINT="$WORK_ITEM"
+          if ! printf '%s' "$STEP_ID_HINT" | grep -Eq '^(M[0-9]+\.[0-9]+[a-z]?|BL-[0-9]+)$'; then
+            STEP_ID_HINT=""
+          fi
+          if [ -n "$STEP_ID_HINT" ]; then
+            echo "::notice::implementer-callable: step_id_hint=${STEP_ID_HINT} (from .implementer-phase; the agent's run-completed stays authoritative)"
+          else
+            echo "::notice::implementer-callable: no usable step_id_hint (.implementer-phase missing, empty, unresolved or not a step id); omitting the key rather than guessing from the dispatch target"
+          fi
+
           # sha256sum is GNU coreutils; the macOS runner may only have shasum.
           if command -v sha256sum >/dev/null 2>&1; then
             SHA="sha256sum"
@@ -568,6 +691,7 @@ jobs:
             --arg run_id "$AGENT_RUN_ID" \
             --arg github_run_id "${GITHUB_RUN_ID:-}" \
             --arg github_run_attempt "$ATTEMPT_NO" \
+            --arg step_id_hint "$STEP_ID_HINT" \
             --arg session_id "${IMPLEMENTER_SESSION_ID:-}" \
             --arg target_kind "${IMPLEMENTER_TARGET_KIND:-}" \
             --arg target_ref "${IMPLEMENTER_TARGET_REF:-}" \
@@ -594,10 +718,13 @@ jobs:
                 agent_name: "implementer",
                 action: "run-metrics",
                 run_id: $run_id,
-                payload: {
+                payload: ({
                   source: "implementer-callable",
                   github_run_id: $github_run_id,
-                  github_run_attempt: $github_run_attempt,
+                  github_run_attempt: $github_run_attempt
+                }
+                + (if $step_id_hint == "" then {} else {step_id_hint: $step_id_hint} end)
+                + {
                   session_id: ($session_id | nz),
                   target_kind: ($target_kind | nz),
                   target_ref: ($target_ref | nz),
@@ -624,7 +751,7 @@ jobs:
                     } else null end),
                   models_used: (if $mu == null then null
                                 else ($mu | with_entries(.value |= (if type == "object" then slim else {} end))) end)
-                }
+                })
               }' "$SRC" 2>/dev/null)"
             [ -n "$BODY" ] && break
           done
@@ -655,6 +782,99 @@ jobs:
           else
             echo "::warning::implementer-callable: run-metrics activity record POST failed (last HTTP ${CODE:-none}); the run is unaffected"
           fi
+
+          # ── Bracket check: the third NULL case, detected at the source (hub BL-128) ──
+          #
+          # The hub fills run_metrics.step_id / outcome / iterations_used by copying them off this
+          # run's agent-written `run-completed`. No run-completed, no values — and the table cannot
+          # tell that case from the crashed run those NULLs were built to mean. Five runs across two
+          # products did exactly this: moneycomb M39 twice on 2026-10-04 (consecutive runs in one
+          # session), then sethgibson-com M52, BL-115 and M54.10 on 2026-10-05/06 — all `success`,
+          # 23-49 of 180 turns, PRs shipped, no bracket at all, and run logs indistinguishable in
+          # shape and wording from their healthy neighbours (STANDARDS_HISTORY §18). This step is
+          # already holding the agent's run_id and the result object, so it is the one place that can
+          # say so while the evidence is live, instead of leaving it to a query weeks later.
+          #
+          # Reads the trail through the scoped agent read API (STANDARDS §18.3,
+          # GET /api/v1/activity/entries?run_id=<id>, service-role auth, same key as the POST).
+          # Gated on `success` on purpose: on a non-success run the absent run-completed is already
+          # explained by the death, and the ensure-report guard above has already surfaced it.
+          #
+          # Every unreadable path reports UNVERIFIED, never missing: a 401/400/5xx or an unparseable
+          # body must not be able to raise a false alarm about the agent's writes. Never non-zero.
+          #
+          # And one case where writing nothing is CORRECT, which the alarm must not claim as a loss:
+          # `.implementer-run-id` is written at Step 1 the moment the run_id is generated, but three
+          # clean exits happen after that and before `run-started` — directed milestone not found,
+          # milestone with no unblocked step, backlog item gone from `## Open`. All three exit
+          # `success` with tick-outcome `guard-tripped`, and implementer PACKETS.md says they
+          # "write no activity records (tick-report only)". That is routine: SKILL.md Step 1 calls the
+          # second one the defensive path for a step consumed between enumeration and dispatch. So the
+          # warning is gated on STEP_RESOLVED — the phase breadcrumb showing the agent got past Step 1
+          # — and NOT on run-started being present, which is 0 on the five real incidents too.
+          SUBTYPE="$(printf '%s' "$BODY" | jq -r '.payload.result_subtype // empty' 2>/dev/null)"
+          if [ "$SUBTYPE" != "success" ]; then
+            echo "::notice::implementer-callable: bracket check skipped (result_subtype ${SUBTYPE:-unreadable}); a missing run-completed on a non-success run is explained by the death itself"
+            exit 0
+          fi
+
+          TRAIL_FILE="${RUNNER_TEMP:-/tmp}/implementer-trail-${GITHUB_RUN_ID:-0}-${ATTEMPT_NO}.json"
+          TRAIL_CODE="$(curl -s -o "$TRAIL_FILE" -w '%{http_code}' --max-time 20 \
+            -H "x-service-role-key: $QUEUE_SERVICE_ROLE_KEY" \
+            -H "User-Agent: aethrix-fleet-ci/1.0 (implementer-callable)" \
+            "${HUB}/api/v1/activity/entries?run_id=${AGENT_RUN_ID}")"
+          case "$TRAIL_CODE" in
+            2??) ;;
+            *)
+              echo "::notice::implementer-callable: bracket check unverified (trail read returned HTTP ${TRAIL_CODE:-none}); the bracket is unread, not known missing"
+              rm -f "$TRAIL_FILE"
+              exit 0 ;;
+          esac
+
+          # `na` whenever the body is not the documented {count, entries[]} shape — an error object
+          # answers `[.entries[]?] | length` with 0, which would read as a missing bracket.
+          COUNTS="$(jq -r 'if (.entries | type) == "array"
+              then [([.entries[] | select(.action == "run-completed")] | length),
+                    ([.entries[] | select(.action == "run-started")] | length),
+                    (.entries | length)] | join(" ")
+              else "na" end' "$TRAIL_FILE" 2>/dev/null)"
+          rm -f "$TRAIL_FILE"
+          # Plain word-splitting, not a `<<<` herestring: this step is otherwise POSIX-clean and pins
+          # no shell, and a herestring is a PARSE-time construct — under a non-bash shell the script
+          # would die before its first line and take the shipping run-metrics POST with it. The values
+          # are digits or `na`, so there is nothing for globbing to expand.
+          N_COMPLETED=""; N_STARTED=""; N_TOTAL=""
+          # shellcheck disable=SC2086
+          set -- $COUNTS
+          N_COMPLETED="${1:-}"; N_STARTED="${2:-}"; N_TOTAL="${3:-}"
+
+          # §18.1a: run_id repeats across a rerun at an unchanged HEAD, so on attempt 2+ a
+          # `run-completed` in the trail may belong to the earlier attempt. The record this step
+          # writes is keyed per attempt; this read cannot be, so say so rather than imply otherwise.
+          ATTEMPT_CAVEAT=""
+          if [ "$ATTEMPT_NO" != "1" ]; then
+            ATTEMPT_CAVEAT=" (attempt ${ATTEMPT_NO}: a record found here may be from an earlier attempt of this run_id)"
+          fi
+          # What is left to attribute the row by, said exactly: the hint when one was sent, and
+          # nothing when it was omitted. "the step_id_hint above" would be a claim about a key that
+          # may not be in the record.
+          if [ -n "$STEP_ID_HINT" ]; then
+            HINT_NOTE="step_id_hint ${STEP_ID_HINT} is this row's only step attribution"
+          else
+            HINT_NOTE="no step_id_hint was usable either, so the row names no step at all"
+          fi
+          case "$N_COMPLETED" in
+            ""|*[!0-9]*)
+              echo "::notice::implementer-callable: bracket check unverified (the trail read returned nothing parseable); the bracket is unread, not known missing" ;;
+            0)
+              if [ -n "$STEP_RESOLVED" ]; then
+                echo "::warning::implementer-callable: run finished success with no run-completed; run_metrics step_id/outcome/iterations_used will be NULL (trail holds ${N_TOTAL:-?} record(s) for this run_id, run-started x${N_STARTED:-?}). ${HINT_NOTE} - see STANDARDS_HISTORY 18 / hub BL-128"
+              else
+                echo "::notice::implementer-callable: no activity bracket, and no resolved work item either (phase breadcrumb absent or unresolved); a guard trip or a Step-1 target-not-found exit writes no activity records by design, so this is not a lost trail"
+              fi ;;
+            *)
+              echo "::notice::implementer-callable: activity bracket intact (run-completed x${N_COMPLETED}, run-started x${N_STARTED:-?}, ${N_TOTAL:-?} record(s) for run_id ${AGENT_RUN_ID})${ATTEMPT_CAVEAT}" ;;
+          esac
           exit 0
 
       - name: Upload the agent transcript (failure path only)
