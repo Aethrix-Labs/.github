@@ -1,0 +1,487 @@
+name: shakedown (callable)
+
+# Findings-routing pass over ONE test session (STANDARDS §23.6), dispatched by the hub.
+# STANDARDS §11.1 G-shakedown-dispatch: until this existed, `shakedown` was reachable only from
+# inside a milestone-test Mode A run that had already started.
+#
+# The thin per-product .github/workflows/shakedown.yml (a separate change, in each product repo)
+# `uses:` this. It is dispatch-only: no `schedule:` trigger, the recurrence lives in the hub
+# Worker's cron (§28.5).
+#
+# Flow: validate the session id -> route every unrouted finding the session owns (shakedown's
+# Mode A posture, `routed_to` in docs/test-sessions.json) -> ONLY when `close` is true and every
+# finding now has a destination, write the session's close as the last edit -> commit via
+# ci-commit -> verify the invariant on the written sidecar.
+#
+# THE CLOSE-WRITE ORDERING IS THE POINT (§23.6 "Who may write `closed`"). `closed` is never
+# written before every finding has a `routed_to`, and it lands in the SAME commit as those
+# routings, so no commit this workflow produces can leave a `closed` session owning an unrouted
+# finding. If the pass cannot route every finding it leaves the session `open` and says so: an
+# unfinished close is recoverable, a false one is not.
+#
+# Requires these bundles vended to fleet-skills `ci/`, reached at .fleet-ci/ci/<name>/:
+# shakedown and ci-commit (incl. PACKETS.md).
+
+on:
+  workflow_call:
+    inputs:
+      product_slug:
+        description: "Product slug (defaults to repo basename)."
+        type: string
+        required: false
+        default: ""
+      hub_url:
+        description: "Hub base URL for the queue POST. Defaults to https://sethgibson.com."
+        type: string
+        required: false
+        default: "https://sethgibson.com"
+      session:
+        description: "The sessions[].id in docs/test-sessions.json whose unrouted findings this pass routes."
+        type: string
+        required: true
+      close:
+        description: "When true, write the session's close (status closed + today's date) as the terminal step, after every finding has a routed_to. Never closes a session it could not fully route."
+        type: boolean
+        required: false
+        default: false
+      runner_label:
+        description: "Self-hosted runner label (STANDARDS §9 surface routing). 'fleet' = PC. This pass is read-only analysis plus one repo write and needs no device, so there is no reason to send it to 'fleet-mac'."
+        type: string
+        required: false
+        default: "fleet"
+      model:
+        description: "Claude model for the agent: an alias (sonnet|opus|haiku|fable) or an exact id. Chosen per run by the hub; the default is a fallback for a dispatch that omits it, not the declaration (STANDARDS §14)."
+        type: string
+        required: false
+        default: "sonnet"
+      effort:
+        description: "Reasoning effort for the agent: low|medium|high|xhigh|max. Chosen per run by the hub; the default is a fallback for a dispatch that omits it."
+        type: string
+        required: false
+        default: "medium"
+
+permissions:
+  contents: write # the pass commits the sidecar and the routing destinations (BACKLOG / PLANNING / ROUTING_BOARD)
+  pull-requests: write # ci-commit opens the PR
+  id-token: write # required by anthropics/claude-code-action@v1
+
+concurrency:
+  # Serialize per product: two passes would race the same docs/test-sessions.json. Not shared with the
+  # implementer's or milestone-test's group (a queued run in a shared group strands its hub session).
+  group: shakedown-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  shakedown:
+    runs-on: [self-hosted, "${{ inputs.runner_label }}"]
+    # STANDARDS §28.6. NOT MEASURED: no run of this workflow has completed. Sized between the
+    # lite-planner (observed max 14m, 60m cap) and milestone-test (150m, which carries e2e runs this
+    # pass does not). Revisit against the first real runs.
+    timeout-minutes: 60
+    env:
+      # One source for the turn cap: the agent step's --max-turns and the failure guard's
+      # "did it run out of turns?" test both read it, so they cannot drift apart.
+      AGENT_MAX_TURNS: "120"
+    steps:
+      - name: Guard — claude-code-action supports only some events
+        # A reusable workflow inherits the CALLER's event, and anthropics/claude-code-action@v1 throws
+        # "Unsupported event type" ~200 ms into its step for anything outside this list — before any
+        # skill phase runs, with nothing to say why. Fail here instead, naming the cause.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          case "$EVENT_NAME" in
+            issues|issue_comment|pull_request|pull_request_target|pull_request_review|pull_request_review_comment|workflow_dispatch|repository_dispatch|schedule|workflow_run) ;;
+            *)
+              echo "::error::claude-code-action cannot run under '$EVENT_NAME'; dispatch via workflow_dispatch. The caller's shakedown.yml must run this job only under workflow_dispatch (STANDARDS §28.6)."
+              echo "### shakedown cannot run under \`$EVENT_NAME\`" >> "$GITHUB_STEP_SUMMARY"
+              echo "claude-code-action rejects this event, so no routing pass ran and the session's findings are UNROUTED." >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+              ;;
+          esac
+
+      - uses: actions/checkout@v4 # consumer repo at $GITHUB_WORKSPACE
+        with:
+          fetch-depth: 0 # routing reads PLANNING / BACKLOG / git history for the next ids and scope checks
+
+      - uses: actions/checkout@v4 # fleet-skills (CI skills under ci/)
+        with:
+          repository: Aethrix-Labs/fleet-skills
+          path: .fleet-ci
+          ref: main
+          token: ${{ secrets.FLEET_SKILLS_PAT }} # fleet-skills is private
+
+      - name: Set up gh CLI
+        run: gh --version
+
+      - name: Configure git for commits
+        run: |
+          git config user.name  "shakedown[bot]"
+          git config user.email "shakedown@aethrix-labs.local"
+
+      - name: Pre-flight — the session exists, and what state it is in
+        # Fails BEFORE any agent spend on a dispatch that cannot succeed (a stale or mistyped id), and
+        # records the session's status so the post-run check can tell "left open" from "closed by a run
+        # that was not asked to". A failure here files no queue entry: nothing ran, and the hub
+        # already knows its dispatch was rejected. Advisory only when jq is absent; the agent step
+        # and the post-run check are the authority.
+        id: preflight
+        shell: bash
+        env:
+          # Through env, never interpolated into the script body.
+          SESSION_ID: ${{ inputs.session }}
+          CLOSE: ${{ inputs.close }}
+        run: |
+          case "$SESSION_ID" in
+            ""|*[!a-z0-9-]*|-*)
+              echo "::error::shakedown: session '$SESSION_ID' is not a kebab-case sessions[].id (§23.6)."
+              exit 1 ;;
+          esac
+          if ! command -v jq >/dev/null 2>&1; then
+            echo "::warning::shakedown: jq is not on PATH for this runner; skipping the session pre-flight (the agent re-reads the sidecar)"
+            echo "status_before=unknown" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          SIDECAR="docs/test-sessions.json"
+          if [ ! -f "$SIDECAR" ]; then
+            echo "::error::shakedown: $SIDECAR does not exist in this repo, so there is no session '$SESSION_ID' to route."
+            exit 1
+          fi
+          STATUS="$(jq -r --arg s "$SESSION_ID" '[.sessions[] | select(.id == $s)] | if length == 1 then .[0].status else "missing" end' "$SIDECAR")"
+          case "$STATUS" in
+            open|closed) ;;
+            *)
+              echo "::error::shakedown: $SIDECAR has no single session with id '$SESSION_ID' (found: $STATUS)."
+              exit 1 ;;
+          esac
+          UNROUTED="$(jq -r --arg s "$SESSION_ID" '[.findings[] | select(.session == $s and (.routed_to == null or .routed_to == ""))] | length' "$SIDECAR")"
+          echo "status_before=$STATUS" >> "$GITHUB_OUTPUT"
+          echo "::notice::shakedown: session=$SESSION_ID status=$STATUS unrouted_findings=$UNROUTED close=$CLOSE"
+          if [ "$STATUS" = "closed" ] && [ "$CLOSE" = "true" ]; then
+            echo "::error::shakedown: session '$SESSION_ID' is already closed; close:true has nothing to do."
+            exit 1
+          fi
+
+      - name: Run shakedown agent
+        id: agent
+        uses: anthropics/claude-code-action@v1
+        env:
+          QUEUE_SERVICE_ROLE_KEY: ${{ secrets.QUEUE_SERVICE_ROLE_KEY }}
+          AUTONOMOUS_TICK_TOKEN: ${{ secrets.AUTONOMOUS_TICK_TOKEN }}
+          SD_PRODUCT_SLUG: ${{ inputs.product_slug }}
+          SD_HUB_URL: ${{ inputs.hub_url }}
+          SD_SESSION: ${{ inputs.session }}
+          SD_CLOSE: ${{ inputs.close }}
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # The caller's dispatch may run under the default GITHUB_TOKEN, making the workflow_dispatch
+          # actor `github-actions` (type Bot), which claude-code-action refuses unless listed
+          # (puzzle-pop M16, run 36913059179 — same cause as milestone-test-callable). Allow exactly
+          # that bot, not '*'.
+          allowed_bots: github-actions
+          prompt: |
+            You are running as the **shakedown agent** in CI, in **Mode A (autonomous)**.
+
+            Read `.fleet-ci/ci/shakedown/SKILL.md` and follow it exactly. Every "Mode A" rule in it
+            applies to you; every "Mode B" instruction does not. You are in Mode A: there is no one
+            to confirm with, anything ambiguous parks on `docs/ROUTING_BOARD.md` with
+            `needs: decision`, and you never invoke `lite-planner`.
+
+            Your scope is ONE session: `$SD_SESSION` in `docs/test-sessions.json`. Route the
+            `findings` rows whose `session` is `$SD_SESSION` and whose `routed_to` is `null`, by
+            writing each row's `routed_to` (`BL-n`, `Mn`, `RB-n`). Leave `fixed-in-session` rows and
+            every other session's rows alone. Do not touch `obligations`, `specs`, or any other
+            session's row. If the session has no unrouted finding, say so and make no routing edit.
+
+            Phase breadcrumb: at each boundary overwrite the single-line file `.shakedown-phase`
+            at the repo root with one of `locate`, `route`, `record`, `closing`, `committing`.
+            Do not commit that file.
+
+            The `close` input for this run is: **$SD_CLOSE**.
+
+            - If it is `false`: do NOT write the session's `status` or `closed`. Closing is Seth's
+              act and an agent never closes a session on its own judgement.
+            - If it is `true`: Seth has already decided to close this session and the hub dispatched
+              you to finish its routing first. Write the close as the **terminal edit, and only if
+              every finding the session owns now has a `routed_to`** — re-read
+              `docs/test-sessions.json` and count the session's rows with a `null` or empty
+              `routed_to` immediately before the edit. The count must be 0. Then set the session's
+              `status` to `"closed"` and `closed` to today's date (`date -u +%F`), nothing else.
+              Never close first and route second, not even briefly, and do not split the close into
+              its own commit: it lands in the same commit as the routings. If you cannot route
+              every finding — a finding that is genuinely unroutable, a missing destination doc
+              you cannot create — **leave the session `open`**, route what you can, and state
+              plainly in your final message that the close did NOT happen and why. An unfinished
+              close is recoverable; a false one is not.
+
+            Before committing, run the sidecar self-check on your result if the script is reachable
+            (`python ~/products/scripts/check-test-sessions-sidecar.py .`; it is not vended to CI
+            runners, so when it is absent do the equivalent by hand): no `findings` row of this
+            session may have an empty-string `routed_to`, and a `closed` session must own no
+            unrouted finding.
+
+            Then commit by reading `.fleet-ci/ci/ci-commit/SKILL.md` and following it.
+
+            Emit NO queue entry of your own. A pass that routed what it was given is silent;
+            this workflow files the one failure entry if you die.
+
+            Runtime context:
+            - Working directory has the full consumer repo (fetch-depth: 0).
+            - Product slug: $SD_PRODUCT_SLUG (or derive from $GITHUB_REPOSITORY).
+            - Hub base URL: $SD_HUB_URL.
+          # STANDARDS §14: this agent is hub-dispatched, so model and effort are declared at the hub and
+          # arrive as inputs. Never pin them here — the literal-in-YAML rule is only for milestone-test and
+          # security-review, which have no hub in their trigger path.
+          claude_args: |
+            --model ${{ inputs.model }}
+            --effort ${{ inputs.effort }}
+            --max-turns ${{ env.AGENT_MAX_TURNS }}
+            --allowedTools Read,Bash,Write,Edit,Glob,Grep
+            # --max-turns 120 is an UNMEASURED estimate: this pass reads a handful of docs, writes a
+            # handful of rows, and pays the same commit tax as the implementer (ci-commit ->
+            # canonical-doc-update) without any e2e or build loop. Recalibrate on the first real runs.
+
+      - name: Verify the close-write invariant on the written sidecar
+        # A detector, not a preventer: the agent's instructions are what enforce the ordering, and this
+        # re-reads the file the agent left. It catches the two ways a run can be wrong in a way that
+        # matters — a `closed` session still owning an unrouted finding (the §23.6 gate gap), and a
+        # session closed by a run that was not asked to close it. A run that was asked to close and
+        # could not route everything is CORRECT to leave the session open; that is reported, not failed.
+        # Reads the working tree as the agent left it; if ci-commit returned the checkout to another
+        # branch, the sidecar read here is that branch's.
+        id: verify
+        if: success()
+        shell: bash
+        env:
+          SESSION_ID: ${{ inputs.session }}
+          CLOSE: ${{ inputs.close }}
+          STATUS_BEFORE: ${{ steps.preflight.outputs.status_before }}
+        run: |
+          SIDECAR="docs/test-sessions.json"
+          if ! command -v jq >/dev/null 2>&1; then
+            echo "::warning::shakedown: jq is not on PATH; skipping the close-write invariant check"
+            exit 0
+          fi
+          if [ ! -f "$SIDECAR" ]; then
+            echo "::error::shakedown: $SIDECAR is missing after the run."
+            exit 1
+          fi
+          read -r STATUS CLOSED_ON < <(jq -r --arg s "$SESSION_ID" '.sessions[] | select(.id == $s) | "\(.status) \(.closed // "null")"' "$SIDECAR")
+          UNROUTED="$(jq -r --arg s "$SESSION_ID" '[.findings[] | select(.session == $s and (.routed_to == null or .routed_to == ""))] | length' "$SIDECAR")"
+          EMPTY="$(jq -r --arg s "$SESSION_ID" '[.findings[] | select(.session == $s and .routed_to == "")] | length' "$SIDECAR")"
+          echo "::notice::shakedown: session=$SESSION_ID status=$STATUS closed=$CLOSED_ON unrouted=$UNROUTED empty_routed_to=$EMPTY close_requested=$CLOSE"
+          FAIL=""
+          if [ "$EMPTY" != "0" ]; then
+            FAIL="$EMPTY finding(s) of $SESSION_ID carry an empty-string routed_to, which is a gate failure (§23.6), not an unrouted finding."
+          elif [ "$STATUS" = "closed" ] && [ "$UNROUTED" != "0" ]; then
+            FAIL="session $SESSION_ID is closed while owning $UNROUTED unrouted finding(s): the exact gate gap the close-write ordering exists to prevent (§23.6)."
+          elif [ "$STATUS" = "closed" ] && [ "$CLOSED_ON" = "null" ]; then
+            FAIL="session $SESSION_ID is closed with no closed date."
+          elif [ "$STATUS" = "closed" ] && [ "$CLOSE" != "true" ] && [ "$STATUS_BEFORE" != "closed" ]; then
+            FAIL="session $SESSION_ID was closed by a run dispatched with close:false. An agent never closes a session on its own judgement (§23.6)."
+          fi
+          {
+            echo "### shakedown — \`$SESSION_ID\`"
+            echo "- status: \`$STATUS\` (before: \`${STATUS_BEFORE:-unknown}\`), unrouted findings left: $UNROUTED, close requested: $CLOSE"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$FAIL" ]; then
+            echo "::error::shakedown: $FAIL"
+            echo "- **INVARIANT VIOLATED:** $FAIL" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          if [ "$CLOSE" = "true" ] && [ "$STATUS" != "closed" ]; then
+            echo "::warning::shakedown: close was requested but session $SESSION_ID is still open with $UNROUTED unrouted finding(s). That is the correct outcome when the pass could not route everything; the close did NOT happen."
+            echo "- **The close did NOT happen.** The session is still open with $UNROUTED unrouted finding(s)." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Emit failure queue entry on agent death or an invariant violation
+        # Surface it so a routing pass (and a close Seth already decided on) doesn't silently go nowhere.
+        # The cause is read off the agent's result object, not assumed.
+        id: failure-entry
+        if: failure() && (steps.agent.outcome == 'failure' || steps.verify.outcome == 'failure')
+        env:
+          # The action's transcript (a JSON array of SDK messages; the last `result` message carries
+          # subtype / is_error / num_turns). Empty when the action died before writing it.
+          AGENT_EXECUTION_FILE: ${{ steps.agent.outputs.execution_file }}
+          QUEUE_SERVICE_ROLE_KEY: ${{ secrets.QUEUE_SERVICE_ROLE_KEY }}
+          SD_PRODUCT_SLUG: ${{ inputs.product_slug }}
+          SD_HUB_URL: ${{ inputs.hub_url }}
+          SD_SESSION: ${{ inputs.session }}
+          SD_CLOSE: ${{ inputs.close }}
+          AGENT_OUTCOME: ${{ steps.agent.outcome }}
+          VERIFY_OUTCOME: ${{ steps.verify.outcome }}
+          # Empty when the action died before Claude ran (its `conclusion` output is only set after).
+          AGENT_CONCLUSION: ${{ steps.agent.outputs.conclusion }}
+        run: |
+          SLUG="${SD_PRODUCT_SLUG:-$(basename "$GITHUB_REPOSITORY")}"
+          HUB="${SD_HUB_URL:-https://sethgibson.com}"
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+          # Phase breadcrumb — the prompt has the agent overwrite this single-line marker at each phase
+          # boundary. On a max-turns/crash death the agent never reached its exit path, so this file is
+          # the only signal for WHERE it died. Unlike milestone-test, the shakedown skill itself does not
+          # write it: it exists only if the agent followed this workflow's prompt.
+          PHASE_FILE="${GITHUB_WORKSPACE:-.}/.shakedown-phase"
+          LAST_PHASE="unknown"
+          if [ -f "$PHASE_FILE" ]; then
+            LAST_PHASE="$(tr -d '\r\n' < "$PHASE_FILE" | head -c 200 | tr -cd 'A-Za-z0-9 _-')"
+          fi
+          echo "::notice::shakedown-callable: workflow failed at phase=${LAST_PHASE}"
+
+          # What the agent step actually reported. claude-code-action writes its transcript to
+          # $RUNNER_TEMP/claude-execution-output.json and prints a {"type":"result", ...} object to the
+          # log. Asserting "max-turns, crash, or infra" without looking names a cause the log can
+          # contradict, so branch on the result object; where it cannot be read, say so.
+          #   max-turns   subtype error_max_turns, or num_turns at/near the cap
+          #   crash       is_error true, a non-success subtype, or no result object in the transcript
+          #   clean-exit  subtype success, is_error false, turns well under the cap
+          #   unknown     transcript or jq unavailable, or a field would not parse
+          EXEC_FILE="${AGENT_EXECUTION_FILE:-}"
+          if [ -z "$EXEC_FILE" ]; then
+            EXEC_FILE="${RUNNER_TEMP:-}/claude-execution-output.json"
+          fi
+          CAP="${AGENT_MAX_TURNS:-}"
+          case "$CAP" in ""|*[!0-9]*) CAP="" ;; esac
+          R_KIND=""; R_SUBTYPE=""; R_ERR=""; R_TURNS=""; R_BG=""; R_DONE=""; R_STOP=""
+          if [ -f "$EXEC_FILE" ] && command -v jq >/dev/null 2>&1; then
+            R_LINE="$(jq -r -s '
+                [.[] | if type == "array" then .[] else . end | select(type == "object" and .type == "result")] | last
+                | if . == null then "none"
+                  else ["result", (.subtype | tostring), (.is_error | tostring), (.num_turns | tostring),
+                       ((.subagent_stats | objects | .started_in_background | numbers) // "" | tostring),
+                       ((.subagent_stats | objects | .completed | numbers) // "" | tostring),
+                       ((.stop_reason | strings) // "")] | join("|")
+                  end' "$EXEC_FILE" 2>/dev/null || true)"
+            IFS='|' read -r R_KIND R_SUBTYPE R_ERR R_TURNS R_BG R_DONE R_STOP <<< "$R_LINE" || true
+            # These land in the JSON body below: keep them to plain tokens.
+            R_SUBTYPE="$(printf '%s' "$R_SUBTYPE" | tr -cd 'A-Za-z0-9_-' | head -c 64)"
+            case "$R_ERR" in true|false) ;; *) R_ERR="" ;; esac
+            case "$R_TURNS" in ""|*[!0-9]*) R_TURNS="" ;; esac
+            # subagent_stats is absent on older transcripts: absent or unparseable is no evidence, never 0.
+            case "$R_BG" in ""|*[!0-9]*) R_BG="" ;; esac
+            case "$R_DONE" in ""|*[!0-9]*) R_DONE="" ;; esac
+            R_STOP="$(printf '%s' "$R_STOP" | tr -cd 'A-Za-z0-9_-' | head -c 32)"
+          fi
+          CAUSE="unknown"
+          BG_WAIT=""
+          if [ "$R_KIND" = "none" ]; then
+            CAUSE="crash"
+          elif [ "$R_KIND" = "result" ]; then
+            if [ "$R_SUBTYPE" = "error_max_turns" ] || { [ -n "$R_TURNS" ] && [ -n "$CAP" ] && [ "$R_TURNS" -ge $((CAP * 9 / 10)) ]; }; then
+              CAUSE="max-turns"
+            elif [ "$R_ERR" = "true" ] || { [ -n "$R_SUBTYPE" ] && [ "$R_SUBTYPE" != "success" ]; }; then
+              CAUSE="crash"
+            elif [ "$R_SUBTYPE" = "success" ] && [ "$R_ERR" = "false" ] && [ -n "$R_TURNS" ] && [ -n "$CAP" ]; then
+              CAUSE="clean-exit"
+              # Sub-flag, not a fifth cause: the agent dispatched subagents in the background, none had
+              # completed, and it ended its turn waiting (STANDARDS 28.6). Needs both fields present.
+              if [ -n "$R_BG" ] && [ -n "$R_DONE" ] && [ "$R_BG" -ge 1 ] && [ "$R_DONE" -eq 0 ]; then
+                BG_WAIT=1
+              fi
+            fi
+          fi
+          echo "::notice::shakedown-callable: agent result cause=${CAUSE} subtype=${R_SUBTYPE:-?} is_error=${R_ERR:-?} turns=${R_TURNS:-?}/${CAP:-?} bg_started=${R_BG:-?} bg_completed=${R_DONE:-?} stop_reason=${R_STOP:-?}"
+
+          # The transcript is the only record of the agent's final message ("why did it stop"); the
+          # runner's temp dir is wiped at job end. Hand it to the upload step below.
+          TRANSCRIPT_NOTE=""
+          if [ -f "$EXEC_FILE" ]; then
+            TRANSCRIPT_NOTE=" The agent's full transcript is attached to the run as the artifact shakedown-transcript-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT:-1} (7-day retention); its last result message is the agent's own account of why it stopped."
+            if [ -n "${GITHUB_OUTPUT:-}" ]; then
+              echo "transcript_path=$EXEC_FILE" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+          CLOSE_NOTE=""
+          if [ "$SD_CLOSE" = "true" ]; then
+            CLOSE_NOTE=" This run was dispatched with close:true; the close is written only as the last edit of a fully routed pass and shares a commit with the routings, so the session should still be open on main. Check docs/test-sessions.json before assuming either way."
+          fi
+
+          if [ "$AGENT_OUTCOME" != "failure" ] && [ "$VERIFY_OUTCOME" = "failure" ]; then
+            # The agent finished and the post-run check rejected what it left. Not a crash: do not offer
+            # the crash advice. The check's own message is in the run log and step summary.
+            TITLE="[$SLUG] shakedown left ${SD_SESSION} in a state the gate rejects"
+            ATTEMPT="The agent step finished, then the post-run close-write check failed on docs/test-sessions.json (a closed session owning an unrouted finding, an empty routed_to, or a session closed by a run dispatched with close:false). The step summary names which. Last phase reached: ${LAST_PHASE}."
+            ASK="Read the failing 'Verify the close-write invariant' step, then fix docs/test-sessions.json for ${SD_SESSION} by hand or re-dispatch the pass. Do not merge a PR from this run until the sidecar passes check-test-sessions-sidecar.py."
+            RECO="This is a bug in the run or in the shakedown skill's close rule, not a flaky runner: read what the agent wrote before re-dispatching. If the PR already merged, the sidecar on main holds the gap and fixing it is the first move."
+          elif [ "$LAST_PHASE" = "unknown" ] && [ -z "${AGENT_CONCLUSION:-}" ]; then
+            # No phase AND no agent result: the action died at startup (it rejected the trigger event,
+            # or its own setup failed), so the phase-based advice below would be a wrong guess.
+            TITLE="[$SLUG] shakedown did not start for ${SD_SESSION} - its findings are UNROUTED"
+            ATTEMPT="claude-code-action failed at startup, before any skill phase ran (no phase breadcrumb, no agent result). Usually the action rejected the trigger event (Unsupported event type) or its setup failed. Event: ${GITHUB_EVENT_NAME}. Run: $RUN_URL"
+            ASK="Session ${SD_SESSION} has NOT been routed${CLOSE_NOTE:+ and was NOT closed}. Read the first lines of the failing step to confirm the cause, then re-dispatch the pass from the hub or run shakedown interactively in this repo."
+            RECO="Fix the trigger if it is the event type (the caller must dispatch as workflow_dispatch), otherwise re-dispatch."
+          else
+            TITLE="[$SLUG] shakedown failed on ${SD_SESSION}"
+            ASK="Inspect the run log, then re-dispatch the routing pass for ${SD_SESSION} from the hub or run shakedown interactively in this repo."
+            # Only what the result object supports is asserted.
+            case "$CAUSE" in
+              max-turns)
+                ATTEMPT="claude-code-action used ${R_TURNS} of ${CAP} turns (result subtype ${R_SUBTYPE}), at or near its turn cap, before the skill's own exit path."
+                RECO="Died at phase '${LAST_PHASE}'. A session with many findings may exceed the cap in one pass; routing the remainder in a second dispatch is safe because rows already routed are skipped. The turn cap is an unmeasured estimate - if this recurs on a modest session, raise AGENT_MAX_TURNS." ;;
+              crash)
+                if [ "$R_KIND" = "none" ]; then
+                  ATTEMPT="claude-code-action ended without a result object in its transcript (a crash or infra error) before the skill's own exit path."
+                else
+                  ATTEMPT="claude-code-action ended in error (result subtype ${R_SUBTYPE:-unknown}, is_error ${R_ERR:-unknown}, ${R_TURNS:-unknown} of ${CAP:-unknown} turns) before the skill's own exit path."
+                fi
+                RECO="Died at phase '${LAST_PHASE}'. This reads as a crash or infra error, not a budget death: re-dispatching is apt. If it recurs at the same phase, read the run log before changing anything." ;;
+              clean-exit)
+                if [ -n "$BG_WAIT" ]; then
+                  # Signature of STANDARDS 28.6 (a headless agent has no next turn).
+                  ATTEMPT="The agent's result object reports success (result subtype success, is_error false, ${R_TURNS} of ${CAP} turns, well under the cap, stop_reason ${R_STOP:-unreported}) yet the step is marked failed: the agent spawned ${R_BG} subagent(s) in the background, none completed (${R_DONE} completed), and it ended its turn waiting for one. A headless session has no next turn, so that ended the session without running its exit path (STANDARDS 28.6)."
+                  RECO="Died at phase '${LAST_PHASE}'. Not a budget or infra failure: a re-dispatch before the skill's dispatch instruction is fixed stops the same way. Running shakedown interactively has a next turn and is not affected."
+                else
+                  ATTEMPT="The agent's result object reports success (result subtype success, is_error false, ${R_TURNS} of ${CAP} turns, well under the cap) yet the step is marked failed."
+                  RECO="Not a budget or infra failure. Read the run log around the end of the agent step, and the agent's final message in the transcript artifact, to see why the step was marked failed (last phase '${LAST_PHASE}')."
+                fi ;;
+              *)
+                ATTEMPT="claude-code-action failed before the skill's own exit path; cause unknown (the agent step's result object could not be read from this job)."
+                RECO="Cause unknown - read the run log (and the transcript artifact, if one is attached) before choosing between re-dispatching and running shakedown interactively. The last phase reached was '${LAST_PHASE}'." ;;
+            esac
+            ATTEMPT="${ATTEMPT} Last phase reached: ${LAST_PHASE}. Run: ${RUN_URL}"
+          fi
+          ATTEMPT="${ATTEMPT}${CLOSE_NOTE}${TRANSCRIPT_NOTE}"
+
+          if [ -n "$QUEUE_SERVICE_ROLE_KEY" ]; then
+            REQUEST_ID=$(printf '%s' "${GITHUB_RUN_ID}shakedown-failed" | sha256sum | cut -d' ' -f1)
+            # `variant: workflow-failed` is the existing class-A variant (QUEUE_TAXONOMY §5), the same one
+            # milestone-test-callable's guard stamps. No new category is coined here. The packet carries no
+            # run_id: the shakedown skill generates none, and substituting $GITHUB_RUN_ID would name the
+            # workflow run rather than an activity trail (§18.1a).
+            curl -sf -X POST "${HUB}/api/v1/queue/entries" \
+              -H "Content-Type: application/json" \
+              -H "x-service-role-key: $QUEUE_SERVICE_ROLE_KEY" \
+              -H "User-Agent: aethrix-fleet-ci/1.0 (shakedown-callable)" \
+              -d "{
+                \"request_id\": \"$REQUEST_ID\",
+                \"entry_type\": \"exception\",
+                \"variant\": \"workflow-failed\",
+                \"agent_name\": \"shakedown\",
+                \"product_slug\": \"$SLUG\",
+                \"title\": \"$TITLE\",
+                \"goal\": \"Route the unrouted findings of test session ${SD_SESSION} (STANDARDS 23.6), close requested: ${SD_CLOSE}\",
+                \"attempts\": [\"$ATTEMPT\"],
+                \"artifacts\": [{\"label\": \"Workflow run\", \"href\": \"$RUN_URL\", \"artifact_type\": \"doc\"}],
+                \"ask\": \"$ASK\",
+                \"recommendation\": \"$RECO\"
+              }" \
+            || echo "::warning::shakedown-callable: failure queue-entry POST failed"
+          else
+            echo "::warning::shakedown-callable: QUEUE_SERVICE_ROLE_KEY missing; skipping failure queue entry"
+          fi
+
+      - name: Upload the agent transcript (failure path only)
+        # The agent step runs with show_full_output: false, so the log carries the result object but
+        # not the agent's final message, and the transcript is deleted with the runner's temp dir.
+        # An artifact rather than show_full_output: true — that would print every tool result,
+        # secrets included, into a log anyone with read access can open. The guard above sets
+        # `transcript_path` only when it ran.
+        if: always() && steps.failure-entry.outputs.transcript_path != ''
+        uses: actions/upload-artifact@v4
+        continue-on-error: true
+        with:
+          name: shakedown-transcript-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.failure-entry.outputs.transcript_path }}
+          if-no-files-found: warn
+          retention-days: 7
