@@ -203,8 +203,10 @@ jobs:
 
             Route residual findings by reading `.fleet-ci/ci/shakedown/SKILL.md` and
             following its **Mode A autonomous routing posture** — tell it you are Mode A.
-            Anything ambiguous parks on `ROUTING_BOARD.md` with `needs: decision`; do not
-            invoke `lite-planner`.
+            Anything ambiguous parks on the routing board with `needs: decision`, in the file
+            the skill's routing step says to write (`docs/routing-board.json`, or the legacy
+            `docs/ROUTING_BOARD.md` only while the product still has one and no sidecar); do
+            not invoke `lite-planner`.
 
             Then commit by reading `.fleet-ci/ci/ci-commit/SKILL.md` and following it.
 

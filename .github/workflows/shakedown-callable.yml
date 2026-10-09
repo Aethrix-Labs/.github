@@ -61,7 +61,7 @@ on:
         default: "medium"
 
 permissions:
-  contents: write # the pass commits the sidecar and the routing destinations (BACKLOG / PLANNING / ROUTING_BOARD)
+  contents: write # the pass commits the sidecar and the routing destinations (BACKLOG / PLANNING / routing board)
   pull-requests: write # ci-commit opens the PR
   id-token: write # required by anthropics/claude-code-action@v1
 
@@ -184,8 +184,10 @@ jobs:
 
             Read `.fleet-ci/ci/shakedown/SKILL.md` and follow it exactly. Every "Mode A" rule in it
             applies to you; every "Mode B" instruction does not. You are in Mode A: there is no one
-            to confirm with, anything ambiguous parks on `docs/ROUTING_BOARD.md` with
-            `needs: decision`, and you never invoke `lite-planner`.
+            to confirm with, anything ambiguous parks on the routing board with `needs: decision`,
+            in the file the skill's routing step says to write (`docs/routing-board.json`, or the
+            legacy `docs/ROUTING_BOARD.md` only while the product still has one and no sidecar),
+            and you never invoke `lite-planner`.
 
             Your scope is ONE session: `$SD_SESSION` in `docs/test-sessions.json`. Route the
             `findings` rows whose `session` is `$SD_SESSION` and whose `routed_to` is `null`, by
