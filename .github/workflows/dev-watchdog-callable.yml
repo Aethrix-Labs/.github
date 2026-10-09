@@ -3,7 +3,7 @@ name: dev-watchdog (callable)
 # Daily per-product development health check (STANDARDS §24; SYSTEM_VISION Phase 14).
 # The thin per-product .github/workflows/dev-watchdog.yml (cron + workflow_dispatch)
 # `uses:` this. Flow (revised 2026-09-20, STANDARDS §24.1-24.2b):
-#   flags -> gate (local docs: PLANNING/BACKLOG/ROUTING_BOARD) -> open-queue-entries
+#   flags -> gate (local docs: PLANNING/BACKLOG/routing board) -> open-queue-entries
 #   check (only when the gate said the product looks idle) -> decide: signals-pending
 #   (from either source) -> debrief (no LLM); else idle -> recommender (deferred-scan
 #   only) -> proposer. Doc reconciliation runs every day, unconditionally, as long as
@@ -229,7 +229,7 @@ jobs:
 
             Read `.fleet-ci/ci/dev-watchdog/SKILL.md`'s "Doc reconciliation" section
             and follow it exactly. This is a standing daily hygiene pass — it runs
-            regardless of whether the product has open PLANNING/BACKLOG/ROUTING_BOARD
+            regardless of whether the product has open PLANNING/BACKLOG/routing board
             work or is fully idle. Do ONLY the continuity-drift sweep of the canonical
             docs OTHER than PLANNING.md boxes (stale LIFECYCLE stage:/next_milestone:,
             LIFECYCLE body bloat, PRD<->design contradictions, DECISIONS lines
@@ -271,7 +271,7 @@ jobs:
             section exactly.
 
             The signals check already confirmed: this product is built-out and idle,
-            PLANNING/BACKLOG/ROUTING_BOARD are all clear, and there are zero open
+            PLANNING/BACKLOG/routing board are all clear, and there are zero open
             queue entries for it — so do NOT re-scan any of those, and do NOT do doc
             reconciliation (a separate step in this run already handles that). Run
             ONLY the deferred-work scan (PRD Post-MVP, PLANNING Out-of-scope items
