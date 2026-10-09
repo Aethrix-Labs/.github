@@ -213,10 +213,11 @@ jobs:
       # Runs regardless of signals-pending vs. idle — only pre-build (nothing
       # shipped yet, no reconciliation target) and the master switch gate it. ----
       - name: Doc reconciliation
-        # id: so the calibration step can read THIS step's own execution_file and
-        # outcome. Every claude-code-action invocation in this job defaults to the same
-        # $RUNNER_TEMP/claude-execution-output.json, so the three overwrite each other -
-        # per-step outputs are the only correct source. Do not remove.
+        # id: the calibration step reads THIS step's outcome, and the snapshot step right
+        # after it keys off that outcome. Every claude-code-action invocation in this job
+        # writes the same $RUNNER_TEMP/claude-execution-output.json, so each agent step is
+        # followed by a snapshot step that moves its result aside before the next one can
+        # overwrite it - see THE OVERWRITE TRAP in record-run-metrics. Do not remove.
         id: doc-reconciliation
         if: steps.flags.outputs.watchdog_enabled == 'true' && steps.gate.outputs.decision != 'pre-build'
         uses: anthropics/claude-code-action@v1
@@ -249,6 +250,26 @@ jobs:
             --effort ${{ inputs.doc_reconciliation_effort }}
             --max-turns ${{ env.DOC_RECONCILIATION_MAX_TURNS }}
             --allowedTools Read,Bash,Write,Edit,Glob,Grep
+
+      # Snapshot steps (one after each agent step): move this agent step's result object to its
+      # own per-step path, so the default path is EMPTY before the next agent step runs. A copy
+      # would leave the old file in place, and an agent step that dies before writing its result
+      # would then inherit it - claude-code-action's error path sets execution_file to whatever
+      # sits at the default path. Nothing in the action reads the file after its run step
+      # returns (the step summary is written inside it, and the action has no post step that
+      # touches it), so moving it here is safe. An absent file means no result object: do
+      # nothing, and the record carries every result field null. Observability only (STANDARDS
+      # §18.2): never fails the run.
+      - name: Snapshot doc-reconciliation result (calibration)
+        if: always() && steps.doc-reconciliation.outcome != 'skipped' && steps.doc-reconciliation.outcome != ''
+        continue-on-error: true
+        run: |
+          set +e
+          if [ -f "$RUNNER_TEMP/claude-execution-output.json" ]; then
+            mv -f "$RUNNER_TEMP/claude-execution-output.json" "$RUNNER_TEMP/run-metrics-doc-reconciliation.json" \
+              || { echo "::warning::dev-watchdog: could not snapshot the doc-reconciliation result; its record will have null results"; rm -f "$RUNNER_TEMP/claude-execution-output.json"; }
+          fi
+          exit 0
 
       # ---- Phase 1: Sonnet recommender — deferred-work scan only (idle path,
       # nothing already pending). STANDARDS §24.2b. ----
@@ -300,6 +321,18 @@ jobs:
             --max-turns ${{ env.RECOMMENDER_MAX_TURNS }}
             --allowedTools Read,Bash,Glob,Grep
 
+      # See the doc-reconciliation snapshot step's note.
+      - name: Snapshot recommender result (calibration)
+        if: always() && steps.recommender.outcome != 'skipped' && steps.recommender.outcome != ''
+        continue-on-error: true
+        run: |
+          set +e
+          if [ -f "$RUNNER_TEMP/claude-execution-output.json" ]; then
+            mv -f "$RUNNER_TEMP/claude-execution-output.json" "$RUNNER_TEMP/run-metrics-recommender.json" \
+              || { echo "::warning::dev-watchdog: could not snapshot the recommender result; its record will have null results"; rm -f "$RUNNER_TEMP/claude-execution-output.json"; }
+          fi
+          exit 0
+
       # ---- Phase 2: proposer — nothing-deferred net-new ideation (STANDARDS §24.6) ----
       # Realizes dev-watchdog's "nothing deferred" branch. Only dispatched on the
       # idle path (decide.path == 'idle'), i.e. only after the signals check has
@@ -308,8 +341,8 @@ jobs:
       # to run independent of any precheck; it no longer does). Writes no code ->
       # no Write/Edit tools. ----
       - name: Run proposer
-        # id: for the calibration step's per-step execution_file / outcome - see the
-        # Doc reconciliation step's note. Do not remove.
+        # id: for the calibration step's per-step outcome and this step's snapshot step - see
+        # the Doc reconciliation step's note. Do not remove.
         id: proposer
         if: >
           steps.decide.outputs.path == 'idle' &&
@@ -352,6 +385,20 @@ jobs:
             --max-turns ${{ env.PROPOSER_MAX_TURNS }}
             --allowedTools Read,Bash,Glob,Grep
 
+      # See the doc-reconciliation snapshot step's note. The proposer is the last agent step, so
+      # nothing would overwrite its result, but it is snapshotted the same way so all three
+      # records read from one uniform place.
+      - name: Snapshot proposer result (calibration)
+        if: always() && steps.proposer.outcome != 'skipped' && steps.proposer.outcome != ''
+        continue-on-error: true
+        run: |
+          set +e
+          if [ -f "$RUNNER_TEMP/claude-execution-output.json" ]; then
+            mv -f "$RUNNER_TEMP/claude-execution-output.json" "$RUNNER_TEMP/run-metrics-proposer.json" \
+              || { echo "::warning::dev-watchdog: could not snapshot the proposer result; its record will have null results"; rm -f "$RUNNER_TEMP/claude-execution-output.json"; }
+          fi
+          exit 0
+
       - name: Record each agent step's model and turns (calibration)
         id: record-run-metrics
         # MODEL_CALIBRATION_PROPOSAL §3.7 / §3.4: the workflow-side producer minimum for
@@ -376,14 +423,20 @@ jobs:
         # idle path, proposer only on idle plus a toggle), and the bail paths mean some runs run
         # no LLM step at all. Zero records on a bail path is correct, not a gap.
         #
-        # *** THE OVERWRITE TRAP. Every claude-code-action invocation defaults to writing
-        # $RUNNER_TEMP/claude-execution-output.json, so these three sequential steps in one job
-        # overwrite each other. Reading that default path at job end yields the LAST step's
-        # result, which would then be attributed to whichever step the reader had in mind. Each
-        # record therefore reads ONLY its own step's steps.<id>.outputs.execution_file, and there
-        # is deliberately NO fallback to the default path (implementer-callable can afford that
-        # fallback; it has one agent step in its job). An empty execution_file yields a record
-        # with every result-derived field null, which is the honest answer. ***
+        # *** THE OVERWRITE TRAP. Every claude-code-action invocation writes its result object to
+        # the SAME fixed path, $RUNNER_TEMP/claude-execution-output.json (claude-code-action@v1
+        # hard-codes it and has no input to change it), so these three sequential steps in one
+        # job overwrite each other. steps.<id>.outputs.execution_file does NOT escape this: it is
+        # per step, but every step's output names that one path, so by the time this step runs
+        # all three point at the LAST agent step's result. That is what the first version of
+        # this step read, and moneycomb run 37181494797 (2026-10-04, all three steps ran) wrote
+        # three records all carrying the proposer's 13 turns / $0.4612 / 55,285 ms.
+        # So each agent step is followed by a snapshot step that MOVES the default file to
+        # $RUNNER_TEMP/run-metrics-<step-key>.json before the next agent step can overwrite it,
+        # and each record reads ONLY its own per-step file. There is deliberately NO fallback to
+        # the default path (implementer-callable can afford that fallback; it has one agent step
+        # in its job). A missing per-step file yields a record with every result-derived field
+        # null, which is the honest answer. ***
         #
         # Observability, not a gate (STANDARDS §18.2): every failure path warns and continues,
         # the step never exits non-zero, and continue-on-error backstops the rest. Nothing here
@@ -400,21 +453,22 @@ jobs:
           QUEUE_SERVICE_ROLE_KEY: ${{ secrets.QUEUE_SERVICE_ROLE_KEY }}
           WATCHDOG_PRODUCT_SLUG: ${{ inputs.product_slug }}
           WATCHDOG_HUB_URL: ${{ inputs.hub_url }}
-          # Per step: did it run, where is ITS result object, and the model/effort it ran on.
+          # Per step: did it run, where is ITS result object (the snapshot step's per-step path,
+          # never outputs.execution_file - see the trap note), and the model/effort it ran on.
           # The models and efforts are the chosen values verbatim (an alias or an exact id), not
           # the resolution. The turn caps are NOT repeated here - the job env above is already in
           # every step's shell, so the script reads *_MAX_TURNS straight from it, which is the
           # same thing the steps' own --max-turns reads (one source, no second copy to drift).
           DOC_OUTCOME: ${{ steps.doc-reconciliation.outcome }}
-          DOC_EXEC_FILE: ${{ steps.doc-reconciliation.outputs.execution_file }}
+          DOC_EXEC_FILE: ${{ runner.temp }}/run-metrics-doc-reconciliation.json
           DOC_MODEL: ${{ inputs.doc_reconciliation_model }}
           DOC_EFFORT: ${{ inputs.doc_reconciliation_effort }}
           REC_OUTCOME: ${{ steps.recommender.outcome }}
-          REC_EXEC_FILE: ${{ steps.recommender.outputs.execution_file }}
+          REC_EXEC_FILE: ${{ runner.temp }}/run-metrics-recommender.json
           REC_MODEL: ${{ inputs.recommender_model }}
           REC_EFFORT: ${{ inputs.recommender_effort }}
           PROP_OUTCOME: ${{ steps.proposer.outcome }}
-          PROP_EXEC_FILE: ${{ steps.proposer.outputs.execution_file }}
+          PROP_EXEC_FILE: ${{ runner.temp }}/run-metrics-proposer.json
           PROP_MODEL: ${{ inputs.proposer_model }}
           PROP_EFFORT: ${{ inputs.proposer_effort }}
         run: |
@@ -495,7 +549,7 @@ jobs:
             if [ -n "$EXEC_FILE" ] && [ -f "$EXEC_FILE" ]; then
               SRC="$EXEC_FILE"
             else
-              echo "::notice::dev-watchdog: no result object for step ${STEP_KEY} (execution_file '${EXEC_FILE:-unset}'); recording the chosen model and effort with every result field null"
+              echo "::notice::dev-watchdog: no result object for step ${STEP_KEY} (no per-step result file at '${EXEC_FILE:-unset}'); recording the chosen model and effort with every result field null"
             fi
 
             # The whole body is built by jq, so nothing from the transcript or the inputs is ever
