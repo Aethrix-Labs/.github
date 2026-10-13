@@ -53,7 +53,7 @@ on:
         description: "Claude model for the agent: an alias (sonnet|opus|haiku|fable) or an exact id. Chosen per run by the hub; the default is a fallback for a dispatch that omits it, not the declaration (STANDARDS §14)."
         type: string
         required: false
-        default: "sonnet"
+        default: "claude-sonnet-5-5"
       effort:
         description: "Reasoning effort for the agent: low|medium|high|xhigh|max. Chosen per run by the hub; the default is a fallback for a dispatch that omits it."
         type: string
