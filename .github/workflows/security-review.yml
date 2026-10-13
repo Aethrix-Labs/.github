@@ -244,11 +244,10 @@ jobs:
               parses this file to gate the workflow.
 
             Do not ask questions. Produce the JSON.
-          # Alias, not an exact id: no hub is in this workflow's trigger path (a PR event),
-          # so nothing would ever bump a pinned id. "sonnet" tracks the current Sonnet on its
-          # own (MODEL_SELECTION_PROPOSAL 2.2) and keeps this off the manual bump procedure.
+          # Exact id, not an alias (DECISIONS 2026-10-13): no hub is in this workflow's trigger path
+          # (a PR event), so the YAML names the model that ran. It matches what /settings resolves to.
           claude_args: |
-            --model sonnet
+            --model claude-sonnet-5-5
             --effort medium
             --max-turns 25
             --allowedTools Read,Bash,Write

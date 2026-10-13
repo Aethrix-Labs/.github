@@ -220,11 +220,11 @@ jobs:
             - Product slug: $MT_PRODUCT_SLUG (or derive from $GITHUB_REPOSITORY).
             - Hub base URL: $MT_HUB_URL.
             - Mobile/simulator capable: $MT_MOBILE_CAPABLE (1 = this runner has one).
-          # Alias, not an exact id: no hub is in this workflow's trigger path (a milestone close landing on main),
-          # so nothing would ever bump a pinned id. "sonnet" tracks the current Sonnet on its
-          # own (MODEL_SELECTION_PROPOSAL 2.2) and keeps this off the manual bump procedure.
+          # Exact id, not an alias (DECISIONS 2026-10-13): no hub is in this workflow's trigger path
+          # (a milestone close landing on main), so the YAML names the model that ran. It matches
+          # what /settings resolves to.
           claude_args: |
-            --model sonnet
+            --model claude-sonnet-5-5
             --effort medium
             --max-turns ${{ env.AGENT_MAX_TURNS }}
             --allowedTools Read,Bash,Write,Edit,Glob,Grep
