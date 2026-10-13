@@ -61,7 +61,7 @@ on:
         default: "medium"
 
 permissions:
-  contents: write # the pass commits the sidecar and the routing destinations (BACKLOG / PLANNING / routing board)
+  contents: write # the pass commits the sidecar and the routing destinations (BACKLOG / the plan: docs/planning.json if present, else docs/PLANNING.md / routing board)
   pull-requests: write # ci-commit opens the PR
   id-token: write # required by anthropics/claude-code-action@v1
 

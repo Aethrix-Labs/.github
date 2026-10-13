@@ -231,10 +231,14 @@ jobs:
             Read `.fleet-ci/ci/dev-watchdog/SKILL.md`'s "Doc reconciliation" section
             and follow it exactly. This is a standing daily hygiene pass — it runs
             regardless of whether the product has open PLANNING/BACKLOG/routing board
-            work or is fully idle. Do everything that section lists, and nothing
-            outside it. Do NOT scan for deferred work, do NOT touch PLANNING.md
-            boxes, do NOT post any queue entry — that's handled by separate steps in
-            this same workflow run.
+            work or is fully idle. Do everything that section lists — including
+            stamping a `done_by: null` step in docs/planning.json with the merged PR
+            that set it, and closing any milestone whose steps are all `done` via
+            milestone-close Phase 1 — and nothing outside it. Do NOT scan for
+            deferred work and do NOT post any queue entry — that's handled by
+            separate steps in this same workflow run. Never tick or edit a plan
+            step; the only plan writes are the done_by stamp and the all-done close
+            the skill names.
 
             Runtime context:
             - Working directory has the full consumer repo (fetch-depth: 0).
@@ -310,9 +314,11 @@ jobs:
             follow-up queue entry. If several deferred items exist, pick the single
             highest-priority one. POST exactly once, then STOP — do NOT POST a second
             entry for another framing of the same finding, a reworded variant, or a
-            different finding. Do not author PLANNING.md steps or net-new committed
-            scope. Do not open a PR — that's the doc-reconciliation step's job, not
-            this one's.
+            different finding. Never tick, edit, or author a plan step (docs/planning.json
+            or docs/PLANNING.md) or net-new committed scope; this step makes no plan
+            writes at all — the done_by stamp and the all-done close are the
+            doc-reconciliation step's. Do not open a PR — that's the
+            doc-reconciliation step's job, not this one's.
           claude_args: |
             --model ${{ inputs.recommender_model }}
             --effort ${{ inputs.recommender_effort }}
