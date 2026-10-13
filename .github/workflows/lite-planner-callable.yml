@@ -4,7 +4,8 @@ name: lite-planner (callable)
 # The hub workflow_dispatches the thin per-product .github/workflows/lite-planner.yml
 # (on auto-feature approval), which `uses:` this. Flow: fetch the approved entry ->
 # Step-0 size/risk re-check (bounce if not "small") -> plan ONE no-design milestone ->
-# plan-reviewer -> commit PLANNING.md via ci-commit (low-tier auto-ship). The
+# plan-reviewer -> commit the plan (docs/planning.json if present, else docs/PLANNING.md)
+# via ci-commit (low-tier auto-ship). The
 # autonomous implementer loop builds it; this skill never implements.
 #
 # Requires the lite-planner bundle vended to fleet-skills `ci/lite-planner/`,
@@ -39,12 +40,12 @@ on:
         default: "medium"
 
 permissions:
-  contents: write       # commit the PLANNING.md edit (low-tier auto-ship)
+  contents: write       # commit the plan edit (docs/planning.json if present, else docs/PLANNING.md; low-tier auto-ship)
   pull-requests: write  # ci-commit opens the PR
   id-token: write       # required by anthropics/claude-code-action@v1
 
 concurrency:
-  # Serialize per product so two approvals can't race the PLANNING.md edit.
+  # Serialize per product so two approvals can't race the plan edit (docs/planning.json or docs/PLANNING.md).
   group: lite-planner-${{ github.repository }}
   cancel-in-progress: false
 
@@ -105,7 +106,8 @@ jobs:
             queue entry the skill specifies and STOP — do not write a plan.
 
             Otherwise: plan ONE no-design milestone (with the `**Auto-feature:**`
-            marker), run plan-reviewer, then commit the PLANNING.md edit by reading
+            marker), run plan-reviewer, then commit the plan edit (docs/planning.json when
+            the product has it, else docs/PLANNING.md) via ci-commit by reading
             `.fleet-ci/ci/ci-commit/SKILL.md` and following it (Tier Low, auto-ship).
             Do NOT implement — the autonomous implementer loop builds it.
 
