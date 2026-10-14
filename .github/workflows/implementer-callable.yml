@@ -318,7 +318,7 @@ jobs:
           # max-turns/crash death the agent never reached its exit path, so this
           # file is the only signal for WHERE it died. Localizes the failure to
           # a phase (step-identified | building | testing | adversary |
-          # committing) instead of a bare workflow-failed. Absent → "unknown".
+          # committing | rebasing) instead of a bare workflow-failed. Absent → "unknown".
           PHASE_FILE="${GITHUB_WORKSPACE:-.}/.implementer-phase"
           LAST_PHASE="unknown"
           if [ -f "$PHASE_FILE" ]; then
@@ -410,7 +410,8 @@ jobs:
           # commit-phase death the PR may have opened, gone green and been merged
           # by the hub while only the in-band tick-report died. Reporting that as
           # workflow-failed tells Seth to retry an already-closed step.
-          # Only reachable from `committing` — no PR can exist before it.
+          # Only reachable from `committing` — no PR of this run can exist before it
+          # (`rebasing` works an already-open PR; it gets its own recommendation below).
           # Best-effort and racy by design; the hub's merge-webhook reconcile
           # stays authoritative. This is the early exit so the common case never
           # shows a spurious retry card.
@@ -470,6 +471,12 @@ jobs:
               ATTEMPT="The agent ended without sending a tick-report or queue entry; cause unknown (the agent step's result object could not be read from this job)."
               RECO="Cause unknown - read the run log (and the transcript artifact, if one is attached) before choosing between retry and splitting the step. The last phase reached was '${LAST_PHASE}'." ;;
           esac
+          # rebasing (implementer Step 1d) works an existing PR after a hub merge-conflict send-back,
+          # so the split-the-step and plain-retry advice above is wrong whatever the cause: the work
+          # is already on the PR. The background-wait case keeps its own advice (the fix is the skill).
+          if [ "$LAST_PHASE" = "rebasing" ] && [ -z "$BG_WAIT" ]; then
+            RECO="Died while rebasing an existing PR after a hub send-back. Do not split the step - the work is already on the PR. Check whether the rebased branch was pushed (the PR's head and its comments) before retrying."
+          fi
           ATTEMPT="${ATTEMPT} Last phase reached: ${LAST_PHASE}. Run: ${RUN_URL}${RUN_ID_NOTE}${TRANSCRIPT_NOTE}"
 
           # Queue entry — exception, variant `workflow-failed`. request_id is rooted in the
