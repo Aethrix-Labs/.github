@@ -59,11 +59,25 @@ permissions:
   id-token: write # required by anthropics/claude-code-action@v1
 
 concurrency:
-  # Serialize per product — never run two implementer invocations on the same
-  # repo at once. Default `cancel-in-progress: false` so a queued second run
-  # waits rather than killing the in-flight one.
-  group: implementer-${{ github.repository }}
+  # Serialize per SESSION, not per product. Several sessions on one product (one
+  # per backlog item or milestone, M64) run side by side: each works on its own
+  # branch in its own runner slot (STANDARDS §27.7) and there are no shared
+  # bookkeeping lines to collide on (PRODUCT_VISIBILITY §15.8). A per-repo group
+  # used to block that. With GitHub's default single-pending queue, five of six
+  # per-item Plays dispatched on sethgibson-com on 2026-10-14 were cancelled
+  # before they started.
+  #
+  # Two runs of ONE session (a rebase retry, a direction send-back) still must
+  # not overlap, so they share a group: `cancel-in-progress: false` keeps the
+  # in-flight run alive, and `queue: max` (up to 100 pending) makes the next
+  # one wait in line instead of being dropped. A dispatch without a session_id
+  # falls back to its own run_id, so it is never grouped with anything.
+  #
+  # This block no longer limits parallelism across sessions. Runner capacity
+  # does: a run with no free runner for its label waits for one.
+  group: implementer-${{ github.repository }}-${{ inputs.session_id || github.run_id }}
   cancel-in-progress: false
+  queue: max
 
 jobs:
   implementer:
@@ -107,7 +121,7 @@ jobs:
         # Advisory: never a gate and never fails the job. The agent's own probe run is authoritative
         # (it can heal, and it is scoped to the repo's Playwright version). A missing script only means
         # the fleet-skills vending PR has not landed yet; that must not break CI for every product.
-        # Bounded: a hung probe must not hold this product's concurrency group for the default 6h.
+        # Bounded: a hung probe must not hold this session's concurrency group for the default 6h.
         continue-on-error: true
         timeout-minutes: 10
         shell: bash
@@ -762,7 +776,7 @@ jobs:
 
           # Up to 3 attempts, only on a network failure or a 5xx: the write is idempotent on
           # request_id, so a retry cannot double-insert, and a 4xx will not improve by repeating.
-          # --max-time so a hung hub cannot hold this product's concurrency group.
+          # --max-time so a hung hub cannot hold this session's concurrency group.
           SENT=""
           CODE=""
           for attempt in 1 2 3; do
