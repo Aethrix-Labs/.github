@@ -91,6 +91,65 @@ jobs:
           git config user.name  "design-to-planning[bot]"
           git config user.email "design-to-planning@aethrix-labs.local"
 
+      - name: Resolve model and effort
+        id: models
+        # The /settings dropdown is the only control for design-to-planning. The hub's Plan dispatch
+        # already sends its /settings value as inputs.model/effort. A push-started run does not: the
+        # caller's `redispatch` job starts it with `gh workflow run` under GITHUB_TOKEN, so the actor
+        # is github-actions and the inputs are just the YAML defaults (real-estate-manager run
+        # 39032124503 ran on sonnet/medium instead of the /settings value). Only that actor asks the
+        # hub; any other actor (the hub's Plan dispatch, a manual Actions run) keeps its inputs.
+        env:
+          RUN_ACTOR: ${{ github.actor }}
+          INPUT_MODEL: ${{ inputs.model }}
+          INPUT_EFFORT: ${{ inputs.effort }}
+          AUTONOMOUS_TICK_TOKEN: ${{ secrets.AUTONOMOUS_TICK_TOKEN }}
+          DTP_HUB_URL: ${{ inputs.hub_url }}
+        run: |
+          MODEL="$INPUT_MODEL"
+          EFFORT="$INPUT_EFFORT"
+          SOURCE="inputs"
+
+          if [ "$RUN_ACTOR" = "github-actions[bot]" ]; then
+            HUB="${DTP_HUB_URL:-https://sethgibson.com}"
+            HUB_MODEL=""; HUB_EFFORT=""; WHY=""
+            if [ -z "$AUTONOMOUS_TICK_TOKEN" ]; then
+              WHY="AUTONOMOUS_TICK_TOKEN is not set"
+            elif ! command -v jq >/dev/null 2>&1; then
+              WHY="jq is not on PATH"
+            elif ! BODY="$(curl -fsS --max-time 10 \
+                -H "Authorization: Bearer $AUTONOMOUS_TICK_TOKEN" \
+                "${HUB}/api/agent-models/design-to-planning")"; then
+              WHY="the hub call failed"
+            else
+              HUB_MODEL="$(printf '%s' "$BODY" | jq -r '.model // empty' 2>/dev/null || true)"
+              HUB_EFFORT="$(printf '%s' "$BODY" | jq -r '.effort // empty' 2>/dev/null || true)"
+              # These land in claude_args: shape-check them (DECISIONS 2026-10-13 / STANDARDS §14).
+              if ! printf '%s' "$HUB_MODEL" | grep -Eq '^[a-z0-9.-]+$'; then
+                WHY="the hub returned an invalid model"
+              else
+                case "$HUB_EFFORT" in
+                  low|medium|high|xhigh|max) ;;
+                  *) WHY="the hub returned an invalid effort" ;;
+                esac
+              fi
+            fi
+
+            if [ -z "$WHY" ]; then
+              MODEL="$HUB_MODEL"
+              EFFORT="$HUB_EFFORT"
+              SOURCE="hub"
+            else
+              echo "::warning::design-to-planning-callable: ${WHY}; falling back to inputs.model/inputs.effort (${MODEL}, ${EFFORT})"
+            fi
+          fi
+
+          echo "::notice::design-to-planning-callable: model=${MODEL} effort=${EFFORT} source=${SOURCE}"
+          {
+            echo "model=${MODEL}"
+            echo "effort=${EFFORT}"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Run design-to-planning agent
         id: agent
         uses: anthropics/claude-code-action@v1
@@ -123,8 +182,8 @@ jobs:
             - Product slug: $DTP_PRODUCT_SLUG (or derive from $GITHUB_REPOSITORY).
             - Hub base URL: $DTP_HUB_URL.
           claude_args: |
-            --model ${{ inputs.model }}
-            --effort ${{ inputs.effort }}
+            --model ${{ steps.models.outputs.model }}
+            --effort ${{ steps.models.outputs.effort }}
             --max-turns ${{ env.AGENT_MAX_TURNS }}
             --allowedTools Read,Bash,Write,Edit,Glob,Grep
             # --max-turns 180 matches lite-planner-callable and implementer-callable: the
