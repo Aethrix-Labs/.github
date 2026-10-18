@@ -300,6 +300,11 @@ jobs:
           # The action's transcript (a JSON array of SDK messages; the last `result` message carries
           # subtype / is_error / num_turns). Empty when the action died before writing it.
           AGENT_EXECUTION_FILE: ${{ steps.agent.outputs.execution_file }}
+          # The agent step's outcome and who started the run, for the pre-flight cause (the action
+          # refuses bot actors).
+          AGENT_OUTCOME: ${{ steps.agent.outcome }}
+          RUN_ACTOR: ${{ github.actor }}
+          RUN_ACTOR_TYPE: ${{ github.event.sender.type }}
         run: |
           # If the skill delivered its own tick-report it dropped this breadcrumb —
           # the hub already heard back, so this guard has nothing to do. Absent → fall
@@ -358,7 +363,9 @@ jobs:
           #   max-turns   subtype error_max_turns, or num_turns at/near the cap
           #   crash       is_error true, a non-success subtype, or no result object in the transcript
           #   clean-exit  subtype success, is_error false, turns well under the cap
-          #   unknown     transcript or jq unavailable, or a field would not parse
+          #   pre-flight  the agent step failed and no transcript exists: the action died in its own setup,
+          #               before the agent started
+          #   unknown     a transcript exists but jq is unavailable or a field would not parse
           EXEC_FILE="${AGENT_EXECUTION_FILE:-}"
           if [ -z "$EXEC_FILE" ]; then
             EXEC_FILE="${RUNNER_TEMP:-}/claude-execution-output.json"
@@ -402,6 +409,25 @@ jobs:
                 BG_WAIT=1
               fi
             fi
+          fi
+          # Pre-flight: the agent step failed and no transcript exists, so the action died in its own
+          # setup (token exchange, trigger or actor checks) before the agent started. A transcript that
+          # exists but cannot be parsed is not this case; it stays `unknown`. The action's own error line
+          # cannot be quoted from here: check-run annotations are filled in only when the job completes
+          # (annotations_count is 0 and the job-logs endpoint returns 404 while it runs, probed
+          # 2026-10-18), so the entry sends the reader to the agent step's log. What this step can say
+          # without guessing is who started the run, which is what the action's actor check reads.
+          PF_ATTEMPT=""; PF_RECO=""
+          if [ "$CAUSE" = "unknown" ] && [ "${AGENT_OUTCOME:-}" = "failure" ] && [ ! -f "$EXEC_FILE" ]; then
+            CAUSE="pre-flight"
+            # Interpolated into the JSON body below: a plain login, capped.
+            PF_ACTOR="$(printf '%s' "${RUN_ACTOR:-}" | tr -cd 'A-Za-z0-9_.[]-' | head -c 64)"
+            PF_BOT=""
+            if [ "${RUN_ACTOR_TYPE:-}" = "Bot" ]; then
+              PF_BOT=" This run was started by the bot actor ${PF_ACTOR:-unknown}, and claude-code-action refuses bot actors unless allowed_bots is set; if the agent step's log says 'Workflow initiated by non-human actor', that is the cause."
+            fi
+            PF_ATTEMPT="claude-code-action failed before the agent started: it wrote no transcript, so no agent session ran. Its own error line could not be read from inside the job (check-run annotations and the job log are only populated once the job completes), so it is not quoted here; it is in the log of the agent step.${PF_BOT}"
+            PF_RECO="Read the first lines of the agent step's log in the run for the action's error. If it says 'non-human actor' or allowed_bots, the run was started by a bot: re-dispatch it as a person (the hub's Plan / Retry runs under GITHUB_MERGE_TOKEN as sgibson53, which passes). Any other pre-flight error is an action setup problem, not a budget or agent failure: fix what the log names, then re-dispatch."
           fi
           echo "::notice::implementer-callable: agent result cause=${CAUSE} subtype=${R_SUBTYPE:-?} is_error=${R_ERR:-?} turns=${R_TURNS:-?}/${CAP:-?} bg_started=${R_BG:-?} bg_completed=${R_DONE:-?} stop_reason=${R_STOP:-?}"
 
@@ -467,6 +493,9 @@ jobs:
                 ATTEMPT="The agent step concluded success (result subtype success, is_error false, ${R_TURNS} of ${CAP} turns, well under the cap) but the agent ended its session without running its exit path: no queue entry or tick-report was sent."
                 RECO="Not a budget or infra failure - do not recommend splitting the step on this evidence. The agent stopped on its own at phase '${LAST_PHASE}'; read its final message in the transcript artifact to see why, then re-dispatch or fix the skill. If the phase is committing, check the PR state first: the work may have landed."
               fi ;;
+            pre-flight)
+              ATTEMPT="${PF_ATTEMPT} The agent never ran, so it sent no queue entry or tick-report."
+              RECO="$PF_RECO" ;;
             *)
               ATTEMPT="The agent ended without sending a tick-report or queue entry; cause unknown (the agent step's result object could not be read from this job)."
               RECO="Cause unknown - read the run log (and the transcript artifact, if one is attached) before choosing between retry and splitting the step. The last phase reached was '${LAST_PHASE}'." ;;
