@@ -161,12 +161,6 @@ jobs:
           DTP_SPEC_SLUG: ${{ inputs.spec_slug }}
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          # The caller's push-triggered `redispatch` job starts this run with `gh workflow run`
-          # under the default GITHUB_TOKEN, so the workflow_dispatch actor is `github-actions`
-          # (type Bot). claude-code-action refuses a bot actor unless it is listed, dying at
-          # startup with "Workflow initiated by non-human actor: github-actions (type: Bot)"
-          # (real-estate-manager co-tenant-occupancy, run 39032124503). Allow exactly that bot, not '*'.
-          allowed_bots: github-actions
           prompt: |
             You are running as the design-to-planning agent in CI, headless.
 
