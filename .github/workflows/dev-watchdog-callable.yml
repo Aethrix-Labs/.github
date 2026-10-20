@@ -5,12 +5,12 @@ name: dev-watchdog (callable)
 # `uses:` this. Flow (revised 2026-09-20, STANDARDS §24.1-24.2b):
 #   flags -> gate (local docs: PLANNING/BACKLOG/routing board) -> open-queue-entries
 #   check (only when the gate said the product looks idle) -> decide: signals-pending
-#   (from either source) -> debrief (no LLM); else idle -> recommender (deferred-scan
+#   (from either source) -> hold (nothing posted); else idle -> recommender (deferred-scan
 #   only) -> proposer. Doc reconciliation runs every day, unconditionally, as long as
 #   the product isn't pre-build — independent of the signals-pending/idle branch.
 #
 # Requires the dev-watchdog bundle vended to fleet-skills `ci/dev-watchdog/`
-# (SKILL.md, gate.sh, brief_collect.py, debrief_emit.py), reached here at
+# (SKILL.md, gate.sh, brief_collect.py), reached here at
 # .fleet-ci/ci/dev-watchdog/.
 
 on:
@@ -177,7 +177,7 @@ jobs:
           echo "open queue entries for ${SLUG}: ${COUNT}"
           echo "open_count=${COUNT:-0}" >> "$GITHUB_OUTPUT"
 
-      # ---- Decide: signals-pending (debrief) vs. genuinely idle. STANDARDS §24.1 ----
+      # ---- Decide: signals-pending (hold) vs. genuinely idle. STANDARDS §24.1 ----
       - name: Decide
         id: decide
         if: steps.flags.outputs.watchdog_enabled == 'true' && steps.gate.outputs.decision != 'pre-build'
@@ -185,29 +185,11 @@ jobs:
           DECISION="${{ steps.gate.outputs.decision }}"
           QCOUNT="${{ steps.queuecheck.outputs.open_count }}"
           if [ "$DECISION" = "signals-pending" ] || [ "${QCOUNT:-0}" -gt 0 ]; then
-            echo "path=debrief" >> "$GITHUB_OUTPUT"
+            echo "path=hold" >> "$GITHUB_OUTPUT"
           else
             echo "path=idle" >> "$GITHUB_OUTPUT"
           fi
           echo "dev-watchdog decide: gate=$DECISION open_queue_entries=${QCOUNT:-0}"
-
-      # ---- Debrief (no LLM), STANDARDS §24.1a. Deterministic — built from the
-      # gate's digest + the open-entries list, never an LLM call. ----
-      - name: Debrief
-        if: steps.decide.outputs.path == 'debrief'
-        env:
-          QUEUE_SERVICE_ROLE_KEY: ${{ secrets.QUEUE_SERVICE_ROLE_KEY }}
-          HUB_URL: ${{ inputs.hub_url }}
-          PRODUCT_SLUG: ${{ inputs.product_slug }}
-        run: |
-          SLUG="${PRODUCT_SLUG:-$(basename "$GITHUB_REPOSITORY")}"
-          python3 .fleet-ci/ci/dev-watchdog/debrief_emit.py \
-            --digest "${{ steps.gate.outputs.digest_path }}" \
-            --open-entries "$RUNNER_TEMP/dev-watchdog-open-entries.json" \
-            --product-slug "$SLUG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --hub-url "${HUB_URL:-https://sethgibson.com}" \
-            --service-role-key "$QUEUE_SERVICE_ROLE_KEY"
 
       # ---- Doc reconciliation (Sonnet, every day, unconditional), STANDARDS §24.2.
       # Runs regardless of signals-pending vs. idle — only pre-build (nothing
@@ -679,7 +661,7 @@ jobs:
           emit_record proposer           "$PROP_OUTCOME" "$PROP_EXEC_FILE" "$PROP_MODEL" "$PROP_EFFORT" "${PROPOSER_MAX_TURNS:-}"
 
           # Zero records is a correct outcome on every bail path (master switch off, the pre-build
-          # gate, or a debrief run that spent no LLM step). Say so rather than warning.
+          # gate, or a hold run that spent no LLM step). Say so rather than warning.
           echo "dev-watchdog calibration: ${WROTE} run-metrics record(s) written, ${SKIPPED} agent step(s) did not run (run_id ${RUN_ID})"
           exit 0
 
@@ -693,11 +675,11 @@ jobs:
           fi
           D="${{ steps.gate.outputs.decision }}"
           case "$D" in
-            pre-build) echo "Bailed: pre-build — early-phase skills own this product. No doc reconciliation, no debrief." ;;
+            pre-build) echo "Bailed: pre-build — early-phase skills own this product. No doc reconciliation." ;;
             signals-pending|recommend)
               echo "Doc reconciliation ran (every day, per STANDARDS §24.2)."
-              if [ "${{ steps.decide.outputs.path }}" = "debrief" ]; then
-                echo "Signals pending (gate=$D, open queue entries=${{ steps.queuecheck.outputs.open_count || 0 }}) — posted/refreshed the debrief."
+              if [ "${{ steps.decide.outputs.path }}" = "hold" ]; then
+                echo "Signals pending (gate=$D, open queue entries=${{ steps.queuecheck.outputs.open_count || 0 }}) — nothing posted; the hub's product page shows the open work."
               else
                 echo "Idle, nothing pending: ran the recommender."
                 if [ "${{ steps.flags.outputs.auto_feature_enabled }}" = "true" ] || [ "${{ steps.flags.outputs.inspiration_enabled }}" = "true" ]; then
