@@ -13,18 +13,26 @@ name: e2e-nominate (callable)
 #
 # It is never in the caller's `report.needs`, so it can never fail the weekly e2e run.
 #
-# Flow: read the last 8 days of git log and the suite's spec files -> nominate candidates for
-# pruning -> one fresh e2e-judge subagent per candidate -> write the proposals to
-# docs/e2e-suite.json -> commit only that file via ci-commit. It never runs the suite and never
-# removes or edits a spec, so there is no Playwright probe and no FLEET_TEST_PASSWORD here.
+# Flow: the nominator job reads the last 8 days of git log and the suite's spec files ->
+# nominates candidates for pruning -> one fresh e2e-judge subagent per candidate -> writes the
+# proposals to docs/e2e-suite.json -> commits only that file via ci-commit. It never runs the
+# suite and never removes or edits a spec, so there is no Playwright probe and no
+# FLEET_TEST_PASSWORD there. The flow then ends with the removal sweep (e2e-removal-sweep, the
+# second job, `needs: e2e-nominate`, `if: always()`): when docs/e2e-suite.json has an `approved`
+# row it carries Seth's approvals as ONE removal PR on e2e-suite/removal-sweep, which he merges
+# (never auto-merged). The "never removes or edits a spec" rule above applies to the nominator
+# job only; the sweep removes exactly the specs on `approved` rows and nothing else.
 #
 # Zero candidates or zero proposals is a clean exit: no commit, no queue entry. A failed run
 # files NO queue entry either: the next weekly run's 8-day window overlaps this one and
 # recovers the week, and TESTING.md §23.12 says this job must never demand attention for a
 # dead judge. The failure path leaves a warning, a step summary and the transcript artifact.
+# The sweep is the same: nothing approved is a clean no-op that never starts the agent, and a
+# dead sweep files no entry, leaving the open PR as it was for next week.
 #
 # Requires the fleet-skills `ci/` bundles e2e-suite-review and ci-commit, reached at
-# .fleet-ci/ci/<name>/. Until e2e-suite-review is vended, every run is a clean no-op.
+# .fleet-ci/ci/<name>/. Until e2e-suite-review is vended, every run is a clean no-op. The sweep
+# additionally needs the "Removal sweep (CI)" section in that SKILL.md.
 
 on:
   workflow_call:
@@ -46,8 +54,8 @@ on:
         default: "fleet"
 
 permissions:
-  contents: write # the nominator commits docs/e2e-suite.json
-  pull-requests: write # ci-commit opens the PR
+  contents: write # the nominator commits docs/e2e-suite.json; the sweep pushes its branch
+  pull-requests: write # ci-commit and the sweep open their PRs
   id-token: write # required by anthropics/claude-code-action@v1
 
 concurrency:
@@ -251,6 +259,226 @@ jobs:
         continue-on-error: true
         with:
           name: e2e-nominate-transcript-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.failure-note.outputs.transcript_path }}
+          if-no-files-found: warn
+          retention-days: 7
+
+  e2e-removal-sweep:
+    needs: e2e-nominate
+    if: always() # a dead or skipped nominator must not stop the sweep: it reads only the approved rows
+    runs-on: [self-hosted, "${{ inputs.runner_label }}"]
+    # STANDARDS §28.6. No completed run yet to measure; deletes files and opens one PR.
+    timeout-minutes: 60
+    env:
+      # One source for the turn cap, as in e2e-nominate.
+      AGENT_MAX_TURNS: "80"
+    steps:
+      - name: Guard — claude-code-action supports only some events
+        # Same reason as the nominator's guard: the reusable workflow inherits the CALLER's event.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          case "$EVENT_NAME" in
+            issues|issue_comment|pull_request|pull_request_target|pull_request_review|pull_request_review_comment|workflow_dispatch|repository_dispatch|schedule|workflow_run) ;;
+            *)
+              echo "::error::claude-code-action cannot run under '$EVENT_NAME'; the caller's e2e-weekly.yml must run this job under workflow_dispatch or schedule (STANDARDS §28.6)."
+              echo "### e2e-removal-sweep cannot run under \`$EVENT_NAME\`" >> "$GITHUB_STEP_SUMMARY"
+              echo "claude-code-action rejects this event, so the sweep was not started. Nothing was removed this week." >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+              ;;
+          esac
+
+      - uses: actions/checkout@v4 # consumer repo at $GITHUB_WORKSPACE
+        with:
+          fetch-depth: 0 # the sweep compares origin/main, its own branch and per-spec commit history
+
+      - uses: actions/checkout@v4 # fleet-skills (CI skills under ci/)
+        with:
+          repository: Aethrix-Labs/fleet-skills
+          path: .fleet-ci
+          ref: main
+          token: ${{ secrets.FLEET_SKILLS_PAT }} # fleet-skills is private
+
+      - name: Set up gh CLI
+        run: gh --version
+
+      - name: Configure git for commits
+        run: |
+          git config user.name  "e2e-removal-sweep[bot]"
+          git config user.email "e2e-removal-sweep@aethrix-labs.local"
+
+      - name: Guard — removal sweep vended to ci/
+        # The "Removal sweep (CI)" section ships in the e2e-suite-review bundle separately from this
+        # workflow. Until it lands, every run is a clean no-op rather than an agent with no procedure.
+        id: vend
+        shell: bash
+        run: |
+          if grep -qF '## Removal sweep (CI)' ".fleet-ci/ci/e2e-suite-review/SKILL.md" 2>/dev/null; then
+            echo "vended=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "vended=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::e2e-suite-review removal sweep not vended to ci/ yet; nothing removed"
+            echo "### e2e-removal-sweep" >> "$GITHUB_STEP_SUMMARY"
+            echo "Removal sweep not vended to ci/ yet; nothing removed" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Guard — anything approved
+        # This is what keeps a quiet week free: the agent never starts without an approved row.
+        id: approved
+        if: steps.vend.outputs.vended == 'true'
+        shell: bash
+        run: |
+          N=0
+          if [ -f docs/e2e-suite.json ]; then
+            N="$(jq '[.proposals[] | select(.status == "approved")] | length' docs/e2e-suite.json 2>/dev/null || echo 0)"
+          fi
+          case "$N" in ""|*[!0-9]*) N=0 ;; esac
+          if [ "$N" -gt 0 ]; then
+            echo "any=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::e2e-removal-sweep: ${N} approved row(s)"
+          else
+            echo "any=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::e2e-removal-sweep: nothing approved"
+            echo "### e2e-removal-sweep" >> "$GITHUB_STEP_SUMMARY"
+            echo "Nothing approved; no agent run." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Install dependencies (Playwright suites)
+        # The agent runs `playwright test --list` to catch a deleted helper that is still imported.
+        if: steps.approved.outputs.any == 'true'
+        shell: bash
+        run: |
+          if [ -f package.json ] && grep -qF '"@playwright/test"' package.json; then
+            pnpm install --frozen-lockfile
+          fi
+
+      - name: Run e2e-removal-sweep agent
+        id: agent
+        if: steps.approved.outputs.any == 'true'
+        uses: anthropics/claude-code-action@v1
+        env:
+          EN_PRODUCT_SLUG: ${{ inputs.product_slug }}
+          EN_HUB_URL: ${{ inputs.hub_url }}
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # Same bot actor as the nominator (the hub dispatches e2e-weekly under the default
+          # GITHUB_TOKEN). Allow exactly that bot, not '*'.
+          allowed_bots: github-actions
+          prompt: |
+            You are running as the **e2e removal sweep** in CI, unattended.
+
+            Read `.fleet-ci/ci/e2e-suite-review/SKILL.md` and follow its **"Removal sweep (CI)"**
+            section exactly.
+
+            Hard rules, restated because they are the ones that matter unattended:
+            - **Never** merge the PR.
+            - **Never** add the `auto-merge` or `commit-pending-merge` labels.
+            - **Never** remove a spec that is not on an `approved` row.
+            - **Never** edit another spec.
+            - Nothing to carry is a clean exit.
+            - **No queue entry**, ever.
+
+            Runtime context:
+            - Working directory has the full consumer repo (fetch-depth: 0).
+            - Product slug: $EN_PRODUCT_SLUG (or derive from $GITHUB_REPOSITORY).
+            - Hub base URL: $EN_HUB_URL.
+          # Exact id, not an alias (DECISIONS 2026-10-13); STANDARDS §14 row `e2e-removal-sweep`.
+          claude_args: |
+            --model claude-sonnet-5-5
+            --effort medium
+            --max-turns ${{ env.AGENT_MAX_TURNS }}
+            --allowedTools Read,Bash,Write,Edit,Glob,Grep
+            # --max-turns 80 is an unmeasured estimate: per-spec grep for registrations and
+            # helpers, playwright --list, two commits and the PR. Revisit once a completed run
+            # reports num_turns.
+
+      - name: Name the cause of an agent death
+        # No queue entry, by design (see the header): the next weekly run redoes the sweep.
+        # The cause is read off the agent's result object, not assumed.
+        id: failure-note
+        if: failure() && steps.agent.outcome == 'failure'
+        env:
+          # The action's transcript (a JSON array of SDK messages; the last `result` message carries
+          # subtype / is_error / num_turns). Empty when the action died before writing it.
+          AGENT_EXECUTION_FILE: ${{ steps.agent.outputs.execution_file }}
+          AGENT_OUTCOME: ${{ steps.agent.outcome }}
+        run: |
+          # Result-object reading as milestone-test-callable's guard does it:
+          #   max-turns   subtype error_max_turns, or num_turns at/near the cap
+          #   crash       is_error true, a non-success subtype, or no result object in the transcript
+          #   clean-exit  subtype success, is_error false, turns well under the cap
+          #   pre-flight  the agent step failed and no transcript exists: the action died in its own
+          #               setup, before the agent started
+          #   unknown     a transcript exists but jq is unavailable or a field would not parse
+          EXEC_FILE="${AGENT_EXECUTION_FILE:-}"
+          if [ -z "$EXEC_FILE" ]; then
+            EXEC_FILE="${RUNNER_TEMP:-}/claude-execution-output.json"
+          fi
+          CAP="${AGENT_MAX_TURNS:-}"
+          case "$CAP" in ""|*[!0-9]*) CAP="" ;; esac
+          R_KIND=""; R_SUBTYPE=""; R_ERR=""; R_TURNS=""; R_BG=""; R_DONE=""
+          if [ -f "$EXEC_FILE" ] && command -v jq >/dev/null 2>&1; then
+            R_LINE="$(jq -r -s '
+                [.[] | if type == "array" then .[] else . end | select(type == "object" and .type == "result")] | last
+                | if . == null then "none"
+                  else ["result", (.subtype | tostring), (.is_error | tostring), (.num_turns | tostring),
+                       ((.subagent_stats | objects | .started_in_background | numbers) // "" | tostring),
+                       ((.subagent_stats | objects | .completed | numbers) // "" | tostring)] | join("|")
+                  end' "$EXEC_FILE" 2>/dev/null || true)"
+            IFS='|' read -r R_KIND R_SUBTYPE R_ERR R_TURNS R_BG R_DONE <<< "$R_LINE" || true
+            R_SUBTYPE="$(printf '%s' "$R_SUBTYPE" | tr -cd 'A-Za-z0-9_-' | head -c 64)"
+            case "$R_ERR" in true|false) ;; *) R_ERR="" ;; esac
+            case "$R_TURNS" in ""|*[!0-9]*) R_TURNS="" ;; esac
+            # subagent_stats is absent on older transcripts: absent or unparseable is no evidence, never 0.
+            case "$R_BG" in ""|*[!0-9]*) R_BG="" ;; esac
+            case "$R_DONE" in ""|*[!0-9]*) R_DONE="" ;; esac
+          fi
+          CAUSE="unknown"
+          DETAIL=""
+          if [ "$R_KIND" = "none" ]; then
+            CAUSE="crash"
+          elif [ "$R_KIND" = "result" ]; then
+            if [ "$R_SUBTYPE" = "error_max_turns" ] || { [ -n "$R_TURNS" ] && [ -n "$CAP" ] && [ "$R_TURNS" -ge $((CAP * 9 / 10)) ]; }; then
+              CAUSE="max-turns"
+            elif [ "$R_ERR" = "true" ] || { [ -n "$R_SUBTYPE" ] && [ "$R_SUBTYPE" != "success" ]; }; then
+              CAUSE="crash"
+            elif [ "$R_SUBTYPE" = "success" ] && [ "$R_ERR" = "false" ] && [ -n "$R_TURNS" ] && [ -n "$CAP" ]; then
+              CAUSE="clean-exit"
+              # Sub-flag: the agent dispatched subagents in the background, none had completed, and it
+              # ended its turn waiting (STANDARDS 28.6).
+              if [ -n "$R_BG" ] && [ -n "$R_DONE" ] && [ "$R_BG" -ge 1 ] && [ "$R_DONE" -eq 0 ]; then
+                DETAIL=" The agent dispatched ${R_BG} subagent(s) in the background, none completed, and it ended its turn waiting (STANDARDS 28.6)."
+              fi
+            fi
+          fi
+          if [ "$CAUSE" = "unknown" ] && [ "${AGENT_OUTCOME:-}" = "failure" ] && [ ! -f "$EXEC_FILE" ]; then
+            CAUSE="pre-flight"
+            DETAIL=" claude-code-action failed before the agent started and wrote no transcript; its error line is in the agent step's log."
+          fi
+
+          MSG="e2e-removal-sweep: agent died, cause=${CAUSE} subtype=${R_SUBTYPE:-?} is_error=${R_ERR:-?} turns=${R_TURNS:-?}/${CAP:-?}.${DETAIL} No queue entry filed; the open removal PR, if any, stays as it was for next week's run."
+          echo "::warning::${MSG}"
+          {
+            echo "### e2e-removal-sweep agent died"
+            echo "${MSG}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # The transcript is the only record of the agent's final message; the runner's temp dir is
+          # wiped at job end. Hand it to the upload step below.
+          if [ -f "$EXEC_FILE" ] && [ -n "${GITHUB_OUTPUT:-}" ]; then
+            echo "transcript_path=$EXEC_FILE" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload the agent transcript (failure path only)
+        # The agent step runs with show_full_output: false, so the log carries the result object but
+        # not the agent's final message. An artifact rather than show_full_output: true — that would
+        # print every tool result, secrets included, into a log anyone with read access can open.
+        # The guard above sets `transcript_path` only when it ran, i.e. the agent step failed.
+        if: always() && steps.failure-note.outputs.transcript_path != ''
+        uses: actions/upload-artifact@v4
+        continue-on-error: true
+        with:
+          name: e2e-removal-sweep-transcript-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ steps.failure-note.outputs.transcript_path }}
           if-no-files-found: warn
           retention-days: 7
