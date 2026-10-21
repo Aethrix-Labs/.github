@@ -1,0 +1,256 @@
+name: e2e-nominate (callable)
+
+# Weekly e2e suite nominator (STANDARDS §23.12; procedure in TESTING.md §23.12 "Who runs it").
+#
+# A product's e2e-weekly.yml calls this as a job after the suite:
+#
+#   nominate:
+#     needs: [pc]
+#     if: always()
+#     permissions: { contents: write, pull-requests: write, id-token: write }
+#     uses: Aethrix-Labs/.github/.github/workflows/e2e-nominate-callable.yml@main
+#     secrets: inherit
+#
+# It is never in the caller's `report.needs`, so it can never fail the weekly e2e run.
+#
+# Flow: read the last 8 days of git log and the suite's spec files -> nominate candidates for
+# pruning -> one fresh e2e-judge subagent per candidate -> write the proposals to
+# docs/e2e-suite.json -> commit only that file via ci-commit. It never runs the suite and never
+# removes or edits a spec, so there is no Playwright probe and no FLEET_TEST_PASSWORD here.
+#
+# Zero candidates or zero proposals is a clean exit: no commit, no queue entry. A failed run
+# files NO queue entry either: the next weekly run's 8-day window overlaps this one and
+# recovers the week, and TESTING.md §23.12 says this job must never demand attention for a
+# dead judge. The failure path leaves a warning, a step summary and the transcript artifact.
+#
+# Requires the fleet-skills `ci/` bundles e2e-suite-review and ci-commit, reached at
+# .fleet-ci/ci/<name>/. Until e2e-suite-review is vended, every run is a clean no-op.
+
+on:
+  workflow_call:
+    inputs:
+      product_slug:
+        description: "Product slug (defaults to repo basename)."
+        type: string
+        required: false
+        default: ""
+      hub_url:
+        description: "Hub base URL. Defaults to https://sethgibson.com."
+        type: string
+        required: false
+        default: "https://sethgibson.com"
+      runner_label:
+        description: "Self-hosted runner label (STANDARDS §9 surface routing). 'fleet' = PC."
+        type: string
+        required: false
+        default: "fleet"
+
+permissions:
+  contents: write # the nominator commits docs/e2e-suite.json
+  pull-requests: write # ci-commit opens the PR
+  id-token: write # required by anthropics/claude-code-action@v1
+
+concurrency:
+  # Serialize nominator runs per product. Deliberately not shared with any other agent's group.
+  group: e2e-nominate-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  e2e-nominate:
+    runs-on: [self-hosted, "${{ inputs.runner_label }}"]
+    # STANDARDS §28.6. No completed run yet to measure; the job reads files and git history and
+    # dispatches at most 10 judges, so well under the milestone-test budget.
+    timeout-minutes: 90
+    env:
+      # One source for the turn cap: the agent step's --max-turns and the failure guard's
+      # "did it run out of turns?" test both read it, so they cannot drift apart.
+      AGENT_MAX_TURNS: "120"
+    steps:
+      - name: Guard — claude-code-action supports only some events
+        # A reusable workflow inherits the CALLER's event, and anthropics/claude-code-action@v1 throws
+        # "Unsupported event type" ~200 ms into its step for anything outside this list — before any
+        # skill phase runs, with nothing to say why. Fail here instead, naming the cause.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          case "$EVENT_NAME" in
+            issues|issue_comment|pull_request|pull_request_target|pull_request_review|pull_request_review_comment|workflow_dispatch|repository_dispatch|schedule|workflow_run) ;;
+            *)
+              echo "::error::claude-code-action cannot run under '$EVENT_NAME'; the caller's e2e-weekly.yml must run this job under workflow_dispatch or schedule (STANDARDS §28.6)."
+              echo "### e2e-nominate cannot run under \`$EVENT_NAME\`" >> "$GITHUB_STEP_SUMMARY"
+              echo "claude-code-action rejects this event, so the nominator was not started. Nothing was nominated this week." >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+              ;;
+          esac
+
+      - uses: actions/checkout@v4 # consumer repo at $GITHUB_WORKSPACE
+        with:
+          fetch-depth: 0 # the nominator reads 8 days of git log and the re-proposal rule's history
+
+      - uses: actions/checkout@v4 # fleet-skills (CI skills under ci/)
+        with:
+          repository: Aethrix-Labs/fleet-skills
+          path: .fleet-ci
+          ref: main
+          token: ${{ secrets.FLEET_SKILLS_PAT }} # fleet-skills is private
+
+      - name: Set up gh CLI
+        run: gh --version
+
+      - name: Configure git for commits
+        run: |
+          git config user.name  "e2e-nominate[bot]"
+          git config user.email "e2e-nominate@aethrix-labs.local"
+
+      - name: Guard — e2e-suite-review vended to ci/
+        # The fleet repo vends the e2e-suite-review CI bundle separately from this workflow. Until
+        # it lands, every run is a clean no-op rather than an agent dying on a missing skill.
+        id: vend
+        shell: bash
+        run: |
+          if [ -f ".fleet-ci/ci/e2e-suite-review/SKILL.md" ]; then
+            echo "vended=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "vended=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::e2e-suite-review not vended to ci/ yet; nothing nominated"
+            echo "### e2e-nominate" >> "$GITHUB_STEP_SUMMARY"
+            echo "e2e-suite-review not vended to ci/ yet; nothing nominated" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Run e2e-nominate agent
+        id: agent
+        if: steps.vend.outputs.vended == 'true'
+        uses: anthropics/claude-code-action@v1
+        env:
+          QUEUE_SERVICE_ROLE_KEY: ${{ secrets.QUEUE_SERVICE_ROLE_KEY }}
+          EN_PRODUCT_SLUG: ${{ inputs.product_slug }}
+          EN_HUB_URL: ${{ inputs.hub_url }}
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # The hub dispatches the caller's e2e-weekly.yml with workflow_dispatch under the default
+          # GITHUB_TOKEN, so the actor is `github-actions` (type Bot). claude-code-action refuses a
+          # bot actor unless it is listed. Allow exactly that bot, not '*'.
+          allowed_bots: github-actions
+          prompt: |
+            You are running as the **e2e suite nominator** in CI, unattended.
+
+            Read `.fleet-ci/ci/e2e-suite-review/SKILL.md` and follow its **"Weekly nominator (CI)"**
+            section exactly.
+
+            Hard rules, restated because they are the ones that matter unattended:
+            - **Never** remove or edit a spec. You nominate; you do not prune.
+            - **Never** write a bare `nominated` row. A candidate leaves your hands as a judge's
+              `declined` or `proposed` verdict, or not at all.
+            - **Never** judge inline. Dispatch one fresh general-purpose subagent per candidate, in
+              the **foreground**, never in the background: a headless run has no next turn, so a
+              background subagent that you wait on ends the session without its exit path
+              (STANDARDS §28.6).
+            - At most **10** judge dispatches in one run.
+            - Commit **only** `docs/e2e-suite.json`, by reading `.fleet-ci/ci/ci-commit/SKILL.md`
+              and following it.
+            - Zero candidates, or zero proposals, is a clean exit: no commit and no queue entry.
+
+            Runtime context:
+            - Working directory has the full consumer repo (fetch-depth: 0).
+            - Product slug: $EN_PRODUCT_SLUG (or derive from $GITHUB_REPOSITORY).
+            - Hub base URL: $EN_HUB_URL.
+          # Exact id, not an alias (DECISIONS 2026-10-13): no hub is in this workflow's trigger path,
+          # so the YAML names the model that ran. Effort matches the pinned e2e-judge agent.
+          claude_args: |
+            --model claude-sonnet-5-5
+            --effort high
+            --max-turns ${{ env.AGENT_MAX_TURNS }}
+            --allowedTools Read,Bash,Write,Edit,Glob,Grep
+            # --max-turns 120 is an unmeasured estimate: up to 10 judge dispatches, plus
+            # nominating, plus ci-commit. Revisit once a completed run reports num_turns.
+
+      - name: Name the cause of an agent death
+        # No queue entry, by design (see the header): a missed week is recovered by the next run.
+        # The cause is read off the agent's result object, not assumed.
+        id: failure-note
+        if: failure() && steps.agent.outcome == 'failure'
+        env:
+          # The action's transcript (a JSON array of SDK messages; the last `result` message carries
+          # subtype / is_error / num_turns). Empty when the action died before writing it.
+          AGENT_EXECUTION_FILE: ${{ steps.agent.outputs.execution_file }}
+          AGENT_OUTCOME: ${{ steps.agent.outcome }}
+        run: |
+          # Result-object reading as milestone-test-callable's guard does it:
+          #   max-turns   subtype error_max_turns, or num_turns at/near the cap
+          #   crash       is_error true, a non-success subtype, or no result object in the transcript
+          #   clean-exit  subtype success, is_error false, turns well under the cap
+          #   pre-flight  the agent step failed and no transcript exists: the action died in its own
+          #               setup, before the agent started
+          #   unknown     a transcript exists but jq is unavailable or a field would not parse
+          EXEC_FILE="${AGENT_EXECUTION_FILE:-}"
+          if [ -z "$EXEC_FILE" ]; then
+            EXEC_FILE="${RUNNER_TEMP:-}/claude-execution-output.json"
+          fi
+          CAP="${AGENT_MAX_TURNS:-}"
+          case "$CAP" in ""|*[!0-9]*) CAP="" ;; esac
+          R_KIND=""; R_SUBTYPE=""; R_ERR=""; R_TURNS=""; R_BG=""; R_DONE=""
+          if [ -f "$EXEC_FILE" ] && command -v jq >/dev/null 2>&1; then
+            R_LINE="$(jq -r -s '
+                [.[] | if type == "array" then .[] else . end | select(type == "object" and .type == "result")] | last
+                | if . == null then "none"
+                  else ["result", (.subtype | tostring), (.is_error | tostring), (.num_turns | tostring),
+                       ((.subagent_stats | objects | .started_in_background | numbers) // "" | tostring),
+                       ((.subagent_stats | objects | .completed | numbers) // "" | tostring)] | join("|")
+                  end' "$EXEC_FILE" 2>/dev/null || true)"
+            IFS='|' read -r R_KIND R_SUBTYPE R_ERR R_TURNS R_BG R_DONE <<< "$R_LINE" || true
+            R_SUBTYPE="$(printf '%s' "$R_SUBTYPE" | tr -cd 'A-Za-z0-9_-' | head -c 64)"
+            case "$R_ERR" in true|false) ;; *) R_ERR="" ;; esac
+            case "$R_TURNS" in ""|*[!0-9]*) R_TURNS="" ;; esac
+            # subagent_stats is absent on older transcripts: absent or unparseable is no evidence, never 0.
+            case "$R_BG" in ""|*[!0-9]*) R_BG="" ;; esac
+            case "$R_DONE" in ""|*[!0-9]*) R_DONE="" ;; esac
+          fi
+          CAUSE="unknown"
+          DETAIL=""
+          if [ "$R_KIND" = "none" ]; then
+            CAUSE="crash"
+          elif [ "$R_KIND" = "result" ]; then
+            if [ "$R_SUBTYPE" = "error_max_turns" ] || { [ -n "$R_TURNS" ] && [ -n "$CAP" ] && [ "$R_TURNS" -ge $((CAP * 9 / 10)) ]; }; then
+              CAUSE="max-turns"
+            elif [ "$R_ERR" = "true" ] || { [ -n "$R_SUBTYPE" ] && [ "$R_SUBTYPE" != "success" ]; }; then
+              CAUSE="crash"
+            elif [ "$R_SUBTYPE" = "success" ] && [ "$R_ERR" = "false" ] && [ -n "$R_TURNS" ] && [ -n "$CAP" ]; then
+              CAUSE="clean-exit"
+              # Sub-flag: the agent dispatched judges in the background, none had completed, and it
+              # ended its turn waiting (STANDARDS 28.6).
+              if [ -n "$R_BG" ] && [ -n "$R_DONE" ] && [ "$R_BG" -ge 1 ] && [ "$R_DONE" -eq 0 ]; then
+                DETAIL=" The agent dispatched ${R_BG} subagent(s) in the background, none completed, and it ended its turn waiting (STANDARDS 28.6)."
+              fi
+            fi
+          fi
+          if [ "$CAUSE" = "unknown" ] && [ "${AGENT_OUTCOME:-}" = "failure" ] && [ ! -f "$EXEC_FILE" ]; then
+            CAUSE="pre-flight"
+            DETAIL=" claude-code-action failed before the agent started and wrote no transcript; its error line is in the agent step's log."
+          fi
+
+          MSG="e2e-nominate: agent died, cause=${CAUSE} subtype=${R_SUBTYPE:-?} is_error=${R_ERR:-?} turns=${R_TURNS:-?}/${CAP:-?}.${DETAIL} No queue entry filed; the next weekly run's 8-day window recovers this week."
+          echo "::warning::${MSG}"
+          {
+            echo "### e2e-nominate agent died"
+            echo "${MSG}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # The transcript is the only record of the agent's final message; the runner's temp dir is
+          # wiped at job end. Hand it to the upload step below.
+          if [ -f "$EXEC_FILE" ] && [ -n "${GITHUB_OUTPUT:-}" ]; then
+            echo "transcript_path=$EXEC_FILE" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload the agent transcript (failure path only)
+        # The agent step runs with show_full_output: false, so the log carries the result object but
+        # not the agent's final message. An artifact rather than show_full_output: true — that would
+        # print every tool result, secrets included, into a log anyone with read access can open.
+        # The guard above sets `transcript_path` only when it ran, i.e. the agent step failed.
+        if: always() && steps.failure-note.outputs.transcript_path != ''
+        uses: actions/upload-artifact@v4
+        continue-on-error: true
+        with:
+          name: e2e-nominate-transcript-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.failure-note.outputs.transcript_path }}
+          if-no-files-found: warn
+          retention-days: 7
