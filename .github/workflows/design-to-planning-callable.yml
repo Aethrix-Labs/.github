@@ -48,6 +48,11 @@ on:
         type: string
         required: false
         default: "medium"
+      runner_label:
+        description: "Self-hosted runner label (STANDARDS §9 surface routing). 'fleet' = PC. Planning is read-and-write on docs only and needs no device, so 'fleet-mac' is only ever a spill-over choice, never a requirement."
+        type: string
+        required: false
+        default: "fleet"
 
 permissions:
   contents: write       # commit the plan edit (docs/planning.json, the spec, the routing board; doc-only auto-ship)
@@ -62,8 +67,11 @@ concurrency:
 
 jobs:
   design-to-planning:
-    # Fleet PC (WSL2) self-hosted runner. See ~/products/docs/SELF_HOSTED_RUNNER.md.
-    runs-on: [self-hosted, linux, fleet]
+    # Self-hosted runner, label set per dispatch (STANDARDS §9): 'fleet' (default) is the Fleet
+    # PC (WSL2); 'fleet-mac' only when the hub spills over. No `linux` label on purpose: the Mac
+    # has none, and only PC instances carry `fleet` (STANDARDS §28.1). See
+    # ~/products/docs/SELF_HOSTED_RUNNER.md.
+    runs-on: [self-hosted, "${{ inputs.runner_label }}"]
     # STANDARDS §28.6. Same budget as lite-planner: --max-turns 180 is ~60m at the implementer's
     # worst observed ~20s/turn, so a legitimately long plan is never cut off.
     timeout-minutes: 60

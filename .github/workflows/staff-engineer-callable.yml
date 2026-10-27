@@ -54,6 +54,11 @@ on:
         type: string
         required: false
         default: "high"
+      runner_label:
+        description: "Self-hosted runner label (STANDARDS §9 surface routing). 'fleet' = PC. Read-only analysis needs no device, so 'fleet-mac' is only ever a spill-over choice, never a requirement."
+        type: string
+        required: false
+        default: "fleet"
 
 permissions:
   contents: read    # checkout only — this agent commits nothing
@@ -70,9 +75,12 @@ concurrency:
 
 jobs:
   staff-engineer:
-    # Fleet PC (WSL2) self-hosted runner. See ~/products/docs/SELF_HOSTED_RUNNER.md.
-    # Read-only analysis, no device needed — never fleet-mac.
-    runs-on: [self-hosted, linux, fleet]
+    # Self-hosted runner, label set per dispatch (STANDARDS §9): 'fleet' (default) is the Fleet
+    # PC (WSL2); 'fleet-mac' only when the hub spills over. Read-only analysis, no device needed,
+    # so surface routing never picks fleet-mac for it. No `linux` label on purpose: the Mac has
+    # none, and only PC instances carry `fleet` (STANDARDS §28.1). See
+    # ~/products/docs/SELF_HOSTED_RUNNER.md.
+    runs-on: [self-hosted, "${{ inputs.runner_label }}"]
     timeout-minutes: 20 # STANDARDS §28.6
     steps:
       - uses: actions/checkout@v4        # consumer repo (the entry's product) at $GITHUB_WORKSPACE
