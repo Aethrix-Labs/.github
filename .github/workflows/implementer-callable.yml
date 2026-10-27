@@ -150,6 +150,67 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           rm -f "$RUNNER_TEMP/tooling-probe.txt"
 
+      - name: Install Claude Code CLI (job-private HOME)
+        # WHY THIS STEP EXISTS. claude-code-action installs the CLI itself, on every step that uses
+        # it, by running claude.ai/install.sh. That script stages its download in
+        # $HOME/.claude/downloads under a name keyed only on version and platform
+        # (claude-<latest>-<platform>[.zst]) and deletes it when done. Every runner instance on a
+        # host shares one $HOME (six on the PC, three on the Mac), so two jobs installing at the same
+        # moment delete or overwrite each other's file mid-checksum. 2026-10-09 06:57 UTC: three of
+        # five dev-watchdog runs that started in the same second failed, after all three install
+        # attempts, with `sha256sum: .../claude-2.1.295-linux-x64.zst: No such file` and then
+        # `Checksum verification failed`. It needs no new CLI release to trigger, only an overlap.
+        #
+        # THE FIX is to run that same installer here with HOME pointed at a directory private to this
+        # job, so the staged download, the version store and the launcher are all this job's own and
+        # there is nothing shared left to lock. The result goes to the action through
+        # path_to_claude_code_executable, which makes it skip its own install. ONLY the installer sees
+        # the private HOME. The agent still runs in the real one, because jobs rely on it (the
+        # pnpm/npm store, Playwright browsers and `gh` config on the PC; the simulators, keychain and
+        # Maestro under ~/Library and ~/.maestro on the Mac). That is also why a job-wide HOME
+        # override is the wrong fix: the action's install and the agent run are ONE step, so HOME
+        # cannot change for one and not the other. A lock would not be better: it needs mkdir rather
+        # than flock (the Mac has none), a killed runner leaves it behind, and a second install can
+        # still replace the CLI under a job that is already running it.
+        #
+        # The version is the one the action pins (claudeCodeVersion in its run.ts), read from the copy
+        # the runner has already downloaded, so the CLI keeps moving with the action's @v1 tag instead
+        # of with a number copied into this file. ANY failure here (unreadable pin, failed install,
+        # wrong version) takes the old path, the action's own install, with a ::warning::. That makes
+        # this step an improvement and never a gate; the warning is what keeps the fallback from
+        # decaying into dead code unnoticed. Same step, same script, in every callable that runs
+        # claude-code-action: change them together.
+        id: claude-cli
+        continue-on-error: true
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          CLI_HOME="$RUNNER_TEMP/claude-cli-home"
+          PIN_SRC="$RUNNER_WORKSPACE/../_actions/anthropics/claude-code-action/v1/src/entrypoints/run.ts"
+          fall_back() {
+            echo "::warning::claude-cli pre-install skipped: $1. claude-code-action will install the CLI itself into the shared ~/.claude/downloads, where a concurrent job can make that fail with 'Checksum verification failed'."
+            exit 0
+          }
+          VERSION="$(sed -n 's/.*claudeCodeVersion = "\([0-9][0-9.]*\)".*/\1/p' "$PIN_SRC" 2>/dev/null | head -n 1)" || VERSION=""
+          [ -n "$VERSION" ] || fall_back "could not read the pinned CLI version from $PIN_SRC"
+          rm -rf "$CLI_HOME"
+          mkdir -p "$CLI_HOME" || fall_back "could not create $CLI_HOME"
+          for ATTEMPT in 1 2 3; do
+            env -u XDG_DATA_HOME -u XDG_CONFIG_HOME -u XDG_CACHE_HOME -u XDG_STATE_HOME -u CLAUDE_CONFIG_DIR HOME="$CLI_HOME" \
+              bash -c 'set -o pipefail; curl -fsSL https://claude.ai/install.sh | bash -s -- "$1"' _ "$VERSION" && break
+            echo "claude-cli pre-install: attempt $ATTEMPT failed"
+            [ "$ATTEMPT" -lt 3 ] && sleep 5
+          done
+          BIN="$CLI_HOME/.local/bin/claude"
+          [ -x "$BIN" ] || fall_back "the installer left no executable at $BIN"
+          GOT="$(env HOME="$CLI_HOME" "$BIN" --version 2>/dev/null | head -n 1)" || true
+          case "$GOT" in
+            "$VERSION"*) ;;
+            *) fall_back "$BIN reports '$GOT', not the pinned $VERSION" ;;
+          esac
+          echo "path=$BIN" >> "$GITHUB_OUTPUT"
+          echo "claude-cli pre-install: $GOT at $BIN (installer HOME was $CLI_HOME)"
+
       - name: Run implementer agent
         id: agent
         uses: anthropics/claude-code-action@v1
@@ -182,6 +243,8 @@ jobs:
           # (`verification-unavailable`, STANDARDS §23.9) — it no longer silently no-ops.
           UI_SELF_CHECK_MOBILE: ${{ inputs.runner_label == 'fleet-mac' && '1' || '0' }}
         with:
+          # Set by the pre-install step above; empty means it fell back and the action installs itself.
+          path_to_claude_code_executable: ${{ steps.claude-cli.outputs.path }}
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           prompt: |
             You are running as the **implementer agent** in CI.

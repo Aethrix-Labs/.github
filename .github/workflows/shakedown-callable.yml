@@ -162,6 +162,42 @@ jobs:
             exit 1
           fi
 
+      - name: Install Claude Code CLI (job-private HOME)
+        # Pre-installs the CLI under a job-private HOME so concurrent jobs do not collide in the
+        # shared ~/.claude/downloads (2026-10-09: 3 of 5 simultaneous dev-watchdog runs failed with
+        # `Checksum verification failed`). Why, and what the fallback is: implementer-callable.yml's
+        # step of the same name. Same script in every callable; change them together.
+        id: claude-cli
+        continue-on-error: true
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          CLI_HOME="$RUNNER_TEMP/claude-cli-home"
+          PIN_SRC="$RUNNER_WORKSPACE/../_actions/anthropics/claude-code-action/v1/src/entrypoints/run.ts"
+          fall_back() {
+            echo "::warning::claude-cli pre-install skipped: $1. claude-code-action will install the CLI itself into the shared ~/.claude/downloads, where a concurrent job can make that fail with 'Checksum verification failed'."
+            exit 0
+          }
+          VERSION="$(sed -n 's/.*claudeCodeVersion = "\([0-9][0-9.]*\)".*/\1/p' "$PIN_SRC" 2>/dev/null | head -n 1)" || VERSION=""
+          [ -n "$VERSION" ] || fall_back "could not read the pinned CLI version from $PIN_SRC"
+          rm -rf "$CLI_HOME"
+          mkdir -p "$CLI_HOME" || fall_back "could not create $CLI_HOME"
+          for ATTEMPT in 1 2 3; do
+            env -u XDG_DATA_HOME -u XDG_CONFIG_HOME -u XDG_CACHE_HOME -u XDG_STATE_HOME -u CLAUDE_CONFIG_DIR HOME="$CLI_HOME" \
+              bash -c 'set -o pipefail; curl -fsSL https://claude.ai/install.sh | bash -s -- "$1"' _ "$VERSION" && break
+            echo "claude-cli pre-install: attempt $ATTEMPT failed"
+            [ "$ATTEMPT" -lt 3 ] && sleep 5
+          done
+          BIN="$CLI_HOME/.local/bin/claude"
+          [ -x "$BIN" ] || fall_back "the installer left no executable at $BIN"
+          GOT="$(env HOME="$CLI_HOME" "$BIN" --version 2>/dev/null | head -n 1)" || true
+          case "$GOT" in
+            "$VERSION"*) ;;
+            *) fall_back "$BIN reports '$GOT', not the pinned $VERSION" ;;
+          esac
+          echo "path=$BIN" >> "$GITHUB_OUTPUT"
+          echo "claude-cli pre-install: $GOT at $BIN (installer HOME was $CLI_HOME)"
+
       - name: Run shakedown agent
         id: agent
         uses: anthropics/claude-code-action@v1
@@ -173,6 +209,8 @@ jobs:
           SD_SESSION: ${{ inputs.session }}
           SD_CLOSE: ${{ inputs.close }}
         with:
+          # Set by the pre-install step above; empty means it fell back and the action installs itself.
+          path_to_claude_code_executable: ${{ steps.claude-cli.outputs.path }}
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           # The caller's dispatch may run under the default GITHUB_TOKEN, making the workflow_dispatch
           # actor `github-actions` (type Bot), which claude-code-action refuses unless listed
