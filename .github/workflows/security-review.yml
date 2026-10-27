@@ -29,10 +29,106 @@ permissions:
 # keep ubuntu-latest: they don't bill minutes, and the self-hosted runner group is
 # private-repos-only. The self-hosted runner has no sudo, no pip and a persistent home, so
 # every tool below installs into the per-runner tool cache instead of /usr/local.
+#
+# Spill-over (STANDARDS §9 "Spill-over", §28.1). In a private repo the three jobs below do
+# not name a host: they take the label the choose-runner job emits, `fleet` (the PC) or
+# `fleet-mac` (the Mac, when the PC is saturated). So nothing in them may assume Linux: the
+# runner is `[self-hosted, <label>]` with no OS label (the Mac carries macOS/ARM64 and no
+# `linux`), and every downloaded binary resolves its own OS and architecture. A job that
+# only works on the PC would fail on exactly the runs that spill, the hardest to reproduce.
 
 jobs:
+  # Picks the host for the jobs below. It runs on ubuntu-latest, the one sanctioned hosted-
+  # runner job in a private repo (STANDARDS §28.1): on `fleet` it would queue behind the very
+  # saturation it exists to detect, and on a bare `[self-hosted]` it could land on, and
+  # consume, the Mac instance it is protecting. Do not move it to a self-hosted runner. It is
+  # seconds of work, billed as GitHub's one-minute minimum. Skipped in a public repo, which
+  # is on ubuntu-latest already.
+  #
+  # Rule: `fleet` if any fleet instance is online and idle. Otherwise `fleet-mac`, but only
+  # if a fleet-mac instance is itself online and idle. The Mac is manual-start, and a job
+  # routed to a label with no online instance sits queued for ~24 h, where waiting on a
+  # saturated PC drains in minutes (STANDARDS §9 "Manual-start operational model";
+  # DECISIONS 2026-10-05). It is a snapshot, not a reservation: PRs opened together read the
+  # same state and all pick `fleet`.
+  #
+  # FAILS OPEN TO `fleet`, never to `fleet-mac`, on any error: unset credential, non-200,
+  # unparseable or truncated body, or an unexpected failure in the script. `fleet-mac` would
+  # send a web job to the one host a mobile job cannot do without. A degraded read must be
+  # loud: the milestone-test gate's equivalent check sat behind an unset secret and silently
+  # took its fail-open branch in six repos for months. Hence the ::warning:: on every
+  # degraded path. The job itself never fails.
+  choose-runner:
+    if: github.event.repository.private
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {} # checks out nothing and uses no job token; the runners read uses the PAT below
+    outputs:
+      runner_label: ${{ steps.pick.outputs.runner_label }}
+    steps:
+      - name: Pick the runner label
+        id: pick
+        env:
+          # Fine-grained PAT, org permission "Self-hosted runners: Read" only, private repos
+          # only. GITHUB_TOKEN and the merge PAT both 403 on the org runners endpoint.
+          RUNNERS_READ_TOKEN: ${{ secrets.RUNNERS_READ_TOKEN }}
+          ORG: ${{ github.repository_owner }}
+        run: |
+          set +e
+          fail_open() {
+            echo "::warning::security-review runner chooser DEGRADED: $1. Falling open to fleet; spill-over to fleet-mac was NOT evaluated for this PR."
+            echo "runner_label=fleet" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+          trap 'fail_open "unexpected error at line $LINENO"' ERR
+
+          if [ -z "${RUNNERS_READ_TOKEN:-}" ]; then
+            fail_open "RUNNERS_READ_TOKEN is not set or not visible to this repo"
+          fi
+          command -v jq >/dev/null 2>&1 || fail_open "jq is not on PATH"
+
+          BODY="$RUNNER_TEMP/org-runners.json"
+          CODE="$(curl -sS -m 20 -o "$BODY" -w '%{http_code}' \
+            -H "Authorization: Bearer $RUNNERS_READ_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/orgs/${ORG}/actions/runners?per_page=100")" \
+            || fail_open "the runners request could not reach GitHub"
+          [ "$CODE" = "200" ] || fail_open "the runners endpoint returned HTTP $CODE"
+
+          # Parseable AND complete. A second page of runners would make the counts below a
+          # silent undercount, which could read a busy PC as idle or an idle Mac as absent.
+          jq -e '(.runners | type) == "array" and (.total_count | type) == "number" and .total_count <= (.runners | length)' "$BODY" >/dev/null 2>&1 \
+            || fail_open "the runners response was unparseable or spans more than one page"
+
+          IDLE='[.runners[] | select(.status == "online" and .busy == false and any((.labels // [])[]; .name == $l))] | length'
+          FLEET_IDLE="$(jq -r --arg l fleet "$IDLE" "$BODY")"
+          MAC_IDLE="$(jq -r --arg l fleet-mac "$IDLE" "$BODY")"
+          case "${FLEET_IDLE}x${MAC_IDLE}" in
+            *[!0-9x]* | x* | *x) fail_open "could not count idle instances (fleet='${FLEET_IDLE}', fleet-mac='${MAC_IDLE}')" ;;
+          esac
+
+          if [ "$FLEET_IDLE" -gt 0 ]; then
+            LABEL=fleet
+            WHY="$FLEET_IDLE fleet instance(s) online and idle"
+          elif [ "$MAC_IDLE" -gt 0 ]; then
+            LABEL=fleet-mac
+            WHY="no fleet instance is idle; $MAC_IDLE fleet-mac instance(s) online and idle"
+          else
+            LABEL=fleet
+            WHY="no fleet instance is idle, but no fleet-mac instance is online and idle either; the job waits on the PC"
+          fi
+          echo "runner_label=$LABEL" >> "$GITHUB_OUTPUT"
+          echo "::notice::security-review runs on $LABEL: $WHY"
+
   deterministic:
-    runs-on: ${{ github.event.repository.private && fromJSON('["self-hosted","linux","fleet"]') || 'ubuntu-latest' }}
+    needs: choose-runner
+    # choose-runner is skipped in a public repo, and a skipped dependency would skip this job
+    # too, which here would silently pass a required check without scanning. So: run unless
+    # the workflow is cancelled, whatever the chooser did. A failed or skipped chooser reads as
+    # an empty label below and falls back to `fleet`.
+    if: ${{ !cancelled() }}
+    runs-on: ${{ github.event.repository.private && fromJSON(format('["self-hosted","{0}"]', needs.choose-runner.outputs.runner_label || 'fleet')) || 'ubuntu-latest' }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4 # consumer repo at $GITHUB_WORKSPACE
@@ -50,11 +146,27 @@ jobs:
         run: |
           set -ex
           GITLEAKS_VERSION=8.24.3
+          # The job may land on the PC (Linux x86_64) or the Mac (Darwin arm64), so resolve the
+          # release asset instead of hardcoding it. gitleaks' asset vocabulary is NOT uname's:
+          # linux/darwin for the OS, x64/arm64 for the architecture (x86_64 -> x64, not amd64).
+          # An unmapped value fails here, loudly, rather than guessing an asset that 404s or,
+          # worse, downloads one that runs on the wrong architecture.
+          case "$(uname -s)" in
+            Linux)  GL_OS=linux ;;
+            Darwin) GL_OS=darwin ;;
+            *) echo "::error::Install gitleaks: no release asset mapping for OS '$(uname -s)'"; exit 1 ;;
+          esac
+          case "$(uname -m)" in
+            x86_64)        GL_ARCH=x64 ;;
+            arm64|aarch64) GL_ARCH=arm64 ;;
+            *) echo "::error::Install gitleaks: no release asset mapping for architecture '$(uname -m)'"; exit 1 ;;
+          esac
           # Tool cache, not /usr/local/bin: the self-hosted runner has no sudo. Cached per
-          # runner by version, so only the first run on each runner downloads.
-          DIR="${RUNNER_TOOL_CACHE}/gitleaks/${GITLEAKS_VERSION}"
+          # runner by version AND os_arch, so only the first run on each runner downloads and
+          # one cache entry can never serve the wrong architecture.
+          DIR="${RUNNER_TOOL_CACHE}/gitleaks/${GITLEAKS_VERSION}/${GL_OS}_${GL_ARCH}"
           if [ ! -x "$DIR/gitleaks" ]; then
-            URL="https://github.com/zricethezav/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+            URL="https://github.com/zricethezav/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_${GL_OS}_${GL_ARCH}.tar.gz"
             # zricethezav (the original org) hosts release artifacts; the
             # gitleaks/gitleaks rename's redirect does NOT cover asset URLs.
             # `curl -fsSL` fails loudly on 404 instead of silently downloading
@@ -186,9 +298,10 @@ jobs:
           if-no-files-found: ignore
 
   semantic:
-    runs-on: ${{ github.event.repository.private && fromJSON('["self-hosted","linux","fleet"]') || 'ubuntu-latest' }}
+    # Same host as the deterministic job: both read the one label choose-runner emitted.
+    runs-on: ${{ github.event.repository.private && fromJSON(format('["self-hosted","{0}"]', needs.choose-runner.outputs.runner_label || 'fleet')) || 'ubuntu-latest' }}
     timeout-minutes: 30
-    needs: deterministic
+    needs: [choose-runner, deterministic]
     if: always() # run the semantic step even on deterministic failure — triage whatever the deterministic tools found
     permissions:
       contents: read
@@ -333,16 +446,20 @@ jobs:
   # workflow goes green it pings the hub, which correlates the PR to a waiting
   # `paused-merge` session and fires the synchronous `mergePr()`.
   #
-  # `needs: [deterministic, semantic]` + the default success() gate means this
+  # `needs: [deterministic, semantic]` + the success gate on both means this
   # job runs ONLY when both gating jobs succeeded — i.e. the required workflow
   # is green. A critical dep-audit or semantic finding fails its job, so this
   # never fires on a red PR. A legitimately-skipped semantic review (§3.3 gate)
   # still leaves the semantic job green, so green-with-skip correctly pings.
+  #
+  # choose-runner is in `needs` only to read its label, and it is skipped in a public repo,
+  # which would skip a plain `if: success()` job. So the condition names the two gating jobs
+  # and ignores the chooser: the same "both gating jobs succeeded" meaning, spelled out.
   merge-ready:
-    runs-on: ${{ github.event.repository.private && fromJSON('["self-hosted","linux","fleet"]') || 'ubuntu-latest' }}
+    runs-on: ${{ github.event.repository.private && fromJSON(format('["self-hosted","{0}"]', needs.choose-runner.outputs.runner_label || 'fleet')) || 'ubuntu-latest' }}
     timeout-minutes: 5
-    needs: [deterministic, semantic]
-    if: success()
+    needs: [choose-runner, deterministic, semantic]
+    if: ${{ !cancelled() && needs.deterministic.result == 'success' && needs.semantic.result == 'success' }}
     permissions:
       contents: read
     steps:
