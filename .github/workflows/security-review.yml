@@ -261,9 +261,14 @@ jobs:
 
       # npm:
       - name: Dep audit (npm)
-        run: npm audit --omit=dev --json > npm-audit.json || true
+        # In an npm-workspaces monorepo the lockfile marks test/build tooling (vitest, vite,
+        # esbuild, drizzle-kit) `devOptional`, which --omit=dev alone keeps; --omit=peer does not
+        # help. --omit=optional drops them. See STANDARDS §17.13.
+        run: npm audit --omit=dev --omit=optional --json > npm-audit.json || true
 
       # pnpm:  (also requires `- uses: pnpm/action-setup@v4` BEFORE this step)
+      # NOTE (pnpm and yarn): the aggregator parses npm's audit shape only, so the
+      # .npm-audit-ignore.json allowlist and the gate count do not apply to these variants.
       # - name: Dep audit (pnpm)
       #   run: pnpm audit --json > npm-audit.json || true
 
@@ -274,16 +279,6 @@ jobs:
       # non-Node: delete this step AND the "Fail on critical" step below.
       # --- end DEP-AUDIT VARIANT ---
 
-      - name: Fail on critical dep-audit findings
-        run: |
-          CRITICAL=$(jq '.metadata.vulnerabilities.critical // 0' npm-audit.json)
-          HIGH=$(jq '.metadata.vulnerabilities.high // 0' npm-audit.json)
-          echo "dep-audit: critical=$CRITICAL high=$HIGH"
-          if [ "$CRITICAL" -gt "0" ]; then
-            echo "::error::$CRITICAL critical dep-audit findings — blocking"
-            exit 1
-          fi
-
       - name: Aggregate deterministic findings
         if: always()
         run: |
@@ -292,6 +287,22 @@ jobs:
             --semgrep semgrep-results.json \
             --npm-audit npm-audit.json \
             --output deterministic-findings.json
+
+      - name: Fail on critical dep-audit findings
+        run: |
+          # Post-allowlist counts from the aggregator (STANDARDS §17.13). Falls back to npm's raw
+          # count when the aggregator predates the dep_audit block, so this lands in either order.
+          CRITICAL=$(jq -r '.dep_audit.critical // empty' deterministic-findings.json 2>/dev/null || true)
+          HIGH=$(jq -r '.dep_audit.high // empty' deterministic-findings.json 2>/dev/null || true)
+          if [ -z "$CRITICAL" ]; then
+            CRITICAL=$(jq '.metadata.vulnerabilities.critical // 0' npm-audit.json)
+            HIGH=$(jq '.metadata.vulnerabilities.high // 0' npm-audit.json)
+          fi
+          echo "dep-audit: critical=$CRITICAL high=$HIGH (after .npm-audit-ignore.json)"
+          if [ "$CRITICAL" -gt "0" ]; then
+            echo "::error::$CRITICAL critical dep-audit findings — blocking. Record a reviewed, not-reachable advisory in .npm-audit-ignore.json (STANDARDS §17.13)."
+            exit 1
+          fi
 
       - name: Upload deterministic artifacts
         if: always()

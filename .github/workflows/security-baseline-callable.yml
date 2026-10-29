@@ -333,7 +333,7 @@ jobs:
               echo "::warning::pnpm-lock.yaml found but pnpm is not on PATH; dep-audit skipped."
             fi
           elif [ -f package-lock.json ]; then
-            npm audit --omit=dev --json > npm-audit.json || true
+            npm audit --omit=dev --omit=optional --json > npm-audit.json || true
           else
             echo "::notice::No pnpm-lock.yaml or package-lock.json at the repo root; dep-audit skipped."
           fi
