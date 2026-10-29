@@ -1,0 +1,990 @@
+name: security-baseline (callable)
+
+# Scheduled whole-repo security scan (initiative `security-baseline`; STANDARDS §28.5, §14 matrix row,
+# §8 idempotency row; DECISIONS 2026-10-29). The per-PR gate (security-review.yml) is diff-scoped by
+# design; this reads the repo as a whole, on the hub's schedule, for products that opted in.
+#
+# The product's thin .github/workflows/security-baseline.yml (workflow_dispatch ONLY: the hub is the
+# only trigger, which also satisfies claude-code-action's event rule, STANDARDS §28.6) calls this:
+#
+#   uses: Aethrix-Labs/.github/.github/workflows/security-baseline-callable.yml@main
+#   secrets: inherit
+#   with: { product_slug, hub_url, model, effort, scan, since_sha }
+#
+# Flow:
+#   scope          baseline-scope.py splits the repo (or the diff since `since_sha`) into chunks
+#   deterministic  gitleaks (working tree, NOT history) + Semgrep + dep-audit -> deterministic-findings.json
+#   semantic       one claude-code-action session per chunk (matrix, 2 at a time)
+#   route          baseline-route.py: triage, fingerprints, queue entries for Criticals, the
+#                  docs/backlog.json edits and the hub's completion callback. If it changed the
+#                  backlog, ONE doc-only PR on the product touches docs/backlog.json and nothing else
+#   run-metrics    the cost record (agent_name: security-baseline) the initiative's done-when needs
+#
+# This is NOT a gate: nothing here fails the run on a finding. Criticals are routed, not failed.
+#
+# Requires the security-review bundle vended to fleet-skills `ci/security-review/`, reached here at
+# .fleet-ci/ci/security-review/: baseline-scope.py, baseline-route.py, aggregator.py, gitleaks.toml,
+# and the "Baseline mode" section of SKILL.md.
+
+on:
+  workflow_call:
+    inputs:
+      product_slug:
+        description: "Product slug (defaults to repo basename)."
+        type: string
+        required: false
+        default: ""
+      hub_url:
+        description: "Hub base URL for the completion callback and the activity record. Defaults to https://sethgibson.com."
+        type: string
+        required: false
+        default: "https://sethgibson.com"
+      model:
+        description: "Claude model for each semantic session: an alias (sonnet|opus|haiku|fable) or an exact id. Chosen per run by the hub."
+        type: string
+        required: false
+        default: "claude-sonnet-5-5"
+      effort:
+        description: "Reasoning effort for each semantic session: low|medium|high|xhigh|max. Chosen per run by the hub."
+        type: string
+        required: false
+        default: "high"
+      scan:
+        description: "'full' = the whole repo; 'incremental' = only what changed since since_sha. The deterministic tools always read the whole working tree."
+        type: string
+        required: false
+        default: "full"
+      since_sha:
+        description: "The last baseline's commit, for scan=incremental. Empty when scan=full. An unreachable sha falls back to a full scan."
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: write       # route pushes the backlog branch
+  pull-requests: write  # route opens the backlog PR
+  id-token: write       # claude-code-action@v1, and route's App-token exchange
+
+concurrency:
+  # One baseline per product at a time. A second dispatch queues rather than cancelling an
+  # in-flight scan, which may already have spent most of its turns.
+  group: security-baseline-${{ github.repository }}
+  cancel-in-progress: false
+
+env:
+  # One source for the semantic turn cap, per leg: the step's own --max-turns and the run-metrics
+  # record's max_turns both read it (dev-watchdog's *_MAX_TURNS pattern). AN ESTIMATE until the first
+  # two real runs report num_turns (DECISIONS 2026-10-29): read the legs array of the run-metrics
+  # record, then set it from what the busiest legs used. Change it here, nowhere else.
+  SEMANTIC_MAX_TURNS: "60"
+
+jobs:
+  scope:
+    # `fleet` is the PC. No spill chooser: the hub dispatch is the only trigger (STANDARDS §28.1), and
+    # nothing here needs a device. No `linux` label, as security-review.yml since #80: only PC instances
+    # carry `fleet`, and every download below resolves its own OS and architecture anyway.
+    runs-on: [self-hosted, fleet]
+    # STANDARDS §28.6. A checkout and one git-reading script; no completed run yet to measure.
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      chunks: ${{ steps.scope.outputs.chunks }}
+      chunk_count: ${{ steps.scope.outputs.chunk_count }}
+      mode: ${{ steps.scope.outputs.mode }}
+      empty: ${{ steps.scope.outputs.empty }}
+    steps:
+      - name: Guard — claude-code-action supports only some events
+        # A reusable workflow inherits the CALLER's event, and anthropics/claude-code-action@v1 throws
+        # "Unsupported event type" ~200 ms into its step for anything outside this list. Fail here, before
+        # a scan is spent, naming the cause.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          case "$EVENT_NAME" in
+            issues|issue_comment|pull_request|pull_request_target|pull_request_review|pull_request_review_comment|workflow_dispatch|repository_dispatch|schedule|workflow_run) ;;
+            *)
+              echo "::error::claude-code-action cannot run under '$EVENT_NAME'; the caller's security-baseline.yml must run this job under workflow_dispatch (STANDARDS §28.6)."
+              exit 1
+              ;;
+          esac
+
+      - uses: actions/checkout@v4 # consumer repo at $GITHUB_WORKSPACE
+        with:
+          fetch-depth: 0 # an incremental scan diffs against since_sha; a shallow clone would not reach it
+
+      - uses: actions/checkout@v4 # fleet-skills (CI skills under ci/)
+        with:
+          repository: Aethrix-Labs/fleet-skills
+          path: .fleet-ci
+          ref: main
+          token: ${{ secrets.FLEET_SKILLS_PAT }} # fleet-skills is private; default GITHUB_TOKEN can't cross repos
+
+      - name: Split the repo into chunks
+        id: scope
+        env:
+          SCAN: ${{ inputs.scan }}
+          SINCE_SHA: ${{ inputs.since_sha }}
+        run: |
+          SCOPE=.fleet-ci/ci/security-review/baseline-scope.py
+          if [ ! -f "$SCOPE" ]; then
+            echo "::error::$SCOPE is not in the fleet-skills checkout: the security-review bundle with baseline mode is not vended yet. Nothing was scanned."
+            exit 1
+          fi
+          case "${SCAN:-full}" in
+            full)
+              ARGS=(--full)
+              ;;
+            incremental)
+              if [ -z "$SINCE_SHA" ]; then
+                echo "::warning::scan=incremental with no since_sha; scanning the whole repo instead."
+                ARGS=(--full)
+              elif ! [[ "$SINCE_SHA" =~ ^[0-9a-fA-F]{7,64}$ ]]; then
+                echo "::error::since_sha is not a commit hash."
+                exit 1
+              else
+                ARGS=(--since "$SINCE_SHA")
+              fi
+              ;;
+            *)
+              echo "::error::scan must be 'full' or 'incremental'."
+              exit 1
+              ;;
+          esac
+          # Writes baseline-scope.json, and chunks / chunk_count / mode / empty to $GITHUB_OUTPUT.
+          # An unreachable since_sha falls back to a full scan inside the script.
+          python3 "$SCOPE" "${ARGS[@]}" --out baseline-scope.json
+
+      - name: Upload the scope
+        uses: actions/upload-artifact@v4
+        with:
+          name: baseline-scope
+          path: baseline-scope.json
+          if-no-files-found: error
+          retention-days: 14
+
+  deterministic:
+    runs-on: [self-hosted, fleet]
+    # STANDARDS §28.6. security-review.yml's deterministic job has the same shape and the same cap.
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4 # consumer repo at $GITHUB_WORKSPACE
+        # The default depth: this job scans the working tree, never history, so it needs no history.
+
+      - uses: actions/checkout@v4 # fleet-skills (helpers + gitleaks baseline config)
+        with:
+          repository: Aethrix-Labs/fleet-skills
+          path: .fleet-ci
+          ref: main
+          token: ${{ secrets.FLEET_SKILLS_PAT }} # fleet-skills is private; default GITHUB_TOKEN can't cross repos
+
+      - name: Install gitleaks
+        run: |
+          set -ex
+          # 8.28.0, not security-review.yml's 8.24.3, on purpose. The fleet baseline config
+          # (.fleet-ci/ci/security-review/gitleaks.toml) writes its allowlists as `[[allowlists]]`, a key
+          # gitleaks only reads from 8.25.0: 8.24.3 ignores it silently, so docs/mockups/**, .gitleaksignore
+          # and the e2e fixture placeholders are NOT suppressed there (checked 2026-10-29: the same
+          # docs/mockups fixture is flagged on 8.24.3 and clean on 8.25.0 and 8.28.0). A baseline scan
+          # would bury its findings in them. The per-PR gate is unchanged. Bump this deliberately.
+          GITLEAKS_VERSION=8.28.0
+          # The job may land on the PC (Linux x86_64) or the Mac (Darwin arm64), so resolve the
+          # release asset instead of hardcoding it. gitleaks' asset vocabulary is NOT uname's:
+          # linux/darwin for the OS, x64/arm64 for the architecture (x86_64 -> x64, not amd64).
+          # An unmapped value fails here, loudly, rather than guessing an asset that 404s or,
+          # worse, downloads one that runs on the wrong architecture.
+          case "$(uname -s)" in
+            Linux)  GL_OS=linux ;;
+            Darwin) GL_OS=darwin ;;
+            *) echo "::error::Install gitleaks: no release asset mapping for OS '$(uname -s)'"; exit 1 ;;
+          esac
+          case "$(uname -m)" in
+            x86_64)        GL_ARCH=x64 ;;
+            arm64|aarch64) GL_ARCH=arm64 ;;
+            *) echo "::error::Install gitleaks: no release asset mapping for architecture '$(uname -m)'"; exit 1 ;;
+          esac
+          # Tool cache, not /usr/local/bin: the self-hosted runner has no sudo. Cached per
+          # runner by version AND os_arch, so only the first run on each runner downloads and
+          # one cache entry can never serve the wrong architecture.
+          DIR="${RUNNER_TOOL_CACHE}/gitleaks/${GITLEAKS_VERSION}/${GL_OS}_${GL_ARCH}"
+          if [ ! -x "$DIR/gitleaks" ]; then
+            URL="https://github.com/zricethezav/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_${GL_OS}_${GL_ARCH}.tar.gz"
+            # zricethezav (the original org) hosts release artifacts; the
+            # gitleaks/gitleaks rename's redirect does NOT cover asset URLs.
+            # `curl -fsSL` fails loudly on 404 instead of silently downloading
+            # an HTML error page that tar then chokes on.
+            mkdir -p "$DIR"
+            curl -fsSL -o "$RUNNER_TEMP/gitleaks.tar.gz" "$URL"
+            tar -xzf "$RUNNER_TEMP/gitleaks.tar.gz" -C "$DIR" gitleaks
+            rm -f "$RUNNER_TEMP/gitleaks.tar.gz"
+          fi
+          echo "$DIR" >> "$GITHUB_PATH"
+          "$DIR/gitleaks" version
+
+      - name: Install uv (runs Semgrep)
+        run: |
+          set -ex
+          # The self-hosted runner's python3 has no pip/venv, so Semgrep runs through uvx
+          # (uv builds its own environments).
+          UV_VERSION=0.12.19
+          DIR="${RUNNER_TOOL_CACHE}/uv/${UV_VERSION}"
+          if [ ! -x "$DIR/uv" ]; then
+            mkdir -p "$DIR"
+            curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh"               | env UV_INSTALL_DIR="$DIR" UV_NO_MODIFY_PATH=1 sh
+          fi
+          echo "$DIR" >> "$GITHUB_PATH"
+          "$DIR/uv" --version
+
+      - name: Run gitleaks (working tree, not history)
+        run: |
+          # History secrets are out of scope for the baseline, by decision (DECISIONS 2026-10-29): the
+          # per-PR gate scans every commit, and a leaked-then-removed secret needs rotating, not fixing.
+          # So `dir`, which reads the files as they are now.
+          #
+          # Config: the fleet baseline is the foundation (default ruleset + the fleet path allowlists,
+          # §17.11), and the product's own root .gitleaks.toml is OVERLAID onto it, allowlist only: a
+          # repo may add allowlists, never remove rules. The same overlay as security-review.yml, with
+          # two differences, both for gitleaks >= 8.25:
+          #   - [allowlist] -> [[allowlists]]. 8.25+ refuses a singular [allowlist] beside the
+          #     baseline's [[allowlists]] ("it cannot be used alongside"), a fatal config error, and six
+          #     products' .gitleaks.toml use the singular form. Every key they use is valid in the array form.
+          #   - one more allowlist, because `dir` reads EVERYTHING under the path (the per-PR scan reads
+          #     commits): .git/ (checkout credentials live in its config) and .fleet-ci/ (the helper
+          #     checkout, not the product's code) are not the product.
+          CONFIG=.fleet-ci/ci/security-review/gitleaks.toml
+          EFFECTIVE="$RUNNER_TEMP/effective-gitleaks.toml" # outside the workspace, so the scan cannot read it
+          cp "$CONFIG" "$EFFECTIVE"
+          if [ -f .gitleaks.toml ]; then
+            printf '\n\n# ---- overlay: consumer repo .gitleaks.toml (allowlist only) ----\n' >> "$EFFECTIVE"
+            # Append only the consumer config's ALLOWLIST content. Drop its own `title` and `[extend]`
+            # block so they don't collide with the baseline's keys (duplicate TOML keys are a parse
+            # error) and so a repo can never weaken the baseline ruleset.
+            awk '
+              /^[[:space:]]*\[/ {
+                if ($0 ~ /^[[:space:]]*\[extend\][[:space:]]*$/) { skip = 1; next }
+                else { skip = 0 }
+              }
+              skip { next }
+              /^[[:space:]]*title[[:space:]]*=/ { next }
+              { print }
+            ' .gitleaks.toml | sed -E 's/^[[:space:]]*\[allowlist\][[:space:]]*$/[[allowlists]]/' >> "$EFFECTIVE"
+            echo "::notice::Overlaid consumer .gitleaks.toml allowlist onto the fleet baseline."
+          fi
+          cat >> "$EFFECTIVE" <<'TOML'
+
+
+          # ---- working-tree scan: not the product's code ----
+          [[allowlists]]
+          description = "The VCS directory and the fleet-skills helper checkout are not the product's code."
+          paths = ['''(^|[\\/])\.git([\\/]|$)''', '''(^|[\\/])\.fleet-ci([\\/]|$)''']
+          TOML
+          # `--exit-code 0`: a finding is not a failure here (this is not a gate). A real error (bad
+          # config, unreadable path) still exits 1, so the step fails on those and only those.
+          gitleaks dir . \
+            --config "$EFFECTIVE" \
+            --redact \
+            --no-banner \
+            --report-format sarif \
+            --report-path gitleaks.sarif \
+            --exit-code 0
+
+      - name: Semgrep
+        run: |
+          # Pinned so a Semgrep release can't change findings under us; bump deliberately.
+          # --exclude .fleet-ci: the helper checkout lives inside the workspace and is not the product's code.
+          # Semgrep reads the working tree, so a baseline scan needs no flag change from the per-PR one.
+          uvx --from 'semgrep==1.178.0' semgrep --config p/security-audit --exclude docs/mockups --exclude .gitleaksignore --exclude .fleet-ci --json --output semgrep-results.json || true
+          # The aggregator reads a missing file as "zero findings", so a Semgrep that died would pass
+          # for a clean scan. Say so.
+          [ -s semgrep-results.json ] || echo "::warning::Semgrep wrote no results; the deterministic findings below have NO Semgrep coverage."
+
+      - name: Dep audit (package manager from the lockfile)
+        run: |
+          # A fleet-generic callable cannot carry security-review.yml's "pick ONE variant" comment: the
+          # lockfile says which package manager the product uses. pnpm first, as the fleet's stack is pnpm.
+          # --prod / --omit=dev: production dependencies only, the same scope in both branches.
+          if [ -f pnpm-lock.yaml ]; then
+            if command -v pnpm >/dev/null 2>&1; then
+              pnpm audit --prod --json > npm-audit.json || true
+            else
+              echo "::warning::pnpm-lock.yaml found but pnpm is not on PATH; dep-audit skipped."
+            fi
+          elif [ -f package-lock.json ]; then
+            npm audit --omit=dev --json > npm-audit.json || true
+          else
+            echo "::notice::No pnpm-lock.yaml or package-lock.json at the repo root; dep-audit skipped."
+          fi
+
+      - name: Aggregate deterministic findings
+        if: always()
+        run: |
+          ARGS=(--gitleaks gitleaks.sarif --semgrep semgrep-results.json --output deterministic-findings.json)
+          # No lockfile means no audit: leave the flag off rather than point the aggregator at a missing file.
+          [ -f npm-audit.json ] && ARGS+=(--npm-audit npm-audit.json)
+          python3 .fleet-ci/ci/security-review/aggregator.py "${ARGS[@]}"
+
+      - name: Upload the deterministic findings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deterministic-findings
+          path: deterministic-findings.json
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Upload the raw tool output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deterministic-raw
+          path: |
+            gitleaks.sarif
+            semgrep-results.json
+            npm-audit.json
+          if-no-files-found: ignore
+          retention-days: 14
+
+  semantic:
+    needs: [scope, deterministic]
+    # Skipped when the scope is empty (an incremental scan with nothing changed), and when the scope
+    # job did not finish: there is no chunk list to fan out over. A failed deterministic job does NOT
+    # stop it: the semantic checks read the code, and the findings the tools did produce are uploaded
+    # even when a later step of that job failed.
+    if: ${{ !cancelled() && needs.scope.result == 'success' && needs.scope.outputs.empty != 'true' && needs.scope.outputs.chunk_count != '0' }}
+    name: semantic (chunk ${{ matrix.chunk }})
+    runs-on: [self-hosted, fleet]
+    # STANDARDS §28.6. Unmeasured: 60 turns at the implementer's worst observed ~20 s/turn is ~20 min,
+    # and a high-effort leg reading a big chunk runs slower. Revisit with the turn cap above.
+    timeout-minutes: 60
+    # A leg that fails or hits its cap must not fail the run. Its missing or incomplete `coverage` already
+    # makes baseline-route.py report complete: false, which is how the hub learns the scan was partial.
+    continue-on-error: true
+    permissions:
+      contents: read
+      id-token: write # required by anthropics/claude-code-action@v1 for OIDC token exchange
+    env:
+      # The leg's chunk index, for the agent's session and for the file-naming steps after it.
+      BASELINE_CHUNK: ${{ matrix.chunk }}
+    strategy:
+      fail-fast: false # one dead leg must not cancel the others
+      # Two at a time: the PC's three runner instances share one machine, and a third concurrent session
+      # starves the other jobs queued on it.
+      max-parallel: 2
+      matrix:
+        chunk: ${{ fromJSON(needs.scope.outputs.chunks) }}
+    steps:
+      - uses: actions/checkout@v4 # consumer repo at $GITHUB_WORKSPACE
+        with:
+          fetch-depth: 0
+
+      - uses: actions/checkout@v4 # fleet-skills (helpers + SKILL.md)
+        with:
+          repository: Aethrix-Labs/fleet-skills
+          path: .fleet-ci
+          ref: main
+          token: ${{ secrets.FLEET_SKILLS_PAT }} # fleet-skills is private; default GITHUB_TOKEN can't cross repos
+
+      - name: Download the scope
+        uses: actions/download-artifact@v4
+        with:
+          name: baseline-scope
+
+      - name: Download the deterministic findings
+        # A deterministic job that died before uploading must not take the semantic legs with it.
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: deterministic-findings
+
+      - name: Install Claude Code CLI (job-private HOME)
+        # Pre-installs the CLI under a job-private HOME so concurrent jobs do not collide in the
+        # shared ~/.claude/downloads (2026-10-09: 3 of 5 simultaneous dev-watchdog runs failed with
+        # `Checksum verification failed`). Why, and what the fallback is: implementer-callable.yml's
+        # step of the same name. Same script in every callable; change them together.
+        id: claude-cli
+        continue-on-error: true
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          CLI_HOME="$RUNNER_TEMP/claude-cli-home"
+          PIN_SRC="$RUNNER_WORKSPACE/../_actions/anthropics/claude-code-action/v1/src/entrypoints/run.ts"
+          fall_back() {
+            echo "::warning::claude-cli pre-install skipped: $1. claude-code-action will install the CLI itself into the shared ~/.claude/downloads, where a concurrent job can make that fail with 'Checksum verification failed'."
+            exit 0
+          }
+          VERSION="$(sed -n 's/.*claudeCodeVersion = "\([0-9][0-9.]*\)".*/\1/p' "$PIN_SRC" 2>/dev/null | head -n 1)" || VERSION=""
+          [ -n "$VERSION" ] || fall_back "could not read the pinned CLI version from $PIN_SRC"
+          rm -rf "$CLI_HOME"
+          mkdir -p "$CLI_HOME" || fall_back "could not create $CLI_HOME"
+          for ATTEMPT in 1 2 3; do
+            env -u XDG_DATA_HOME -u XDG_CONFIG_HOME -u XDG_CACHE_HOME -u XDG_STATE_HOME -u CLAUDE_CONFIG_DIR HOME="$CLI_HOME" \
+              bash -c 'set -o pipefail; curl -fsSL https://claude.ai/install.sh | bash -s -- "$1"' _ "$VERSION" && break
+            echo "claude-cli pre-install: attempt $ATTEMPT failed"
+            [ "$ATTEMPT" -lt 3 ] && sleep 5
+          done
+          BIN="$CLI_HOME/.local/bin/claude"
+          [ -x "$BIN" ] || fall_back "the installer left no executable at $BIN"
+          GOT="$(env HOME="$CLI_HOME" "$BIN" --version 2>/dev/null | head -n 1)" || true
+          case "$GOT" in
+            "$VERSION"*) ;;
+            *) fall_back "$BIN reports '$GOT', not the pinned $VERSION" ;;
+          esac
+          echo "path=$BIN" >> "$GITHUB_OUTPUT"
+          echo "claude-cli pre-install: $GOT at $BIN (installer HOME was $CLI_HOME)"
+
+      - name: Run the baseline semantic session
+        id: semantic
+        uses: anthropics/claude-code-action@v1
+        with:
+          # Set by the pre-install step above; empty means it fell back and the action installs itself.
+          path_to_claude_code_executable: ${{ steps.claude-cli.outputs.path }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # The hub dispatches the caller's security-baseline.yml with workflow_dispatch, so the actor may
+          # be the `github-actions` bot, which claude-code-action refuses unless it is listed. Allow
+          # exactly that bot, not '*'.
+          allowed_bots: github-actions
+          prompt: |
+            You are running as the **security-review baseline** semantic step in CI, unattended.
+
+            This is baseline mode. Read `.fleet-ci/ci/security-review/SKILL.md`, section "Baseline mode",
+            and follow it exactly.
+
+            BASELINE_CHUNK=${{ matrix.chunk }}
+
+            Runtime context:
+            - Working directory has the full consumer repo (fetch-depth: 0).
+            - `baseline-scope.json` holds the chunks; yours is the one at index BASELINE_CHUNK, with its
+              `context_files`.
+            - `deterministic-findings.json` is the deterministic tools' output for the whole working tree.
+            - Output: write `semantic-findings.json` in the working directory, with its `coverage`
+              object, and rewrite it as you go so a cut-off session still leaves what it covered.
+
+            Do not ask questions. Produce the JSON.
+          # --max-turns is an unmeasured estimate (the SEMANTIC_MAX_TURNS note above): this is a read-heavy
+          # session over one chunk plus its context files, and the first two runs set the real number.
+          claude_args: |
+            --model ${{ inputs.model }}
+            --effort ${{ inputs.effort }}
+            --max-turns ${{ env.SEMANTIC_MAX_TURNS }}
+            --allowedTools Read,Bash,Write,Grep,Glob
+
+      - name: Snapshot this leg's result object (calibration)
+        # claude-code-action writes its result object to one fixed path, $RUNNER_TEMP/claude-execution-output.json
+        # (dev-watchdog-callable's THE OVERWRITE TRAP). One agent step per job means nothing here can overwrite it,
+        # but the run-metrics job reads each leg's own file and never a default path, so the file is moved to
+        # a per-leg name before the upload. An absent file means no result object: nothing is uploaded and the
+        # leg shows up in the record as missing, which is the honest answer. Observability only (STANDARDS
+        # §18.2): never fails the run.
+        if: ${{ !cancelled() && steps.semantic.outcome != 'skipped' && steps.semantic.outcome != '' }}
+        continue-on-error: true
+        run: |
+          set +e
+          if [ -f "$RUNNER_TEMP/claude-execution-output.json" ]; then
+            mv -f "$RUNNER_TEMP/claude-execution-output.json" "run-metrics-${BASELINE_CHUNK}.json" \
+              || echo "::warning::security-baseline: could not snapshot chunk ${BASELINE_CHUNK}'s result; its record will have null results"
+          fi
+          exit 0
+
+      - name: Upload this leg's result object
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-metrics-leg-${{ matrix.chunk }}
+          path: run-metrics-${{ matrix.chunk }}.json
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Name this leg's findings
+        # semantic-findings.json -> semantic-findings-<n>.json, the glob baseline-route.py reads. A leg
+        # that died before writing any leaves no file, and route then sees no coverage for the chunk.
+        if: ${{ !cancelled() }}
+        run: |
+          if [ -f semantic-findings.json ]; then
+            mv -f semantic-findings.json "semantic-findings-${BASELINE_CHUNK}.json"
+          else
+            echo "::warning::chunk ${BASELINE_CHUNK} wrote no semantic-findings.json; the run will report incomplete coverage."
+          fi
+
+      - name: Upload this leg's findings
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: semantic-findings-${{ matrix.chunk }}
+          path: semantic-findings-${{ matrix.chunk }}.json
+          if-no-files-found: ignore
+          retention-days: 14
+
+  route:
+    needs: [scope, deterministic, semantic]
+    # Route whatever was produced, even when a leg or the tools died: baseline-route.py reads the
+    # coverage and reports complete: false. Only a cancelled run stops it.
+    if: ${{ !cancelled() }}
+    runs-on: [self-hosted, fleet]
+    # STANDARDS §28.6. A script, one push and one PR, plus up to 3 minutes proving the PR's checks start.
+    timeout-minutes: 20
+    permissions:
+      contents: write       # push the backlog branch
+      pull-requests: write  # open the PR
+      id-token: write       # the App-token exchange below
+    outputs:
+      critical: ${{ steps.route.outputs.critical }}
+      important: ${{ steps.route.outputs.important }}
+      advisory: ${{ steps.route.outputs.advisory }}
+      complete: ${{ steps.route.outputs.complete }}
+      backlog_changed: ${{ steps.route.outputs.backlog_changed }}
+      filed: ${{ steps.route.outputs.filed }}
+      closed: ${{ steps.route.outputs.closed }}
+      pr_url: ${{ steps.pr.outputs.pr_url }}
+      checks_started: ${{ steps.pr.outputs.checks_started }}
+    steps:
+      - uses: actions/checkout@v4 # consumer repo at $GITHUB_WORKSPACE
+        with:
+          fetch-depth: 0
+
+      - uses: actions/checkout@v4 # fleet-skills (baseline-route.py)
+        with:
+          repository: Aethrix-Labs/fleet-skills
+          path: .fleet-ci
+          ref: main
+          token: ${{ secrets.FLEET_SKILLS_PAT }} # fleet-skills is private; default GITHUB_TOKEN can't cross repos
+
+      # Every input lands flat in the workspace root, where baseline-route.py looks. Each can be absent
+      # (an empty scope uploads no findings; a dead leg uploads none), and absence is not this job's to
+      # fail: the script turns missing or partial coverage into complete: false.
+      - name: Download the scope
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: baseline-scope
+
+      - name: Download the deterministic findings
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: deterministic-findings
+
+      - name: Download the semantic findings
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: semantic-findings-*
+          merge-multiple: true
+
+      - name: Route the findings
+        id: route
+        env:
+          QUEUE_SERVICE_ROLE_KEY: ${{ secrets.QUEUE_SERVICE_ROLE_KEY }}
+          HUB_BASE_URL: ${{ inputs.hub_url || 'https://sethgibson.com' }}
+          # GITHUB_REPOSITORY and GITHUB_RUN_ID come from the runner's own environment.
+        run: |
+          # Triage, fingerprints, queue entries for Critical findings, the docs/backlog.json edits, and the
+          # hub's completion callback (POST /api/security-baseline/complete). All of it is the script's:
+          # nothing about fingerprints or routing belongs in YAML. Outputs critical / important / advisory /
+          # complete / backlog_changed / filed / closed; writes baseline-summary.md and the step summary.
+          python3 .fleet-ci/ci/security-review/baseline-route.py \
+            --repo-root . \
+            --semantic-glob 'semantic-findings-*.json' \
+            --post-completion
+
+      - name: Keep the routed backlog (recovery copy)
+        if: ${{ !cancelled() && steps.route.outputs.backlog_changed == 'true' }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: backlog-routed
+          path: |
+            docs/backlog.json
+            baseline-summary.md
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Open the backlog PR
+        id: pr
+        if: ${{ steps.route.outputs.backlog_changed == 'true' }}
+        env:
+          PRODUCT_SLUG: ${{ inputs.product_slug }}
+          FILED: ${{ steps.route.outputs.filed }}
+          CLOSED: ${{ steps.route.outputs.closed }}
+          # The job's GITHUB_TOKEN, deliberately NOT given to gh below. It pushes the branch (the checkout
+          # already configured it), and that is all it is used for.
+        run: |
+          set -euo pipefail
+          SLUG="${PRODUCT_SLUG:-$(basename "$GITHUB_REPOSITORY")}"
+          BRANCH="security-baseline/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          TITLE="[${SLUG}] security-baseline: ${FILED:-0} filed, ${CLOSED:-0} closed"
+
+          # ---- Doc-only, by construction: docs/backlog.json and nothing else ----
+          OTHER="$(git diff --name-only | grep -v -x 'docs/backlog.json' || true)"
+          if [ -n "$OTHER" ]; then
+            echo "::error::baseline-route.py changed files other than docs/backlog.json; refusing to open a PR for them: $(printf '%s' "$OTHER" | tr '\n' ' ')"
+            exit 1
+          fi
+          if [ -z "$(git status --porcelain -- docs/backlog.json)" ]; then
+            echo "::warning::baseline-route.py reported backlog_changed but docs/backlog.json is unchanged; no PR opened."
+            exit 0
+          fi
+
+          # ---- THE PR TOKEN TRAP ----
+          # A PR opened with the job's GITHUB_TOKEN triggers NO workflows (GitHub's rule for that token), so
+          # the org-required `security-review` check never runs and the PR can never merge. No other callable
+          # opens a PR from a plain step; the ones that open PRs do it from inside the agent, whose token is
+          # a GitHub App installation token, and an App's events DO trigger workflows. So this does the same
+          # exchange claude-code-action does at job start: the job's OIDC id-token for the App token
+          # (the two calls of fresh-token.sh's mint(), audience included). It needs `id-token: write`, which
+          # this job has; claude-code-action strips that from the agent's session, not from a plain step.
+          #
+          # If the exchange fails, STOP. Falling back to GITHUB_TOKEN would open a PR that looks fine and
+          # sits forever; failing is the loud version, and the routed backlog is kept as an artifact.
+          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+            echo "::error::No OIDC request env (ACTIONS_ID_TOKEN_REQUEST_URL/TOKEN): this job lacks id-token: write. Not opening the backlog PR with GITHUB_TOKEN, which would never run its required checks. The routed docs/backlog.json is in the backlog-routed artifact."
+            exit 1
+          fi
+          OIDC="$(curl -fsS --retry 3 --connect-timeout 10 --max-time 30 \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=claude-code-github-action" | jq -r '.value // empty')" || OIDC=""
+          APP_TOKEN=""
+          if [ -n "$OIDC" ]; then
+            echo "::add-mask::$OIDC"
+            APP_TOKEN="$(curl -fsS --retry 3 --connect-timeout 10 --max-time 30 -X POST \
+              -H "Authorization: Bearer $OIDC" \
+              "https://api.anthropic.com/api/github/github-app-token-exchange" | jq -r '.token // .app_token // empty')" || APP_TOKEN=""
+          fi
+          if [ -z "$APP_TOKEN" ]; then
+            echo "::error::The GitHub App token exchange failed. Not opening the backlog PR with GITHUB_TOKEN, which would never run its required checks. The routed docs/backlog.json is in the backlog-routed artifact."
+            exit 1
+          fi
+          echo "::add-mask::$APP_TOKEN"
+
+          # ---- Commit and push (the checkout's GITHUB_TOKEN credentials; contents: write) ----
+          git config user.name  "security-baseline[bot]"
+          git config user.email "security-baseline@aethrix-labs.local"
+          git checkout -q -b "$BRANCH"
+          git add -- docs/backlog.json
+          git commit -q -m "docs(backlog): security-baseline ${FILED:-0} filed, ${CLOSED:-0} closed"
+          git push -q origin "$BRANCH"
+
+          # ---- Open the PR as the App ----
+          BODY="baseline-summary.md"
+          if [ ! -s "$BODY" ]; then
+            BODY="$RUNNER_TEMP/baseline-pr-body.md"
+            printf 'security-baseline run %s routed findings into docs/backlog.json. baseline-summary.md was not produced; see the run for the summary.\n' "$GITHUB_RUN_ID" > "$BODY"
+          fi
+          PR_URL="$(GH_TOKEN="$APP_TOKEN" gh pr create --base main --head "$BRANCH" --title "$TITLE" --body-file "$BODY")"
+          PR_NUM="${PR_URL##*/}"
+          echo "pr_url=$PR_URL" >> "$GITHUB_OUTPUT"
+          echo "Opened $PR_URL"
+
+          # The standard auto-ship path for a doc-only PR (ci-commit Route A): `commit-pending-merge` at open,
+          # `auto-merge` so the hub merges when security-review goes green. This job never merges. One label
+          # per call and best-effort, so a label a product lacks cannot cost the PR.
+          for LABEL in commit-pending-merge auto-merge; do
+            GH_TOKEN="$APP_TOKEN" gh pr edit "$PR_NUM" --add-label "$LABEL" \
+              || echo "::warning::could not add the '$LABEL' label to $PR_URL; add it by hand if the PR is not picked up."
+          done
+
+          # ---- Prove the trap is gone, on every run: did the PR's checks start? ----
+          # Not a gate (observability, STANDARDS §18.2): a hub or API stall must not turn a good run red. The
+          # answer is in the annotations and the step summary, and in the checks_started job output.
+          STARTED=""
+          CHECKS=""
+          for _ in $(seq 1 18); do
+            CHECKS="$(GH_TOKEN="$APP_TOKEN" gh pr checks "$PR_NUM" --json name --jq '[.[].name] | join(", ")' 2>/dev/null || true)"
+            if [ -n "$CHECKS" ]; then STARTED="true"; break; fi
+            sleep 10
+          done
+          if [ -n "$STARTED" ]; then
+            echo "checks_started=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::PR checks started on $PR_URL: $CHECKS"
+            {
+              echo "### security-baseline PR"
+              echo "$PR_URL"
+              echo "Checks **started** (the App token triggers workflows): $CHECKS"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "checks_started=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::No checks appeared on $PR_URL within 3 minutes. The required security-review check may not be firing for PRs opened this way; if so the PR cannot merge."
+            {
+              echo "### security-baseline PR"
+              echo "$PR_URL"
+              echo "**No checks started within 3 minutes.** The PR token trap may not be solved: look at the PR before trusting this path."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  run-metrics:
+    needs: [scope, semantic, route]
+    if: always()
+    runs-on: [self-hosted, fleet]
+    # STANDARDS §28.6. One record, up to 3 POST attempts at 20 s each plus backoff.
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Download the legs' result objects
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: run-metrics-leg-*
+          merge-multiple: true
+          path: legs
+
+      - name: Record the run's model, turns and cost (calibration)
+        id: record-run-metrics
+        # MODEL_CALIBRATION_PROPOSAL §3.7, as dev-watchdog-callable's step of the same name. This is the cost
+        # record the security-baseline initiative's done-when needs ("cost per run recorded"), and the
+        # turn-cap calibration for SEMANTIC_MAX_TURNS: read the `legs` array.
+        #
+        # The agent cannot write these: claude-code-action writes each result object AFTER that session ends,
+        # so no agent can read its own num_turns. Do not move this into a skill.
+        #
+        # ONE record per run, not per leg: a baseline run IS one run that spends one session per chunk, and
+        # run_id correlates the records of one run (§18.1). Per-leg numbers live in `legs`. Totals are sums;
+        # `num_turns` is the BUSIEST leg's, because the thing it is read against, `max_turns`, is a per-leg cap.
+        #
+        # THE OVERWRITE TRAP (dev-watchdog-callable) is handled by construction, not by fallback: each leg
+        # moved its own result object to run-metrics-<chunk>.json and uploaded it under its own artifact
+        # name, so legs cannot overwrite each other, and this step reads ONLY those files, never the default
+        # $RUNNER_TEMP/claude-execution-output.json. A leg with no file is counted missing and the record
+        # says which, with its result fields absent: absent is "unknown", never 0 (§4).
+        #
+        # Observability, not a gate (STANDARDS §18.2): every failure path warns and continues, the step never
+        # exits non-zero, and continue-on-error backstops the rest.
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 10
+        env:
+          QUEUE_SERVICE_ROLE_KEY: ${{ secrets.QUEUE_SERVICE_ROLE_KEY }}
+          BASELINE_PRODUCT_SLUG: ${{ inputs.product_slug }}
+          BASELINE_HUB_URL: ${{ inputs.hub_url }}
+          # The models and efforts are the chosen values verbatim (an alias or an exact id), not the resolution.
+          BASELINE_MODEL: ${{ inputs.model }}
+          BASELINE_EFFORT: ${{ inputs.effort }}
+          BASELINE_SCAN: ${{ inputs.scan }}
+          BASELINE_MODE: ${{ needs.scope.outputs.mode }}
+          BASELINE_CHUNK_COUNT: ${{ needs.scope.outputs.chunk_count }}
+          BASELINE_SCOPE_RESULT: ${{ needs.scope.result }}
+          BASELINE_SEMANTIC_RESULT: ${{ needs.semantic.result }}
+          BASELINE_ROUTE_RESULT: ${{ needs.route.result }}
+          BASELINE_COMPLETE: ${{ needs.route.outputs.complete }}
+          BASELINE_CRITICAL: ${{ needs.route.outputs.critical }}
+          BASELINE_IMPORTANT: ${{ needs.route.outputs.important }}
+          BASELINE_ADVISORY: ${{ needs.route.outputs.advisory }}
+          # The turn cap is NOT repeated here: the workflow env above is in every job's shell, so the script
+          # reads SEMANTIC_MAX_TURNS straight from it, the same thing the legs' --max-turns reads.
+        run: |
+          # Nothing below may fail the run. -e is on by default for this shell; turn it off so a failed
+          # jq/curl reaches its own warning instead of ending the step silently.
+          set +e
+
+          if [ -z "$QUEUE_SERVICE_ROLE_KEY" ]; then
+            echo "::warning::security-baseline: QUEUE_SERVICE_ROLE_KEY missing; skipping the run-metrics activity record"
+            exit 0
+          fi
+          if ! command -v jq >/dev/null 2>&1; then
+            echo "::warning::security-baseline: jq is not on PATH for this runner; skipping the run-metrics activity record"
+            exit 0
+          fi
+          # sha256sum is GNU coreutils; the macOS runner may only have shasum.
+          if command -v sha256sum >/dev/null 2>&1; then
+            SHA="sha256sum"
+          elif command -v shasum >/dev/null 2>&1; then
+            SHA="shasum -a 256"
+          else
+            echo "::warning::security-baseline: no sha256 tool on PATH; skipping the run-metrics activity record"
+            exit 0
+          fi
+
+          SLUG="${BASELINE_PRODUCT_SLUG:-$(basename "$GITHUB_REPOSITORY")}"
+          HUB="${BASELINE_HUB_URL:-https://sethgibson.com}"
+          ATTEMPT_NO="${GITHUB_RUN_ATTEMPT:-1}"
+
+          # run_id: security-baseline declares its own scheme, as dev-watchdog does (STANDARDS §18.1a): it is
+          # not a dispatched build loop, so there is no target_ref to hash and no breadcrumb. The §18.1a
+          # family shape of repo + what the run is keyed to:
+          #
+          #   run_id = sha256("<owner>/<repo>" + "security-baseline" + "<github_run_id>:<attempt>")
+          #
+          # The attempt is inside the id on purpose: a re-run of a baseline is a genuinely fresh scan, so each
+          # attempt is its own lineage. The literal agent name keeps it from colliding with any other agent
+          # that keys off the same workflow run.
+          RUN_ID="$(printf '%s' "${GITHUB_REPOSITORY}security-baseline${GITHUB_RUN_ID}:${ATTEMPT_NO}" | $SHA | cut -d' ' -f1)"
+          # request_id = dev-watchdog's formula with one fixed step key: one record per run, so no step varies.
+          REQUEST_ID="$(printf '%s' "${RUN_ID}run-metricsbaseline${GITHUB_RUN_ID}:${ATTEMPT_NO}" | $SHA | cut -d' ' -f1)"
+
+          # ---- One object per leg that left a result file ----
+          # Each leg file is a JSON array of SDK messages (or an object stream); take the last
+          # {"type":"result"} and the system/init message. Two jq traps, both bitten in dev-watchdog's #58
+          # testing: the "alternative" operator treats false as absent (so is_error is typed explicitly rather
+          # than defaulted), and the program is single-quoted shell, so it must never contain an apostrophe,
+          # comments included.
+          LEGS_JSON="[]"
+          for F in legs/run-metrics-*.json; do
+            [ -f "$F" ] || continue
+            N="${F##*/run-metrics-}"; N="${N%.json}"
+            LEG="$(jq -s -c --arg chunk "$N" '
+              ([.[] | if type == "array" then .[] else . end | select(type == "object")]) as $msgs
+              | ($msgs | map(select(.type == "result")) | last) as $r
+              | ($msgs | map(select(.type == "system" and .subtype == "init")) | first) as $init
+              | (($r.modelUsage // null) | if type == "object" then . else null end) as $mu
+              | def slim: {
+                  input_tokens: (.inputTokens | numbers // null),
+                  output_tokens: (.outputTokens | numbers // null),
+                  cache_read_input_tokens: (.cacheReadInputTokens | numbers // null),
+                  cache_creation_input_tokens: (.cacheCreationInputTokens | numbers // null),
+                  cost_usd: (.costUSD | numbers // null)
+                };
+              {
+                chunk: ($chunk | if test("^[0-9]+$") then tonumber else . end),
+                has_result: ($r != null),
+                model_init: ($init.model | strings // null),
+                num_turns: ($r.num_turns | numbers // null),
+                result_subtype: ($r.subtype | strings // null),
+                is_error: (if ($r.is_error | type) == "boolean" then $r.is_error else null end),
+                stop_reason: ($r.stop_reason | strings // null),
+                terminal_reason: ($r.terminal_reason | strings // null),
+                duration_ms: ($r.duration_ms | numbers // null),
+                duration_api_ms: ($r.duration_api_ms | numbers // null),
+                total_cost_usd: ($r.total_cost_usd | numbers // null),
+                usage: (($r.usage // null) | if type == "object" then {
+                    input_tokens: (.input_tokens | numbers // null),
+                    output_tokens: (.output_tokens | numbers // null),
+                    cache_read_input_tokens: (.cache_read_input_tokens | numbers // null),
+                    cache_creation_input_tokens: (.cache_creation_input_tokens | numbers // null)
+                  } else null end),
+                models_used: (if $mu == null then null
+                              else ($mu | with_entries(.value |= (if type == "object" then slim else {} end))) end)
+              }' "$F" 2>/dev/null)"
+            if [ -z "$LEG" ]; then
+              echo "::warning::security-baseline: could not read chunk ${N}'s result object (jq failed); counting it missing"
+              continue
+            fi
+            LEGS_JSON="$(printf '%s\n%s' "$LEGS_JSON" "$LEG" | jq -s -c '.[0] + [.[1]]')"
+          done
+
+          # ---- One record from the legs ----
+          BODY="$(printf '%s' "$LEGS_JSON" | jq -c \
+            --arg request_id "$REQUEST_ID" \
+            --arg slug "$SLUG" \
+            --arg run_id "$RUN_ID" \
+            --arg github_run_id "${GITHUB_RUN_ID:-}" \
+            --arg github_run_attempt "$ATTEMPT_NO" \
+            --arg model_as_chosen "${BASELINE_MODEL:-}" \
+            --arg effort "${BASELINE_EFFORT:-}" \
+            --arg cap "${SEMANTIC_MAX_TURNS:-}" \
+            --arg scan "${BASELINE_SCAN:-}" \
+            --arg mode "${BASELINE_MODE:-}" \
+            --arg chunk_count "${BASELINE_CHUNK_COUNT:-}" \
+            --arg scope_result "${BASELINE_SCOPE_RESULT:-}" \
+            --arg step_outcome "${BASELINE_SEMANTIC_RESULT:-}" \
+            --arg route_result "${BASELINE_ROUTE_RESULT:-}" \
+            --arg complete "${BASELINE_COMPLETE:-}" \
+            --arg critical "${BASELINE_CRITICAL:-}" \
+            --arg important "${BASELINE_IMPORTANT:-}" \
+            --arg advisory "${BASELINE_ADVISORY:-}" '
+            def nz: if . == "" then null else . end;
+            def num: if test("^[0-9]+$") then tonumber else null end;
+            . as $legs
+            | ($legs | map(select(.has_result))) as $r
+            | def tot(f): ([$r[] | f | numbers] | if length == 0 then null else add end);
+              def mx(f): ([$r[] | f | numbers] | if length == 0 then null else max end);
+              (reduce ($r[] | (.models_used // {}) | to_entries[]) as $e ({};
+                 .[$e.key] as $a
+                 | .[$e.key] = {
+                     input_tokens: (($a.input_tokens // 0) + ($e.value.input_tokens // 0)),
+                     output_tokens: (($a.output_tokens // 0) + ($e.value.output_tokens // 0)),
+                     cache_read_input_tokens: (($a.cache_read_input_tokens // 0) + ($e.value.cache_read_input_tokens // 0)),
+                     cache_creation_input_tokens: (($a.cache_creation_input_tokens // 0) + ($e.value.cache_creation_input_tokens // 0)),
+                     cost_usd: (($a.cost_usd // 0) + ($e.value.cost_usd // 0))
+                   })) as $mu
+              | (if ($mu | length) == 0 then null else ($mu | to_entries | max_by(.value.cost_usd) | .key) end) as $top
+              | ([$r[] | .model_init | strings] | first) as $init_model
+              | ($chunk_count | num) as $expected
+              | ([$legs[].chunk]) as $present
+              | {
+                  request_id: $request_id,
+                  product_slug: $slug,
+                  agent_name: "security-baseline",
+                  action: "run-metrics",
+                  run_id: $run_id,
+                  payload: {
+                    source: "security-baseline-callable",
+                    step: "semantic",
+                    # The GitHub conclusion of the semantic matrix job, NOT an outcome denominator:
+                    # claude-code-action reports a max-turns cutoff as a SUCCESSFUL step, so a leg that died
+                    # at its cap reads success here. The quality side must be read from the legs array
+                    # (result_subtype, is_error).
+                    step_outcome: ($step_outcome | nz),
+                    scope_result: ($scope_result | nz),
+                    route_result: ($route_result | nz),
+                    github_run_id: $github_run_id,
+                    github_run_attempt: $github_run_attempt,
+                    scan: ($scan | nz),
+                    mode: ($mode | nz),
+                    chunk_count: $expected,
+                    legs_with_result: ($r | length),
+                    legs_missing_result: (if $expected == null then null
+                                          else [range(0; $expected)] - $present end),
+                    complete: (if $complete == "true" then true elif $complete == "false" then false else null end),
+                    findings: {
+                      critical: ($critical | num),
+                      important: ($important | num),
+                      advisory: ($advisory | num)
+                    },
+                    model_as_chosen: ($model_as_chosen | nz),
+                    model_resolved: ($top // $init_model),
+                    model_resolved_source: (if $top != null then "modelUsage"
+                                            elif $init_model != null then "init"
+                                            else null end),
+                    effort: ($effort | nz),
+                    num_turns: mx(.num_turns),
+                    num_turns_total: tot(.num_turns),
+                    max_turns: (if ($cap | test("^[0-9]+$")) then ($cap | tonumber) else null end),
+                    any_error: (if ($r | length) == 0 then null else ([$r[] | .is_error == true] | any) end),
+                    legs_by_subtype: ([$r[] | .result_subtype | strings] | group_by(.) | map({key: .[0], value: length}) | from_entries),
+                    duration_ms: tot(.duration_ms),
+                    duration_api_ms: tot(.duration_api_ms),
+                    total_cost_usd: tot(.total_cost_usd),
+                    usage: (if ($r | length) == 0 then null else {
+                        input_tokens: tot(.usage.input_tokens),
+                        output_tokens: tot(.usage.output_tokens),
+                        cache_read_input_tokens: tot(.usage.cache_read_input_tokens),
+                        cache_creation_input_tokens: tot(.usage.cache_creation_input_tokens)
+                      } end),
+                    models_used: (if ($r | length) == 0 then null else $mu end),
+                    legs: [$r[] | {
+                      chunk, num_turns, result_subtype, is_error, stop_reason, terminal_reason,
+                      duration_ms, total_cost_usd
+                    }]
+                  }
+                }' 2>/dev/null)"
+
+          if [ -z "$BODY" ]; then
+            echo "::warning::security-baseline: could not build the run-metrics record (jq failed); skipping it"
+            exit 0
+          fi
+
+          # Up to 3 attempts, only on a network failure or a 5xx: the write is idempotent on request_id, so a
+          # retry cannot double-insert, and a 4xx will not improve by repeating. --max-time so a hung hub
+          # cannot hold this product's concurrency group.
+          SENT=""
+          CODE=""
+          for attempt in 1 2 3; do
+            CODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 -X POST "${HUB}/api/v1/activity/entries" \
+              -H "Content-Type: application/json" \
+              -H "x-service-role-key: $QUEUE_SERVICE_ROLE_KEY" \
+              -H "User-Agent: aethrix-fleet-ci/1.0 (security-baseline-callable)" \
+              -d "$BODY")"
+            case "$CODE" in
+              2??) SENT=1; break ;;
+              4??) break ;;
+            esac
+            [ "$attempt" -lt 3 ] && sleep $((attempt * 2))
+          done
+          if [ -n "$SENT" ]; then
+            echo "::notice::security-baseline: run-metrics record written (HTTP ${CODE}, run_id ${RUN_ID})"
+          else
+            echo "::warning::security-baseline: run-metrics record POST failed (last HTTP ${CODE:-none}); the run is unaffected"
+          fi
+          exit 0
