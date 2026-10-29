@@ -145,7 +145,13 @@ jobs:
       - name: Install gitleaks
         run: |
           set -ex
-          GITLEAKS_VERSION=8.24.3
+          # 8.28.0, not 8.24.3. The fleet baseline config (.fleet-ci/ci/security-review/gitleaks.toml)
+          # writes its allowlists as `[[allowlists]]`, a key gitleaks only reads from 8.25.0: 8.24.3
+          # ignored it silently, so the §17.11 exclusions (docs/mockups/**, .gitleaksignore, the e2e
+          # fixture placeholders) never applied to this gate. Bump this deliberately: this job is
+          # required on every PR and scans the full history, so a newer default ruleset can turn
+          # every product red at once.
+          GITLEAKS_VERSION=8.28.0
           # The job may land on the PC (Linux x86_64) or the Mac (Darwin arm64), so resolve the
           # release asset instead of hardcoding it. gitleaks' asset vocabulary is NOT uname's:
           # linux/darwin for the OS, x64/arm64 for the architecture (x86_64 -> x64, not amd64).
@@ -220,9 +226,11 @@ jobs:
             # `title` and `[extend]` block so they don't collide with the baseline's
             # keys (duplicate TOML keys are a parse error) and so a repo can never
             # weaken the baseline ruleset — repos may add allowlists, not remove
-            # rules. gitleaks accepts a singular `[allowlist]` and array `[[allowlists]]`
-            # side by side, so the baseline's `[[allowlists]]` and the overlay's
-            # allowlist tables all apply.
+            # rules. Rewrite a singular `[allowlist]` header to `[[allowlists]]`: gitleaks
+            # 8.25+ refuses a singular `[allowlist]` beside the baseline's `[[allowlists]]`
+            # ("it cannot be used alongside"), a fatal config error, and six products'
+            # .gitleaks.toml use the singular form. Every key they use is valid in the array
+            # form, so the baseline's allowlists and the overlay's all apply.
             awk '
               /^[[:space:]]*\[/ {
                 if ($0 ~ /^[[:space:]]*\[extend\][[:space:]]*$/) { skip = 1; next }
@@ -231,7 +239,7 @@ jobs:
               skip { next }
               /^[[:space:]]*title[[:space:]]*=/ { next }
               { print }
-            ' .gitleaks.toml >> effective-gitleaks.toml
+            ' .gitleaks.toml | sed -E 's/^[[:space:]]*\[allowlist\][[:space:]]*$/[[allowlists]]/' >> effective-gitleaks.toml
             CONFIG=effective-gitleaks.toml
             echo "::notice::Overlaid consumer .gitleaks.toml allowlist onto the fleet baseline."
           fi
