@@ -280,10 +280,31 @@ jobs:
           description = "The VCS directory and the fleet-skills helper checkout are not the product's code."
           paths = ['''(^|[\\/])\.git([\\/]|$)''', '''(^|[\\/])\.fleet-ci([\\/]|$)''']
           TOML
+          # .gitleaksignore: the products wrote their entries for history scans, so each carries its
+          # commit (`<40-hex commit>:<file>:<rule>:<line>`). A `dir` fingerprint has no commit
+          # (`<file>:<rule>:<line>`), so none of those entries would match here and every accepted false
+          # positive would come back as a Critical on the product's first baseline. Translate at
+          # runtime and edit no product file: keep every original line and add the same line with the
+          # commit prefix stripped. That suppresses the same file + rule + line the product already
+          # accepted, nothing wider; if the line moved the finding resurfaces and is triaged.
+          # Comments and blank lines pass through, entries are deduped. Built outside the workspace,
+          # like the effective config. gitleaks (checked on 8.28.0) also loads <scan root>/.gitleaksignore
+          # whatever --gitleaks-ignore-path says, but the translated file is a superset of it, so the
+          # two together suppress exactly what the translated file does.
+          IGNORE_PATH=. # gitleaks' own default: no .gitleaksignore means no change
+          if [ -f .gitleaksignore ]; then
+            IGNORE_PATH="$RUNNER_TEMP/gitleaksignore"
+            RAW="$RUNNER_TEMP/gitleaksignore.raw"
+            tr -d '\r' < .gitleaksignore > "$RAW" # CRLF checkouts would otherwise leave a \r on every fingerprint
+            { cat "$RAW"; sed -nE 's/^[0-9a-fA-F]{40}://p' "$RAW"; } | awk '/^[[:space:]]*(#|$)/ || !seen[$0]++' > "$IGNORE_PATH"
+            TRANSLATED=$(sed -nE 's/^[0-9a-fA-F]{40}://p' "$RAW" | wc -l | tr -d ' ')
+            echo "::notice::Translated $TRANSLATED commit-scoped .gitleaksignore entries to working-tree fingerprints."
+          fi
           # `--exit-code 0`: a finding is not a failure here (this is not a gate). A real error (bad
           # config, unreadable path) still exits 1, so the step fails on those and only those.
           gitleaks dir . \
             --config "$EFFECTIVE" \
+            --gitleaks-ignore-path "$IGNORE_PATH" \
             --redact \
             --no-banner \
             --report-format sarif \
