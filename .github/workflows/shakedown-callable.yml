@@ -516,7 +516,18 @@ jobs:
           ATTEMPT="${ATTEMPT}${CLOSE_NOTE}${TRANSCRIPT_NOTE}"
 
           if [ -n "$QUEUE_SERVICE_ROLE_KEY" ]; then
-            REQUEST_ID=$(printf '%s' "${GITHUB_RUN_ID}shakedown-failed" | sha256sum | cut -d' ' -f1)
+            # request_id: the run ID plus, from the second attempt on, the attempt number. This card's
+            # `workflow-failed` variant retries through rerun-failed-jobs, which keeps the run ID and
+            # only bumps GITHUB_RUN_ATTEMPT, so the run ID alone would repeat attempt 1's request_id
+            # and the hub would answer with the existing (resolved) entry, filing no card for the
+            # second failure. Attempt 1's input is unchanged, so its hash is too.
+            REQ_ATTEMPT="${GITHUB_RUN_ATTEMPT:-1}"
+            case "$REQ_ATTEMPT" in ""|*[!0-9]*) REQ_ATTEMPT=1 ;; esac
+            REQ_SEED="${GITHUB_RUN_ID}shakedown-failed"
+            if [ "$REQ_ATTEMPT" -gt 1 ]; then
+              REQ_SEED="${REQ_SEED}:${REQ_ATTEMPT}"
+            fi
+            REQUEST_ID=$(printf '%s' "$REQ_SEED" | sha256sum | cut -d' ' -f1)
             # `variant: workflow-failed` is the existing class-A variant (QUEUE_TAXONOMY §5), the same one
             # milestone-test-callable's guard stamps. No new category is coined here. The packet carries no
             # run_id: the shakedown skill generates none, and substituting $GITHUB_RUN_ID would name the

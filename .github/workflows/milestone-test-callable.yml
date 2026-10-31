@@ -486,7 +486,27 @@ jobs:
           ATTEMPT="${ATTEMPT}${RUN_ID_NOTE}${TRANSCRIPT_NOTE}"
 
           if [ -n "$QUEUE_SERVICE_ROLE_KEY" ]; then
-            REQUEST_ID=$(printf '%s' "${GITHUB_RUN_ID}milestone-test-failed" | sha256sum | cut -d' ' -f1)
+            # request_id: the run ID plus, from the second attempt on, the attempt number. A re-run
+            # keeps the run ID and only GITHUB_RUN_ATTEMPT changes, so the run ID alone would repeat
+            # attempt 1's request_id and the hub would answer with the existing (resolved) entry,
+            # filing no card for the second failure. Attempt 1's input is unchanged, so its hash is too.
+            REQ_ATTEMPT="${GITHUB_RUN_ATTEMPT:-1}"
+            case "$REQ_ATTEMPT" in ""|*[!0-9]*) REQ_ATTEMPT=1 ;; esac
+            REQ_SEED="${GITHUB_RUN_ID}milestone-test-failed"
+            if [ "$REQ_ATTEMPT" -gt 1 ]; then
+              REQ_SEED="${REQ_SEED}:${REQ_ATTEMPT}"
+            fi
+            REQUEST_ID=$(printf '%s' "$REQ_SEED" | sha256sum | cut -d' ' -f1)
+            # Stamp the card the hub auto-retries (fleet DECISIONS 2026-10-31, STANDARDS §29.6): a
+            # pre-flight death (no agent session ran) on the FIRST attempt, started by a person. An
+            # attempt-2 card is deliberately not stamped, so it stays with Seth; a bot actor is
+            # deterministic (the action refuses it every time), so a retry cannot help. Optional
+            # field, built like RUN_ID_FIELD and sharing its line below so every other card's body is
+            # byte-identical to before.
+            CATEGORY_FIELD=""
+            if [ "$CAUSE" = "pre-flight" ] && [ "$REQ_ATTEMPT" -eq 1 ] && [ "${RUN_ACTOR_TYPE:-}" != "Bot" ]; then
+              CATEGORY_FIELD="\"category\": \"pre-flight\","
+            fi
             curl -sf -X POST "${HUB}/api/v1/queue/entries" \
               -H "Content-Type: application/json" \
               -H "x-service-role-key: $QUEUE_SERVICE_ROLE_KEY" \
@@ -495,7 +515,7 @@ jobs:
                 \"request_id\": \"$REQUEST_ID\",
                 \"entry_type\": \"exception\",
                 \"variant\": \"workflow-failed\",
-                ${RUN_ID_FIELD}
+                ${RUN_ID_FIELD}${CATEGORY_FIELD}
                 \"agent_name\": \"milestone-test\",
                 \"product_slug\": \"$SLUG\",
                 \"title\": \"$TITLE\",
