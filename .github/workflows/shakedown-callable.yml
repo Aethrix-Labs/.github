@@ -98,12 +98,13 @@ jobs:
       # One source for the turn cap: the agent step's --max-turns and the failure guard's
       # "did it run out of turns?" test both read it, so they cannot drift apart.
       AGENT_MAX_TURNS: "120"
-      # The notes pass's one switch (STANDARDS §23.6, §28.4). "off" until the hub carrying
-      # `source.kind: note` has deployed: the hub's parsers read an unknown kind as a malformed file, so
-      # a pass that wrote one before then would lock Seth out of the backlog or board panel. While it is
-      # not "on", the pre-flight fails every notes dispatch. A literal, not an input or a variable, so
-      # turning it on is a reviewed change to this file.
-      NOTE_KIND_WRITER: "off"
+      # The notes pass's one switch (STANDARDS §23.6, §28.4). "on" ahead of the hub's deploy, by Seth's
+      # decision (fleet DECISIONS.md 2026-11-01), because no product has a note yet. The hub's parsers read
+      # an unknown kind as a malformed file, so until the hub carrying `source.kind: note` has deployed,
+      # nobody dispatches a notes pass by hand or merges a docs/staged-notes.json. While it is not "on",
+      # the pre-flight fails every notes dispatch. A literal, not an input or a variable, so changing it
+      # is a reviewed change to this file.
+      NOTE_KIND_WRITER: "on"
     steps:
       - name: Guard — claude-code-action supports only some events
         # A reusable workflow inherits the CALLER's event, and anthropics/claude-code-action@v1 throws
@@ -170,9 +171,9 @@ jobs:
               exit 1
             fi
 
-            # The hub carrying source.kind note must have deployed (STANDARDS §23.6, §28.4).
+            # The switch, on ahead of the hub's deploy by Seth's decision (STANDARDS §23.6, §28.4).
             if [ "$NOTE_KIND_WRITER" != "on" ]; then
-              echo "::error::shakedown: notes passes are off. The hub carrying source.kind note has not deployed (STANDARDS §23.6 'The notes pass'), and a pass that wrote one first would leave the hub's parsers reading a malformed backlog or board. NOTE_KIND_WRITER in shakedown-callable.yml is '$NOTE_KIND_WRITER'; set it to \"on\" once that hub deploy is confirmed."
+              echo "::error::shakedown: notes passes are off (STANDARDS §23.6 'The notes pass'). A pass that wrote source.kind note before the hub carrying it deployed would leave the hub's parsers reading a malformed backlog or board. NOTE_KIND_WRITER in shakedown-callable.yml is '$NOTE_KIND_WRITER'."
               exit 1
             fi
 
