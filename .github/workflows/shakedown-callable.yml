@@ -19,6 +19,16 @@ name: shakedown (callable)
 # finding. If the pass cannot route every finding it leaves the session `open` and says so: an
 # unfinished close is recoverable, a false one is not.
 #
+# THE NOTES PASS (STANDARDS §23.6 "The notes pass"). With `notes: true` and no `session`, the same
+# job routes the contributor notes Seth staged in docs/staged-notes.json instead of a session's
+# findings. Exactly one of `session` / `notes: true` must be given: an empty `session` without
+# `notes` fails the pre-flight and is NEVER read as a notes pass. A notes pass takes no `close`,
+# touches no session row, and commits on the branch shakedown-notes/<run id>. Until that PR
+# merges, main still reads `routed_to: null`, so the pre-flight refuses a second notes pass while a
+# PR on that prefix is open. NOTE_KIND_WRITER (job env, below) is the one switch: while it is
+# "off" every notes dispatch fails the pre-flight, because the hub's parsers read an unknown
+# `source.kind` as a malformed file (§28.4 ordered, then staged).
+#
 # Requires these bundles vended to fleet-skills `ci/`, reached at .fleet-ci/ci/<name>/:
 # shakedown and ci-commit (incl. PACKETS.md).
 
@@ -36,9 +46,15 @@ on:
         required: false
         default: "https://sethgibson.com"
       session:
-        description: "The sessions[].id in docs/test-sessions.json whose unrouted findings this pass routes."
+        description: "The sessions[].id in docs/test-sessions.json whose unrouted findings this pass routes. Required unless notes is true; empty without notes fails the pre-flight."
         type: string
-        required: true
+        required: false
+        default: ""
+      notes:
+        description: "When true, run the notes pass (STANDARDS §23.6): route the unrouted rows of docs/staged-notes.json. Takes no session and no close."
+        type: boolean
+        required: false
+        default: false
       close:
         description: "When true, write the session's close (status closed + today's date) as the terminal step, after every finding has a routed_to. Never closes a session it could not fully route."
         type: boolean
@@ -82,6 +98,12 @@ jobs:
       # One source for the turn cap: the agent step's --max-turns and the failure guard's
       # "did it run out of turns?" test both read it, so they cannot drift apart.
       AGENT_MAX_TURNS: "120"
+      # The notes pass's one switch (STANDARDS §23.6, §28.4). "off" until the hub carrying
+      # `source.kind: note` has deployed: the hub's parsers read an unknown kind as a malformed file, so
+      # a pass that wrote one before then would lock Seth out of the backlog or board panel. While it is
+      # not "on", the pre-flight fails every notes dispatch. A literal, not an input or a variable, so
+      # turning it on is a reviewed change to this file.
+      NOTE_KIND_WRITER: "off"
     steps:
       - name: Guard — claude-code-action supports only some events
         # A reusable workflow inherits the CALLER's event, and anthropics/claude-code-action@v1 throws
@@ -119,19 +141,79 @@ jobs:
           git config user.name  "shakedown[bot]"
           git config user.email "shakedown@aethrix-labs.local"
 
-      - name: Pre-flight — the session exists, and what state it is in
-        # Fails BEFORE any agent spend on a dispatch that cannot succeed (a stale or mistyped id), and
-        # records the session's status so the post-run check can tell "left open" from "closed by a run
-        # that was not asked to". A failure here files no queue entry: nothing ran, and the hub
-        # already knows its dispatch was rejected. Advisory only when jq is absent; the agent step
-        # and the post-run check are the authority.
+      - name: Pre-flight — the session exists, or a notes pass can run
+        # Fails BEFORE any agent spend on a dispatch that cannot succeed (a stale or mistyped id, a
+        # notes pass the hub cannot yet read), and records the session's status so the post-run check
+        # can tell "left open" from "closed by a run that was not asked to". A failure here files no
+        # queue entry: nothing ran, and the hub already knows its dispatch was rejected. On a session
+        # run it is advisory only when jq is absent; the agent step and the post-run check are the
+        # authority. A notes run has no such softening: it fails closed on a missing jq, because its
+        # checks are the only thing standing between a notes dispatch and an unreadable file.
         id: preflight
         shell: bash
         env:
           # Through env, never interpolated into the script body.
           SESSION_ID: ${{ inputs.session }}
           CLOSE: ${{ inputs.close }}
+          NOTES: ${{ inputs.notes }}
+          GH_TOKEN: ${{ github.token }} # the open-PR read below
         run: |
+          # Exactly one of: a non-empty session, or notes:true. An empty session without notes is a
+          # malformed dispatch, never a notes pass by default.
+          if [ "$NOTES" = "true" ]; then
+            if [ -n "$SESSION_ID" ]; then
+              echo "::error::shakedown: a notes pass takes no session (got '$SESSION_ID'); pass either session or notes: true, not both."
+              exit 1
+            fi
+            if [ "$CLOSE" = "true" ]; then
+              echo "::error::shakedown: a notes pass takes no close; close: true is only for a session pass (§23.6)."
+              exit 1
+            fi
+
+            # The hub carrying source.kind note must have deployed (STANDARDS §23.6, §28.4).
+            if [ "$NOTE_KIND_WRITER" != "on" ]; then
+              echo "::error::shakedown: notes passes are off. The hub carrying source.kind note has not deployed (STANDARDS §23.6 'The notes pass'), and a pass that wrote one first would leave the hub's parsers reading a malformed backlog or board. NOTE_KIND_WRITER in shakedown-callable.yml is '$NOTE_KIND_WRITER'; set it to \"on\" once that hub deploy is confirmed."
+              exit 1
+            fi
+
+            # A second pass would route the same rows: main still reads routed_to null until the first
+            # pass's PR merges. A failed read of the list fails too; it never reads as "no PR".
+            if ! HEADS="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls?state=open&per_page=100" --jq '.[].head.ref')"; then
+              echo "::error::shakedown: could not read the open pull requests for $GITHUB_REPOSITORY, so the notes pass cannot tell whether an earlier one is still open. Failing rather than assuming there is none."
+              exit 1
+            fi
+            OPEN_NOTES_BRANCH="$(printf '%s\n' "$HEADS" | grep -m1 '^shakedown-notes/' || true)"
+            if [ -n "$OPEN_NOTES_BRANCH" ]; then
+              echo "::error::shakedown: a notes pass is already open on branch '$OPEN_NOTES_BRANCH'. Until that PR merges, main still reads routed_to null for its rows, so a second pass would route them again. Merge or close it, then dispatch again."
+              exit 1
+            fi
+
+            # The session checks below do not apply. What applies is the sidecar the pass routes.
+            NOTES_FILE="docs/staged-notes.json"
+            if ! command -v jq >/dev/null 2>&1; then
+              echo "::error::shakedown: jq is not on PATH for this runner, so the notes pre-flight cannot read $NOTES_FILE. A notes pass fails closed here."
+              exit 1
+            fi
+            if [ ! -f "$NOTES_FILE" ]; then
+              echo "::error::shakedown: $NOTES_FILE does not exist in this repo, so there are no staged notes to route. The hub creates it on the first Run shakedown press."
+              exit 1
+            fi
+            if ! UNROUTED_NOTES="$(jq -r 'if (.staged | type) == "array" then [.staged[] | select(.routed_to == null)] | length else error("staged is not an array") end' "$NOTES_FILE")"; then
+              echo "::error::shakedown: $NOTES_FILE could not be read as a staged-notes file (expected an object with a staged array)."
+              exit 1
+            fi
+            if [ "$UNROUTED_NOTES" = "0" ]; then
+              echo "::error::shakedown: $NOTES_FILE has no row with routed_to null, so there is nothing for a notes pass to route."
+              exit 1
+            fi
+            echo "status_before=notes" >> "$GITHUB_OUTPUT"
+            echo "::notice::shakedown: notes pass, unrouted_notes=$UNROUTED_NOTES"
+            exit 0
+          fi
+          if [ -z "$SESSION_ID" ]; then
+            echo "::error::shakedown: neither a session nor notes: true was given. Pass exactly one; an empty session is not a notes pass."
+            exit 1
+          fi
           case "$SESSION_ID" in
             ""|*[!a-z0-9-]*|-*)
               echo "::error::shakedown: session '$SESSION_ID' is not a kebab-case sessions[].id (§23.6)."
@@ -207,6 +289,7 @@ jobs:
           SD_PRODUCT_SLUG: ${{ inputs.product_slug }}
           SD_HUB_URL: ${{ inputs.hub_url }}
           SD_SESSION: ${{ inputs.session }}
+          SD_NOTES: ${{ inputs.notes }}
           SD_CLOSE: ${{ inputs.close }}
         with:
           # Set by the pre-install step above; empty means it fell back and the action installs itself.
@@ -227,7 +310,21 @@ jobs:
             legacy `docs/ROUTING_BOARD.md` only while the product still has one and no sidecar),
             and you never invoke `lite-planner`.
 
-            Your scope is ONE session: `$SD_SESSION` in `docs/test-sessions.json`. Route the
+            **First, read `$SD_NOTES`.** If it is `true`, this is a **NOTES RUN** and the
+            paragraph headed "Notes run" below replaces the next two paragraphs ("Your scope is ONE
+            session" and "The `close` input"): ignore those. If it is `false`, ignore the "Notes
+            run" paragraph.
+
+            Notes run: this run has no session scope and no close. Follow **"The notes pass"** at the
+            end of `.fleet-ci/ci/shakedown/SKILL.md` for Steps 0, 3 and 4, and the rest of the skill
+            as written. Your rows are the `staged` rows of `docs/staged-notes.json` whose
+            `routed_to` is `null`. Touch no session row and no `docs/test-sessions.json` key, and
+            never write a `closed` or `status`. Commit through `.fleet-ci/ci/ci-commit/SKILL.md` on the
+            branch `shakedown-notes/$GITHUB_RUN_ID`: use exactly that name, not a branch name of your
+            own. That prefix is what makes the next notes pass's pre-flight refuse to start while this
+            run's PR is open.
+
+            Your scope is ONE session (session runs only): `$SD_SESSION` in `docs/test-sessions.json`. Route the
             `findings` rows whose `session` is `$SD_SESSION` and whose `routed_to` is `null`, by
             writing each row's `routed_to` (`BL-n`, `Mn`, `RB-n`). Leave `fixed-in-session` rows and
             every other session's rows alone. Do not touch `obligations`, `specs`, or any other
@@ -237,7 +334,7 @@ jobs:
             at the repo root with one of `locate`, `route`, `record`, `closing`, `committing`.
             Do not commit that file.
 
-            The `close` input for this run is: **$SD_CLOSE**.
+            The `close` input for this run (session runs only; a notes run has none) is: **$SD_CLOSE**.
 
             - If it is `false`: do NOT write the session's `status` or `closed`. Closing is Seth's
               act and an agent never closes a session on its own judgement.
@@ -254,7 +351,8 @@ jobs:
               plainly in your final message that the close did NOT happen and why. An unfinished
               close is recoverable; a false one is not.
 
-            Before committing, run the sidecar self-check on your result if the script is reachable
+            Before committing (session runs; a notes run runs the three gates its skill section
+            names instead), run the sidecar self-check on your result if the script is reachable
             (`python ~/products/scripts/check-test-sessions-sidecar.py .`; it is not vended to CI
             runners, so when it is absent do the equivalent by hand): no `findings` row of this
             session may have an empty-string `routed_to`, and a `closed` session must own no
@@ -290,7 +388,7 @@ jobs:
         # Reads the working tree as the agent left it; if ci-commit returned the checkout to another
         # branch, the sidecar read here is that branch's.
         id: verify
-        if: success()
+        if: success() && !inputs.notes
         shell: bash
         env:
           SESSION_ID: ${{ inputs.session }}
@@ -334,11 +432,70 @@ jobs:
             echo "- **The close did NOT happen.** The session is still open with $UNROUTED unrouted finding(s)." >> "$GITHUB_STEP_SUMMARY"
           fi
 
+      - name: Verify the staged-notes invariant on the written sidecar (notes pass only)
+        # The notes counterpart of the step above, which is skipped on a notes run: there is no session
+        # to close. A detector over the file the agent left: no staged row may carry an empty-string
+        # routed_to (the gate's "never an empty string": a null is an unrouted note, an empty string is
+        # a malformed one), and no row may carry a key outside the five the contract declares, which
+        # is how an author field would arrive under any name (§23.6, templates/staged-notes). Fails
+        # closed: a file or a jq that cannot be read is a failure, not a pass.
+        id: verify-notes
+        if: success() && inputs.notes
+        shell: bash
+        run: |
+          NOTES_FILE="docs/staged-notes.json"
+          if ! command -v jq >/dev/null 2>&1; then
+            echo "::error::shakedown: jq is not on PATH; the staged-notes invariant cannot be checked, so the notes pass is not accepted."
+            exit 1
+          fi
+          # ci-commit may have returned the checkout to main, where routed_to still reads null until the
+          # PR merges. Read the file the pass committed when its branch is on origin, else the tree.
+          SRC="$NOTES_FILE"
+          BRANCH="shakedown-notes/${GITHUB_RUN_ID}"
+          if git fetch -q origin "$BRANCH" 2>/dev/null; then
+            SRC="${RUNNER_TEMP:-/tmp}/staged-notes-after-${GITHUB_RUN_ID}.json"
+            if ! git show "FETCH_HEAD:$NOTES_FILE" > "$SRC"; then
+              echo "::error::shakedown: $NOTES_FILE is missing on $BRANCH after the run."
+              exit 1
+            fi
+          fi
+          if [ ! -f "$SRC" ]; then
+            echo "::error::shakedown: $NOTES_FILE is missing after the run."
+            exit 1
+          fi
+          if ! COUNTS="$(jq -r '
+              ["id","body","direction","sent","routed_to"] as $declared
+              | if (.staged | type) != "array" then error("staged is not an array") else . end
+              | [ ([.staged[] | select(.routed_to == "")] | length),
+                  ([.staged[] | keys_unsorted[] | select(. as $k | ($declared | any(.[]; . == $k)) | not)] | unique | join(",")),
+                  ([.staged[] | select(.routed_to == null)] | length),
+                  (.staged | length) ] | map(tostring) | join("|")' "$SRC")"; then
+            echo "::error::shakedown: $NOTES_FILE could not be read as a staged-notes file after the run."
+            exit 1
+          fi
+          IFS='|' read -r EMPTY UNDECLARED STILL_NULL TOTAL <<< "$COUNTS"
+          echo "::notice::shakedown: notes pass rows=$TOTAL still_unrouted=$STILL_NULL empty_routed_to=$EMPTY undeclared_keys=${UNDECLARED:-none}"
+          FAIL=""
+          if [ "$EMPTY" != "0" ]; then
+            FAIL="$EMPTY staged row(s) carry an empty-string routed_to, which is a gate failure (§23.6), not an unrouted note."
+          elif [ -n "$UNDECLARED" ]; then
+            FAIL="staged row(s) carry a key the contract does not declare (${UNDECLARED}); a row carries exactly id, body, direction, sent and routed_to, and never an author under any name (§23.6)."
+          fi
+          {
+            echo "### shakedown — notes pass"
+            echo "- staged rows: $TOTAL, still unrouted: $STILL_NULL (a row left null is a note the pass named and did not route; the summary says why)"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$FAIL" ]; then
+            echo "::error::shakedown: $FAIL"
+            echo "- **INVARIANT VIOLATED:** $FAIL" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
       - name: Emit failure queue entry on agent death or an invariant violation
         # Surface it so a routing pass (and a close Seth already decided on) doesn't silently go nowhere.
         # The cause is read off the agent's result object, not assumed.
         id: failure-entry
-        if: failure() && (steps.agent.outcome == 'failure' || steps.verify.outcome == 'failure')
+        if: failure() && (steps.agent.outcome == 'failure' || steps.verify.outcome == 'failure' || steps.verify-notes.outcome == 'failure')
         env:
           # The action's transcript (a JSON array of SDK messages; the last `result` message carries
           # subtype / is_error / num_turns). Empty when the action died before writing it.
@@ -350,9 +507,11 @@ jobs:
           SD_PRODUCT_SLUG: ${{ inputs.product_slug }}
           SD_HUB_URL: ${{ inputs.hub_url }}
           SD_SESSION: ${{ inputs.session }}
+          SD_NOTES: ${{ inputs.notes }}
           SD_CLOSE: ${{ inputs.close }}
           AGENT_OUTCOME: ${{ steps.agent.outcome }}
-          VERIFY_OUTCOME: ${{ steps.verify.outcome }}
+          # Whichever post-run check ran (the session close-write check or the notes check) and failed.
+          VERIFY_OUTCOME: ${{ (steps.verify.outcome == 'failure' || steps.verify-notes.outcome == 'failure') && 'failure' || 'ok' }}
           # Empty when the action died before Claude ran (its `conclusion` output is only set after).
           AGENT_CONCLUSION: ${{ steps.agent.outputs.conclusion }}
         run: |
@@ -461,33 +620,63 @@ jobs:
             CLOSE_NOTE=" This run was dispatched with close:true; the close is written only as the last edit of a fully routed pass and shares a commit with the routings, so the session should still be open on main. Check docs/test-sessions.json before assuming either way."
           fi
 
+          # A notes pass has no session: its entry names the notes file and says nothing of a session id,
+          # a close, or test-sessions.json. A re-dispatch is refused by the pre-flight while a PR on the
+          # shakedown-notes/ prefix is open, so every notes recommendation says to settle that first.
+          if [ "$SD_NOTES" = "true" ]; then
+            GOAL="Route the unrouted staged notes in docs/staged-notes.json (STANDARDS 23.6, the notes pass)"
+            MANY_WORD="A batch with many staged notes"
+            REDISPATCH="a second dispatch routes only the rows still null, once any open shakedown-notes/ PR from this run is merged or closed (the pre-flight refuses a second notes pass while one is open)"
+          else
+            GOAL="Route the unrouted findings of test session ${SD_SESSION} (STANDARDS 23.6), close requested: ${SD_CLOSE}"
+            MANY_WORD="A session with many findings"
+            REDISPATCH="routing the remainder in a second dispatch is safe because rows already routed are skipped"
+          fi
+
           if [ "$AGENT_OUTCOME" != "failure" ] && [ "$VERIFY_OUTCOME" = "failure" ]; then
             # The agent finished and the post-run check rejected what it left. Not a crash: do not offer
             # the crash advice. The check's own message is in the run log and step summary.
-            TITLE="[$SLUG] shakedown left ${SD_SESSION} in a state the gate rejects"
-            ATTEMPT="The agent step finished, then the post-run close-write check failed on docs/test-sessions.json (a closed session owning an unrouted finding, an empty routed_to, or a session closed by a run dispatched with close:false). The step summary names which. Last phase reached: ${LAST_PHASE}."
-            ASK="Read the failing 'Verify the close-write invariant' step, then fix docs/test-sessions.json for ${SD_SESSION} by hand or re-dispatch the pass. Do not merge a PR from this run until the sidecar passes check-test-sessions-sidecar.py."
-            RECO="This is a bug in the run or in the shakedown skill's close rule, not a flaky runner: read what the agent wrote before re-dispatching. If the PR already merged, the sidecar on main holds the gap and fixing it is the first move."
+            if [ "$SD_NOTES" = "true" ]; then
+              TITLE="[$SLUG] shakedown notes pass left docs/staged-notes.json in a state the gate rejects"
+              ATTEMPT="The agent step finished, then the post-run staged-notes check failed on docs/staged-notes.json (a row with an empty-string routed_to, or a row with a key the contract does not declare). The step summary names which. Last phase reached: ${LAST_PHASE}."
+              ASK="Read the failing 'Verify the staged-notes invariant' step, then fix docs/staged-notes.json by hand or close the PR on the shakedown-notes/ branch and re-dispatch the notes pass. Do not merge a PR from this run until the sidecar passes check-staged-notes-sidecar.py."
+              RECO="This is a bug in the run or in the shakedown skill's notes pass, not a flaky runner: read what the agent wrote before re-dispatching. If the PR already merged, the sidecar on main holds the gap and fixing it is the first move. A second notes pass will not start while a shakedown-notes/ PR is open."
+            else
+              TITLE="[$SLUG] shakedown left ${SD_SESSION} in a state the gate rejects"
+              ATTEMPT="The agent step finished, then the post-run close-write check failed on docs/test-sessions.json (a closed session owning an unrouted finding, an empty routed_to, or a session closed by a run dispatched with close:false). The step summary names which. Last phase reached: ${LAST_PHASE}."
+              ASK="Read the failing 'Verify the close-write invariant' step, then fix docs/test-sessions.json for ${SD_SESSION} by hand or re-dispatch the pass. Do not merge a PR from this run until the sidecar passes check-test-sessions-sidecar.py."
+              RECO="This is a bug in the run or in the shakedown skill's close rule, not a flaky runner: read what the agent wrote before re-dispatching. If the PR already merged, the sidecar on main holds the gap and fixing it is the first move."
+            fi
           elif [ "$LAST_PHASE" = "unknown" ] && [ -z "${AGENT_CONCLUSION:-}" ]; then
             # No phase AND no agent result: the action died at startup (it rejected the trigger event,
             # or its own setup failed), so the phase-based advice below would be a wrong guess.
-            TITLE="[$SLUG] shakedown did not start for ${SD_SESSION} - its findings are UNROUTED"
             ATTEMPT="claude-code-action failed at startup, before any skill phase ran (no phase breadcrumb, no agent result). Usually the action rejected the trigger event (Unsupported event type) or its setup failed. Event: ${GITHUB_EVENT_NAME}. Run: $RUN_URL"
-            ASK="Session ${SD_SESSION} has NOT been routed${CLOSE_NOTE:+ and was NOT closed}. Read the first lines of the failing step to confirm the cause, then re-dispatch the pass from the hub or run shakedown interactively in this repo."
             RECO="Fix the trigger if it is the event type (the caller must dispatch as workflow_dispatch), otherwise re-dispatch."
+            if [ "$SD_NOTES" = "true" ]; then
+              TITLE="[$SLUG] shakedown notes pass did not start - its staged notes are UNROUTED"
+              ASK="The staged notes in docs/staged-notes.json have NOT been routed. Read the first lines of the failing step to confirm the cause, then re-dispatch the notes pass from the hub."
+            else
+              TITLE="[$SLUG] shakedown did not start for ${SD_SESSION} - its findings are UNROUTED"
+              ASK="Session ${SD_SESSION} has NOT been routed${CLOSE_NOTE:+ and was NOT closed}. Read the first lines of the failing step to confirm the cause, then re-dispatch the pass from the hub or run shakedown interactively in this repo."
+            fi
             if [ "$CAUSE" = "pre-flight" ]; then
               # The agent step failed and wrote no transcript: say what is known rather than the guess above.
               ATTEMPT="${PF_ATTEMPT} Event: ${GITHUB_EVENT_NAME}. Run: $RUN_URL"
               RECO="$PF_RECO"
             fi
           else
-            TITLE="[$SLUG] shakedown failed on ${SD_SESSION}"
-            ASK="Inspect the run log, then re-dispatch the routing pass for ${SD_SESSION} from the hub or run shakedown interactively in this repo."
+            if [ "$SD_NOTES" = "true" ]; then
+              TITLE="[$SLUG] shakedown notes pass failed"
+              ASK="Inspect the run log, then re-dispatch the notes pass from the hub. If the run left a PR open on a shakedown-notes/ branch, merge or close it first: the pre-flight refuses a second notes pass while one is open."
+            else
+              TITLE="[$SLUG] shakedown failed on ${SD_SESSION}"
+              ASK="Inspect the run log, then re-dispatch the routing pass for ${SD_SESSION} from the hub or run shakedown interactively in this repo."
+            fi
             # Only what the result object supports is asserted.
             case "$CAUSE" in
               max-turns)
                 ATTEMPT="claude-code-action used ${R_TURNS} of ${CAP} turns (result subtype ${R_SUBTYPE}), at or near its turn cap, before the skill's own exit path."
-                RECO="Died at phase '${LAST_PHASE}'. A session with many findings may exceed the cap in one pass; routing the remainder in a second dispatch is safe because rows already routed are skipped. The turn cap is an unmeasured estimate - if this recurs on a modest session, raise AGENT_MAX_TURNS." ;;
+                RECO="Died at phase '${LAST_PHASE}'. ${MANY_WORD} may exceed the cap in one pass; ${REDISPATCH}. The turn cap is an unmeasured estimate - if this recurs on a modest batch, raise AGENT_MAX_TURNS." ;;
               crash)
                 if [ "$R_KIND" = "none" ]; then
                   ATTEMPT="claude-code-action ended without a result object in its transcript (a crash or infra error) before the skill's own exit path."
@@ -532,7 +721,7 @@ jobs:
                 \"agent_name\": \"shakedown\",
                 \"product_slug\": \"$SLUG\",
                 \"title\": \"$TITLE\",
-                \"goal\": \"Route the unrouted findings of test session ${SD_SESSION} (STANDARDS 23.6), close requested: ${SD_CLOSE}\",
+                \"goal\": \"$GOAL\",
                 \"attempts\": [\"$ATTEMPT\"],
                 \"artifacts\": [{\"label\": \"Workflow run\", \"href\": \"$RUN_URL\", \"artifact_type\": \"doc\"}],
                 \"ask\": \"$ASK\",
