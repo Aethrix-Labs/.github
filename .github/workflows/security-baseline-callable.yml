@@ -65,11 +65,7 @@ permissions:
   pull-requests: write  # route opens the backlog PR
   id-token: write       # claude-code-action@v1, and route's App-token exchange
 
-concurrency:
-  # One baseline per product at a time. A second dispatch queues rather than cancelling an
-  # in-flight scan, which may already have spent most of its turns.
-  group: security-baseline-${{ github.repository }}
-  cancel-in-progress: false
+# No top-level `concurrency:` here: the caller stub owns per-product serialisation, and this callable must never declare the caller's group (security-baseline-<repo>), which deadlocks the run at startup.
 
 env:
   # One source for the semantic turn cap, per leg: the step's own --max-turns and the run-metrics
