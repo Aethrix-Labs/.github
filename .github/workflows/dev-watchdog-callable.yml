@@ -8,9 +8,11 @@ name: dev-watchdog (callable)
 #   (from either source) -> hold (nothing posted); else idle -> recommender (deferred-scan
 #   only) -> proposer. Doc reconciliation runs every day, unconditionally, as long as
 #   the product isn't pre-build — independent of the signals-pending/idle branch.
+#   The owed-analytics-reads emit (deterministic, no LLM) runs right after the flags fetch,
+#   on the master switch alone, independent of the gate and of every step below.
 #
 # Requires the dev-watchdog bundle vended to fleet-skills `ci/dev-watchdog/`
-# (SKILL.md, gate.sh, brief_collect.py), reached here at
+# (SKILL.md, gate.sh, brief_collect.py, analytics_reads_emit.py), reached here at
 # .fleet-ci/ci/dev-watchdog/.
 
 on:
@@ -139,6 +141,30 @@ jobs:
           fi
           printf '%s\n' "$FLAGS" >> "$GITHUB_OUTPUT"
           echo "flags: $(printf '%s' "$FLAGS" | tr '\n' ' ')"
+
+      # ---- Owed analytics reads (deterministic, no LLM) ----
+      # Posts the product's owed analytics reads, if any (fleet-command-center PR #455,
+      # skills/dev-watchdog/SKILL.md "Owed analytics reads"). Gated on the master switch only:
+      # deliberately NOT on the Gate/Decide outcome, so it runs on a pre-build, signals-pending
+      # or idle day alike, and sits before Gate so nothing downstream can skip it. The script
+      # posts nothing unless docs/analytics.json has `enabled: true`. Never fails the run: the
+      # script exits 0 and warns on its own errors, `|| echo` covers a bundle that predates it
+      # (or a missing python3), and continue-on-error backstops the rest. The timeout is short
+      # so a hung hub cannot hold this product's concurrency group.
+      - name: Emit owed analytics reads
+        id: analytics-reads
+        if: steps.flags.outputs.watchdog_enabled == 'true'
+        continue-on-error: true
+        timeout-minutes: 5
+        env:
+          QUEUE_SERVICE_ROLE_KEY: ${{ secrets.QUEUE_SERVICE_ROLE_KEY }}
+          HUB_BASE_URL: ${{ inputs.hub_url || 'https://sethgibson.com' }}
+          PRODUCT_SLUG: ${{ inputs.product_slug }}
+          # GITHUB_REPOSITORY comes from the runner's own environment.
+        run: |
+          SLUG="${PRODUCT_SLUG:-$(basename "$GITHUB_REPOSITORY")}"
+          python3 .fleet-ci/ci/dev-watchdog/analytics_reads_emit.py . --product-slug "$SLUG" \
+            || echo "::warning::dev-watchdog: analytics_reads_emit.py did not run cleanly; owed analytics reads skipped this run"
 
       # ---- Phase 0: cheap, deterministic local-docs gate (no LLM), STANDARDS §24.1 ----
       - name: Gate
