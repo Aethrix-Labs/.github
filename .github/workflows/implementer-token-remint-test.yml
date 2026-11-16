@@ -1,0 +1,322 @@
+name: implementer token re-minter (test)
+
+# Check of the runner half of fleet DECISIONS 2026-10-17 "Implementer publishes with a re-minted GitHub
+# token" (STANDARDS §9 "Credential lifetime"), without waiting 60 minutes for a real implementer run to
+# reach minute 55.
+#
+# It runs the implementer callable's OWN "Start the GitHub token re-minter" and "Stop the GitHub token
+# re-minter" steps, lifted out of implementer-callable.yml at run time (not a copy that could drift),
+# against the real fresh-token.sh from fleet-skills. `serve` is told to re-mint every 60s instead of
+# every 25 minutes, so a 200s wait covers three re-mints. It then asserts what the agent half depends on:
+#
+#   1. the start step produced a token and left `serve` running after the step ended (detached);
+#   2. the token file CHANGED while the job slept (a re-mint landed);
+#   3. `fresh-token.sh refresh` exports a GH_TOKEN equal to the file's token, `check` exits 0, and that
+#      token works against the GitHub API (`gh api repos/$GITHUB_REPOSITORY`);
+#   4. the stop step ends `serve` and removes the token directory.
+#
+# WHERE IT CAN RUN. Run it from a PRIVATE repo, as a reusable workflow, the way the real callables run:
+#   - The GitHub App token exchange (api.anthropic.com/api/github/github-app-token-exchange) judges the
+#     run's OIDC claims, and answers "Invalid OIDC token" to this workflow's own runs in this public repo
+#     on a feature branch (verified 2026-11-16, runs 43855214787 and 43855725148).
+#   - The org's runner group has allows_public_repositories=false, so a self-hosted runner (the Mac) never
+#     picks up a job from this public repo.
+# A private repo with a thin caller on its default branch has neither problem:
+#
+#   on: { workflow_dispatch: {} }
+#   permissions: { contents: read, id-token: write }
+#   jobs:
+#     test:
+#       strategy:
+#         fail-fast: false
+#         matrix: { runs_on: ['["ubuntu-latest"]', '["self-hosted","fleet-mac"]'] }
+#       uses: Aethrix-Labs/.github/.github/workflows/implementer-token-remint-test.yml@<ref>
+#       with: { runs_on: "${{ matrix.runs_on }}", callable_ref: <ref> }
+#       secrets: inherit
+#
+# What it cannot show is that the OIDC request credential outlives minute 60. It prints how long that
+# credential says it lives (its `exp`, never the credential itself) so that question has a number.
+#
+# Never prints a token: only sha256 prefixes and derived facts.
+
+on:
+  workflow_call:
+    inputs:
+      runs_on:
+        description: 'JSON array for runs-on, e.g. ["ubuntu-latest"] or ["self-hosted","fleet-mac"].'
+        type: string
+        required: false
+        default: '["ubuntu-latest"]'
+      callable_ref:
+        description: "Ref of Aethrix-Labs/.github whose implementer-callable.yml steps are tested."
+        type: string
+        required: false
+        default: "main"
+      sleep_secs:
+        description: "Seconds to wait between the first token and the check."
+        type: string
+        required: false
+        default: "200"
+      remint_secs:
+        description: "FLEET_TOKEN_REFRESH_SECS for `serve` (the production default is 1500)."
+        type: string
+        required: false
+        default: "60"
+      timeout_minutes:
+        description: "Job timeout. Raise it with sleep_secs for a run that outlasts the OIDC credential."
+        type: string
+        required: false
+        default: "15"
+  workflow_dispatch:
+    inputs:
+      callable_ref:
+        description: "Ref of Aethrix-Labs/.github whose implementer-callable.yml steps are tested."
+        type: string
+        required: false
+        default: "main"
+      sleep_secs:
+        description: "Seconds to wait between the first token and the check."
+        type: string
+        required: false
+        default: "200"
+      remint_secs:
+        description: "FLEET_TOKEN_REFRESH_SECS for `serve` (the production default is 1500)."
+        type: string
+        required: false
+        default: "60"
+      timeout_minutes:
+        description: "Job timeout. Raise it with sleep_secs for a run that outlasts the OIDC credential."
+        type: string
+        required: false
+        default: "15"
+
+permissions:
+  contents: read
+  id-token: write # the minting step needs the OIDC request URL/token
+
+jobs:
+  remint:
+    runs-on: ${{ fromJSON(inputs.runs_on || '["ubuntu-latest"]') }}
+    timeout-minutes: ${{ fromJSON(inputs.timeout_minutes || '15') }}
+    env:
+      # `|| 'default'` so a caller that leaves an input out gets the same values as the declared defaults.
+      CALLABLE_REF: ${{ inputs.callable_ref || 'main' }}
+      SLEEP_SECS: ${{ inputs.sleep_secs || '200' }}
+      REMINT_SECS: ${{ inputs.remint_secs || '60' }}
+    steps:
+      - uses: actions/checkout@v4 # the calling repo: a git repo with an origin, which `refresh` rewrites
+
+      - uses: actions/checkout@v4 # fleet-skills (fresh-token.sh), same checkout the callable makes
+        with:
+          repository: Aethrix-Labs/fleet-skills
+          path: .fleet-ci
+          ref: main
+          token: ${{ secrets.FLEET_SKILLS_PAT }}
+
+      - uses: actions/checkout@v4 # the callable under test
+        with:
+          repository: Aethrix-Labs/.github
+          path: callable-src
+          ref: ${{ inputs.callable_ref || 'main' }}
+          token: ${{ secrets.FLEET_SKILLS_PAT }}
+
+      - name: Lift the callable's re-minter steps
+        shell: bash
+        run: |
+          case "$SLEEP_SECS$REMINT_SECS" in ""|*[!0-9]*) echo "::error::sleep_secs and remint_secs must be whole numbers"; exit 1 ;; esac
+          CALLABLE="callable-src/.github/workflows/implementer-callable.yml"
+          echo "testing $CALLABLE at $(git -C callable-src rev-parse --short HEAD) ($CALLABLE_REF)"
+          # The text of one step's `run: |` block, de-indented. Matches the step by its exact name.
+          # awk reads the file itself and strips any CR: a `tr | awk` pipe breaks under pipefail, because
+          # awk exits as soon as the step ends and a `tr` still writing gets SIGPIPE (seen on the Mac).
+          extract() {
+            awk -v name="$1" '
+              { sub(/\r$/, "") }
+              $0 == "      - name: " name { found = 1; next }
+              found && !inrun && $0 == "        run: |" { inrun = 1; next }
+              inrun {
+                if ($0 ~ /^          /) { print substr($0, 11); next }
+                if ($0 ~ /^[ ]*$/) { print ""; next }
+                exit
+              }
+              found && !inrun && $0 ~ /^      - / { exit }
+            ' "$CALLABLE"
+          }
+          extract "Start the GitHub token re-minter (fresh-token.sh serve)" > "$RUNNER_TEMP/remint-start.sh"
+          extract "Stop the GitHub token re-minter and remove its token" > "$RUNNER_TEMP/remint-stop.sh"
+          for F in remint-start remint-stop; do
+            [ -s "$RUNNER_TEMP/$F.sh" ] || { echo "::error::could not find the $F step in $CALLABLE"; exit 1; }
+            bash -n "$RUNNER_TEMP/$F.sh" || { echo "::error::$F step does not parse"; exit 1; }
+            echo "lifted $F: $(wc -l < "$RUNNER_TEMP/$F.sh" | tr -d ' ') lines"
+          done
+
+      - name: Start the re-minter (the callable's own step text)
+        shell: bash
+        env:
+          FLEET_TOKEN_REFRESH_SECS: ${{ inputs.remint_secs || '60' }}
+        # Run the way the callable's step runs: the same shell flags, the body as a script of its own.
+        run: bash --noprofile --norc -eo pipefail "$RUNNER_TEMP/remint-start.sh"
+
+      - name: First token, and is serve still running after its step ended?
+        shell: bash
+        run: |
+          STATE="$RUNNER_TEMP/fleet-token"
+          sha() { if command -v sha256sum >/dev/null 2>&1; then sha256sum | cut -d' ' -f1; else shasum -a 256 | cut -d' ' -f1; fi; }
+
+          # The start step never fails the job, so a fallback would pass it. The test must not.
+          if [ ! -s "$STATE/token" ]; then
+            echo "::error::no token after the start step: the re-minter fell back (see the step's warning and log)"
+            exit 1
+          fi
+          echo "::add-mask::$(cat "$STATE/token")"
+          sha < "$STATE/token" > "$RUNNER_TEMP/first.sha"
+          echo "first token sha256: $(cut -c1-16 "$RUNNER_TEMP/first.sha")..."
+
+          # This is the check on `nohup ... &`: the step that launched serve has exited by now.
+          SERVE_PID="$(cat "$STATE/serve.pid" 2>/dev/null || true)"
+          case "$SERVE_PID" in ""|*[!0-9]*) echo "::error::no serve.pid after the first mint"; exit 1 ;; esac
+          kill -0 "$SERVE_PID" 2>/dev/null || { echo "::error::serve (pid $SERVE_PID) did not survive its step"; exit 1; }
+          echo "$SERVE_PID" > "$RUNNER_TEMP/test-serve.pid"
+          echo "serve pid $SERVE_PID is alive after the start step ended"
+          ls -l "$STATE"
+
+          # How long does the OIDC request credential say it lives? Only `exp` is read and printed.
+          # Diagnostic: never fails the test.
+          set +e
+          P="$(printf '%s' "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" | cut -d. -f2 | tr '_-' '/+')"
+          if [ -n "$P" ]; then
+            while [ $(( ${#P} % 4 )) -ne 0 ]; do P="${P}="; done
+            CLAIMS="$(printf '%s' "$P" | base64 -d 2>/dev/null)" || CLAIMS="$(printf '%s' "$P" | base64 -D 2>/dev/null)"
+            MIN="$(printf '%s' "$CLAIMS" | jq -r 'if .exp then ((.exp - now) / 60 | floor | tostring) else empty end' 2>/dev/null)"
+            if [ -n "$MIN" ]; then
+              echo "::notice::the OIDC request credential reports exp in ${MIN} min from now (it must outlive minute 55 for re-minting to work on a long run)"
+            else
+              echo "::notice::the OIDC request credential is not a JWT with an exp claim; its lifetime is not readable from here"
+            fi
+          fi
+
+      - name: Why no token? (the exchange's own answer)
+        # Only on a failure with no token on disk. `fresh-token.sh` runs curl with -f, which keeps the
+        # error body out of its log, so ask the exchange again without it and print what it says: the
+        # HTTP status, its error fields, and the OIDC claims it judges the request by (repository, ref,
+        # workflow refs: none of them secret). A success is never printed: the body is the token.
+        if: failure()
+        shell: bash
+        run: |
+          set +e
+          [ -s "$RUNNER_TEMP/fleet-token/token" ] && { echo "a token exists; nothing to diagnose"; exit 0; }
+          OIDC="$(curl -sS --max-time 30 -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=claude-code-github-action" | jq -r '.value // empty')"
+          [ -n "$OIDC" ] || { echo "the OIDC id-token request itself failed"; exit 0; }
+          echo "::add-mask::$OIDC"
+          P="$(printf '%s' "$OIDC" | cut -d. -f2 | tr '_-' '/+')"
+          while [ $(( ${#P} % 4 )) -ne 0 ]; do P="${P}="; done
+          CLAIMS="$(printf '%s' "$P" | base64 -d 2>/dev/null)" || CLAIMS="$(printf '%s' "$P" | base64 -D 2>/dev/null)"
+          echo "OIDC claims the exchange sees:"
+          printf '%s' "$CLAIMS" | jq -c '{repository, ref, event_name, workflow_ref, job_workflow_ref, job_workflow_sha}' 2>/dev/null
+          CODE="$(curl -sS --max-time 30 -o "$RUNNER_TEMP/exchange.json" -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer $OIDC" https://api.anthropic.com/api/github/github-app-token-exchange)"
+          echo "exchange answered HTTP $CODE"
+          if [ "$CODE" = "200" ]; then
+            echo "this time the exchange succeeded (not printed: the body is a token)"
+          else
+            jq -c '{type, message, error}' "$RUNNER_TEMP/exchange.json" 2>/dev/null | head -c 800
+          fi
+          rm -f "$RUNNER_TEMP/exchange.json"
+
+      - name: Wait for re-mints
+        shell: bash
+        run: sleep "$SLEEP_SECS"
+
+      - name: The token changed, and the newest one works
+        shell: bash
+        run: |
+          STATE="$RUNNER_TEMP/fleet-token"
+          sha() { if command -v sha256sum >/dev/null 2>&1; then sha256sum | cut -d' ' -f1; else shasum -a 256 | cut -d' ' -f1; fi; }
+          FAIL=0
+
+          [ -s "$STATE/token" ] || { echo "::error::the token file is gone or empty"; exit 1; }
+          echo "::add-mask::$(cat "$STATE/token")"
+          FIRST="$(cat "$RUNNER_TEMP/first.sha")"
+          NOW="$(sha < "$STATE/token")"
+          echo "first token sha256: ${FIRST:0:16}..."
+          echo "now   token sha256: ${NOW:0:16}..."
+          if [ "$FIRST" = "$NOW" ]; then
+            echo "::error::the token file did not change in ${SLEEP_SECS}s (re-mint every ${REMINT_SECS}s)"
+            FAIL=1
+          else
+            echo "ok: the token file changed"
+          fi
+
+          LOG="$RUNNER_TEMP/fresh-token-serve.log"
+          MINTS="$(grep -c 'fresh-token: minted' "$LOG" 2>/dev/null || true)"
+          echo "mint lines in the serve log: ${MINTS:-0}"
+          sed 's/^/  | /' "$LOG"
+          [ "${MINTS:-0}" -ge 2 ] || { echo "::error::expected at least 2 mints in ${SLEEP_SECS}s"; FAIL=1; }
+          # `serve` keeps the previous token when a mint fails, so "the file changed since the first
+          # token" can stay true for a long time after minting has stopped working (an expired OIDC
+          # request credential, say). Two more checks that cannot: no failed mint in the log, and the
+          # newest mint is recent (`remaining` counts down from the last mint's 55-minute trust window).
+          FAILED="$(grep -c 'fresh-token:.*failed' "$LOG" 2>/dev/null || true)"
+          if [ "${FAILED:-0}" -gt 0 ]; then
+            echo "::error::${FAILED} failed mint(s) in the serve log"; FAIL=1
+          else
+            echo "ok: no failed mints"
+          fi
+          REM="$(bash .fleet-ci/ci/implementer/fresh-token.sh remaining)"
+          NEED=$(( 3300 - 2 * REMINT_SECS ))
+          if [ "$REM" -gt "$NEED" ]; then
+            echo "ok: the newest mint is recent (${REM}s of its trust window left, need > ${NEED}s)"
+          else
+            echo "::error::the newest mint is stale (${REM}s of its trust window left, need > ${NEED}s): minting stopped"; FAIL=1
+          fi
+
+          # The agent half, exactly as the implementer runs it.
+          eval "$(bash .fleet-ci/ci/implementer/fresh-token.sh refresh)" || { echo "::error::refresh failed"; FAIL=1; }
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::refresh exported no GH_TOKEN"; FAIL=1
+          elif [ "$(printf '%s' "$GH_TOKEN" | sha)" != "$NOW" ]; then
+            echo "::error::GH_TOKEN is not the token file's newest token"; FAIL=1
+          else
+            echo "ok: refresh exported the newest token as GH_TOKEN"
+          fi
+          bash .fleet-ci/ci/implementer/fresh-token.sh check && echo "ok: check exits 0" || { echo "::error::check exited $?"; FAIL=1; }
+
+          GOT="$(gh api "repos/$GITHUB_REPOSITORY" --jq .full_name)"
+          if [ "$GOT" = "$GITHUB_REPOSITORY" ]; then
+            echo "ok: the re-minted token reads $GOT"
+          else
+            echo "::error::gh api with the re-minted token returned '${GOT}', expected ${GITHUB_REPOSITORY}"
+            FAIL=1
+          fi
+          exit "$FAIL"
+
+      - name: Stop the re-minter (the callable's own step text)
+        if: always()
+        shell: bash
+        run: |
+          if [ -s "$RUNNER_TEMP/remint-stop.sh" ]; then
+            bash --noprofile --norc -eo pipefail "$RUNNER_TEMP/remint-stop.sh"
+          else
+            echo "::warning::no lifted stop step; nothing to run"
+          fi
+
+      - name: serve is gone and its token is removed
+        if: always()
+        shell: bash
+        run: |
+          [ -f "$RUNNER_TEMP/test-serve.pid" ] || { echo "serve never came up; nothing to assert"; exit 0; }
+          FAIL=0
+          PID="$(cat "$RUNNER_TEMP/test-serve.pid")"
+          sleep 2
+          if kill -0 "$PID" 2>/dev/null; then
+            echo "::error::serve (pid $PID) is still running after the stop step"; FAIL=1
+          else
+            echo "ok: serve (pid $PID) is gone"
+          fi
+          if [ -e "$RUNNER_TEMP/fleet-token" ]; then
+            echo "::error::$RUNNER_TEMP/fleet-token still exists after the stop step"; FAIL=1
+          else
+            echo "ok: the token directory is removed"
+          fi
+          exit "$FAIL"

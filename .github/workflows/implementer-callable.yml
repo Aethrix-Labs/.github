@@ -211,6 +211,86 @@ jobs:
           echo "path=$BIN" >> "$GITHUB_OUTPUT"
           echo "claude-cli pre-install: $GOT at $BIN (installer HOME was $CLI_HOME)"
 
+      - name: Start the GitHub token re-minter (fresh-token.sh serve)
+        # The runner half of fleet DECISIONS 2026-10-17 "Implementer publishes with a re-minted GitHub
+        # token" (STANDARDS §9 "Credential lifetime"). claude-code-action exchanges the job's OIDC
+        # id-token for a GitHub App installation token ONCE, at the agent step's start, and that token
+        # lives 60 minutes. The job runs for up to 120, so a run that outlasts it can finish its work and
+        # then not push it (`credential-expiring` cards at about minute 55: puzzle-pop x3,
+        # sethgibson-com x1, 2026-11-07..11).
+        #
+        # The agent half is already live: the implementer and ci-commit run
+        # `eval "$(.fleet-ci/ci/implementer/fresh-token.sh refresh)"` before every push or gh call, and
+        # `fresh-token.sh check` stops the run at minute ~55 when no newer token exists. `refresh` only
+        # READS what `serve` writes, so this step is what makes the newer token exist: `serve` mints
+        # immediately and then every 25 minutes into $RUNNER_TEMP/fleet-token/ (the token goes to a file,
+        # mode 600, and is never echoed). It has to be a step of the workflow, not of the agent: it needs
+        # ACTIONS_ID_TOKEN_REQUEST_URL/TOKEN, which claude-code-action strips from the agent's session on
+        # purpose (action #1011) and which must not be forwarded to the agent under any name (rejected
+        # 2026-10-17). The agent only ever sees an installation token, the same kind it already holds.
+        #
+        # NEVER a gate. Every path below exits 0. If the script is missing, or the first mint does not
+        # land, the run falls back to the job-start token, which is exactly today's behavior: it works
+        # until minute ~55 and then `check` stops it with credential-expiring. The ::warning:: is what keeps
+        # that fallback from going unnoticed. Needs `id-token: write` (declared above).
+        #
+        # Fully detached (nohup, all three streams redirected) so the step can finish while `serve` keeps
+        # running; a background process holding the step's stdout open would hold the step open with it.
+        # The last step of the job stops it and removes the token.
+        continue-on-error: true
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          # Nothing below may fail the job. The shell has -e on by default; turn it off.
+          set +e
+
+          SCRIPT=".fleet-ci/ci/implementer/fresh-token.sh"
+          if [ ! -f "$SCRIPT" ]; then
+            echo "::warning::implementer-callable: $SCRIPT is not in .fleet-ci (fleet-skills vending has not landed); no token re-minter, so this run falls back to the job-start GitHub token and will stop with credential-expiring around minute 55"
+            exit 0
+          fi
+
+          STATE_DIR="$RUNNER_TEMP/fleet-token"
+          LOG="$RUNNER_TEMP/fresh-token-serve.log"
+          # A token left behind by an earlier job on this runner instance would satisfy the wait below
+          # and be handed to the agent as if this run had minted it.
+          rm -rf "$STATE_DIR"
+          : > "$LOG"
+
+          nohup bash "$SCRIPT" serve > "$LOG" 2>&1 < /dev/null &
+          SERVE_PID=$!
+          # `serve` writes its own serve.pid, but only after the first mint. Keep the launch pid too, so
+          # the closing step can still stop a `serve` that was slow to mint and is not up yet.
+          echo "$SERVE_PID" > "$RUNNER_TEMP/fresh-token-serve.pid"
+
+          # Wait up to 60s for the first token. Stop early if `serve` already exited: its first mint is
+          # a one-shot, so a dead process means no token is coming.
+          WAITED=0
+          while [ "$WAITED" -lt 60 ]; do
+            [ -s "$STATE_DIR/token" ] && break
+            kill -0 "$SERVE_PID" 2>/dev/null || break
+            sleep 1
+            WAITED=$((WAITED + 1))
+          done
+
+          if [ -s "$STATE_DIR/token" ]; then
+            echo "::notice::implementer-callable: GitHub token re-minter running (pid ${SERVE_PID}); first token minted after ${WAITED}s, then one every ${FLEET_TOKEN_REFRESH_SECS:-1500}s"
+            exit 0
+          fi
+
+          # The log holds `fresh-token:` status lines and curl's error line, never a token. It is still
+          # printed prefixed, capped and with control characters removed, so nothing in it can start a
+          # workflow command at column 0.
+          echo "re-minter log ($LOG):"
+          head -c 4000 "$LOG" | tr -d '\r' | tr -cd '[:print:]\n' | sed 's/^/  | /'
+          if kill -0 "$SERVE_PID" 2>/dev/null; then
+            WHY="no token after ${WAITED}s (the helper is still trying)"
+          else
+            WHY="the helper exited without minting"
+          fi
+          echo "::warning::implementer-callable: token re-minter gave no token: ${WHY}. This run falls back to the job-start GitHub token and will stop with credential-expiring around minute 55. Read the re-minter log above, and confirm the job has id-token: write."
+          exit 0
+
       - name: Run implementer agent
         id: agent
         uses: anthropics/claude-code-action@v1
@@ -242,6 +322,13 @@ jobs:
           # simulator) does not thrash: it takes the blocked path and the loop is held
           # (`verification-unavailable`, STANDARDS §23.9) — it no longer silently no-ops.
           UI_SELF_CHECK_MOBILE: ${{ inputs.runner_label == 'fleet-mac' && '1' || '0' }}
+          # Where the token re-minter (step above) writes, and where the agent's
+          # `fresh-token.sh refresh` looks: $RUNNER_TEMP/fleet-token, else /tmp/fleet-token, which holds
+          # nothing. claude-code-action hands the CLI a copy of its own process env (parse-sdk-options.ts),
+          # so the value reaches the CLI process either way; whether the CLI's Bash tool then passes it on
+          # is the CLI's behavior, not something the action's source settles. Set it here so it does not
+          # depend on that. It is the runner's own value, not a secret.
+          RUNNER_TEMP: ${{ runner.temp }}
         with:
           # Set by the pre-install step above; empty means it fell back and the action installs itself.
           path_to_claude_code_executable: ${{ steps.claude-cli.outputs.path }}
@@ -1024,3 +1111,53 @@ jobs:
           path: ${{ steps.ensure-report.outputs.transcript_path }}
           if-no-files-found: warn
           retention-days: 7
+
+      - name: Stop the GitHub token re-minter and remove its token
+        # Pairs with "Start the GitHub token re-minter" above; keep it the LAST step. Several runner
+        # instances share each self-hosted host (six on the PC, three on the Mac), and a live `serve`
+        # keeps minting a repo-write installation token every 25 minutes into a directory the next job on
+        # this instance would find. Stop it and delete the token whatever happened: `always()` covers a
+        # failed, timed-out or cancelled job. Observability and hygiene, never a gate: exits 0 on every
+        # path, and a runner that dies before reaching this step is covered by the token's own 60-minute
+        # life and by the start step clearing the directory before it begins.
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          set +e
+
+          STATE_DIR="$RUNNER_TEMP/fleet-token"
+          LOG="$RUNNER_TEMP/fresh-token-serve.log"
+
+          # What the re-minter did, from its log (status lines only; it never prints a token). A mint
+          # count above 1 on a run past minute 25 is the proof the re-mint worked on a real run.
+          if [ -f "$LOG" ]; then
+            echo "re-minter log ($LOG):"
+            head -c 4000 "$LOG" | tr -d '\r' | tr -cd '[:print:]\n' | head -n 40 | sed 's/^/  | /'
+          fi
+
+          # `serve` writes its pid after its first mint; the start step wrote the launch pid first. Both
+          # name the same process unless the first mint never finished, so try both. A pid is signalled
+          # only when it is a plain number AND is still running fresh-token.sh: pids are reused, and this
+          # host runs other jobs.
+          STOPPED=" "
+          for PID_FILE in "$STATE_DIR/serve.pid" "$RUNNER_TEMP/fresh-token-serve.pid"; do
+            [ -f "$PID_FILE" ] || continue
+            PID="$(tr -d ' \t\r\n' < "$PID_FILE" 2>/dev/null)"
+            case "$PID" in ""|*[!0-9]*) continue ;; esac
+            case "$STOPPED" in *" $PID "*) continue ;; esac
+            kill -0 "$PID" 2>/dev/null || continue
+            ps -p "$PID" -o args= 2>/dev/null | grep -q 'fresh-token\.sh' || continue
+            # The parent first, then the `sleep` it was waiting in (which would otherwise be left to run
+            # out its 25 minutes). Killing the child first would let the loop mint once more.
+            CHILDREN="$(pgrep -P "$PID" 2>/dev/null)"
+            kill "$PID" 2>/dev/null
+            # shellcheck disable=SC2086
+            [ -n "$CHILDREN" ] && kill $CHILDREN 2>/dev/null
+            STOPPED="${STOPPED}${PID} "
+            echo "::notice::implementer-callable: stopped the GitHub token re-minter (pid ${PID})"
+          done
+
+          rm -rf "$STATE_DIR" "$RUNNER_TEMP/fresh-token-serve.pid" "$LOG"
+          exit 0
