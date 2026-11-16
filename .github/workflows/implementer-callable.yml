@@ -150,6 +150,309 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           rm -f "$RUNNER_TEMP/tooling-probe.txt"
 
+      - name: Heal a stale dev client on this slot
+        # STANDARDS section 27.7 "Dev clients on slot simulators", "Who repairs it". A native-dependency change
+        # leaves the dev client stale on EVERY slot (fleet-slot-1..3), and each slot used to file its own
+        # `dev-client-stale` card: 15 of them between 2026-10-31 and 2026-11-11 (puzzle-pop, petcare-companion),
+        # every one cleared by Seth running `dev-client:rebuild` on the Mac and re-dispatching. Seth approved
+        # healing it HERE on 2026-11-16: a deterministic workflow step may rebuild. The agent still never does,
+        # because the client is shared by every job on the slot and a native build is open-ended work; its own
+        # probe stays authoritative and files the card if this step could not fix things.
+        #
+        # Runs before the agent (and, in the implementer, before the token re-minter), so a rebuild spends none
+        # of the agent's token window. It only ever touches THIS job's own slot: `fleet_slot` must resolve to
+        # 1..9, never 0 (a human's simulator), and the simulator is `fleet_sim_target`'s, the same one the agent's
+        # probe will check. The checks are the product's own vendored scripts/lib/fleet-slot.sh and
+        # scripts/lib/dev-client-check.mjs (exit 0 fresh or n/a, 21 stale or missing, 2 undecided), and the
+        # rebuild is the product's own `dev-client:rebuild` script.
+        #
+        # A check that exits 2 on a checkout with no node_modules is not a verdict: the helper runs the
+        # product's own `expo` and `expo-updates`, and actions/checkout deletes node_modules. So that case
+        # installs once (frozen, from the lockfile) and asks again. Only a 21 is acted on.
+        #
+        # Heals go one at a time machine-wide, under ~/.fleet/locks (same atomic mkdir and dead-owner recovery
+        # as fleet_maestro): the three Mac instances share the CocoaPods cache and the CPU. It waits up to 20
+        # minutes for the lock and then gives up. The step's 35 minutes are a budget too: a heal that reaches
+        # the lock with less than 15 of them left gives up rather than start a build the timeout would kill.
+        # The implementer's 120-minute job timeout is hard-coded by the hub and is not raised for this.
+        #
+        # NEVER a gate: continue-on-error, and every path exits 0. Any failure is a ::warning:: and the agent's
+        # probe files the dev-client-stale card exactly as it did before this step existed. Afterwards the work
+        # tree holds no tracked changes (prebuild --clean regenerates the gitignored ios/, but if anything
+        # tracked moved it is restored), so the agent can never commit what the rebuild touched.
+        #
+        # Same step, same script in implementer-callable.yml and milestone-test-callable.yml: change them
+        # together. dev-client-heal-test.yml lifts both and fails if they differ.
+        if: inputs.runner_label == 'fleet-mac'
+        continue-on-error: true
+        timeout-minutes: 35
+        shell: bash
+        run: |
+          # Every path below ends in exit 0: this step repairs, it never gates. The shell has -e on by default.
+          set +e
+
+          LIB="scripts/lib/fleet-slot.sh"
+          HELPER="scripts/lib/dev-client-check.mjs"
+          REBUILD="dev-client:rebuild"
+          TMP="${RUNNER_TEMP:-/tmp}"
+          BUILD_LOG="$TMP/dev-client-heal-build.log"
+          INSTALL_LOG="$TMP/dev-client-heal-install.log"
+          SIM_ERR="$TMP/dev-client-heal-sim.err"
+          SUMMARY="${GITHUB_STEP_SUMMARY:-/dev/null}"
+          # The lock lives where fleet_maestro's does (fleet-slot.sh `_fleet_lock_dir`): $HOME, not $TMPDIR, so a
+          # human's Terminal and every runner LaunchAgent share ONE lock. The FLEET_HEAL_* overrides are for tests.
+          LOCK_DIR="${FLEET_MAESTRO_LOCK_DIR:-$HOME/.fleet/locks}"
+          LOCK="$LOCK_DIR/fleet-dev-client-heal.lock"
+          LOCK_WAIT_SECS="${FLEET_HEAL_LOCK_WAIT_SECS:-1200}"
+          # Keep STEP_BUDGET_SECS equal to this step's timeout-minutes. A build the timeout would kill half way
+          # is worse than none: it holds the lock and burns the time for nothing.
+          STEP_BUDGET_SECS="${FLEET_HEAL_STEP_BUDGET_SECS:-2100}"
+          MIN_BUILD_SECS="${FLEET_HEAL_MIN_BUILD_SECS:-900}"
+
+          HELD=0; REBUILD_STARTED=0; TREE_CLEANED=0; DEPS_DONE=0; INSTALL_RAN=0; BUILD_RAN=0
+          SLOT=""; UDID=""; PM=""; INSTALL=()
+          CHECK_RC=""; CHECK_JSON=""; CHECK_STATE=""
+          INSTALL_SECS=0; LOCK_WAIT=0; BUILD_SECS=0; LOCK_AT=""; UNLOCK_AT=""
+
+          skip() { echo "::notice::dev-client heal skipped: $1"; exit 0; }
+
+          fmt() { printf '%dm %02ds' $(( $1 / 60 )) $(( $1 % 60 )); }
+
+          # Last lines of a log, safe to print and to put in a fenced block: control characters and backticks out.
+          tail_of() { tail -n "${2:-40}" "$1" 2>/dev/null | tr -d '\r' | tr -cd '[:print:]\n' | tr '`' "'"; }
+
+          # Run a command with its output tee'd to a log AND printed to the job log with a prefix, so no line of a
+          # build can start a workflow command (`::...`) at column 0. Returns the command's own exit code.
+          run_logged() {
+            local log="$1"; shift
+            : > "$log"
+            "$@" 2>&1 | tee -a "$log" | awk '{ print "  | " $0; fflush() }'
+            return "${PIPESTATUS[0]}"
+          }
+
+          json_field() {
+            printf '%s' "$CHECK_JSON" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const v=JSON.parse(s)[process.argv[1]];process.stdout.write(String(v==null?"":v).replace(/\s+/g," ").slice(0,300))}catch(e){}})' "$1"
+          }
+
+          # Sets CHECK_RC (0 fresh or n/a, 21 stale or missing, 2 undecided) and CHECK_STATE. The helper's own
+          # human line goes to the job log on stderr; its JSON verdict is the last line of stdout.
+          run_check() {
+            local out
+            out="$(fleet_dev_client_check "$UDID")"
+            CHECK_RC=$?
+            CHECK_JSON="$(printf '%s\n' "$out" | tail -n 1)"
+            CHECK_STATE="$(json_field state)"
+            [ -n "$CHECK_STATE" ] || CHECK_STATE="unknown"
+          }
+
+          release_lock() {
+            if [ "$HELD" = 1 ]; then
+              rm -rf "$LOCK"
+              HELD=0
+              UNLOCK_AT="$(date +%s)"
+            fi
+          }
+
+          # Same atomic mkdir and dead-owner recovery as fleet_maestro. Returns 1 after LOCK_WAIT_SECS.
+          acquire_lock() {
+            local owner waited=0 nopid=0
+            until mkdir "$LOCK" 2>/dev/null; do
+              owner="$(cat "$LOCK/pid" 2>/dev/null)" || owner=""
+              # Reclaim a lock whose owner died without releasing it.
+              if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then
+                echo "dev-client heal: reclaiming the lock from dead pid $owner"
+                rm -rf "$LOCK"; nopid=0; continue
+              fi
+              # No pid file: either the winner has not written it yet or it died between mkdir and the write.
+              if [ -z "$owner" ]; then
+                nopid=$((nopid + 2))
+                if [ "$nopid" -ge 10 ]; then
+                  echo "dev-client heal: reclaiming a lock that never recorded a pid"
+                  rm -rf "$LOCK"; nopid=0; continue
+                fi
+              else
+                nopid=0
+              fi
+              waited=$((waited + 2))
+              [ "$waited" -ge "$LOCK_WAIT_SECS" ] && return 1
+              if [ $((waited % 60)) -eq 0 ]; then
+                echo "dev-client heal: waiting ${waited}s for another heal (held by pid ${owner:-?}: $(cat "$LOCK/owner" 2>/dev/null))"
+              fi
+              sleep 2
+            done
+            echo $$ > "$LOCK/pid"
+            echo "${GITHUB_REPOSITORY:-?} on ${RUNNER_NAME:-?}" > "$LOCK/owner"
+            HELD=1
+            LOCK_AT="$(date +%s)"
+            return 0
+          }
+
+          # The work tree must hold no tracked changes when the agent starts: it could commit them. prebuild
+          # --clean regenerates ios/ (normally gitignored), so there is normally nothing to do.
+          cleanup_tree() {
+            local changed fresh
+            TREE_CLEANED=1
+            changed="$(git diff --name-only HEAD 2>/dev/null)"
+            if [ -n "$changed" ]; then
+              git checkout HEAD -- . 2>/dev/null || git reset -q --hard HEAD
+              echo "::warning::dev-client heal: the rebuild changed tracked files; restored them so the agent cannot commit them: $(printf '%s' "$changed" | head -n 20 | tr '\n' ' ')"
+            fi
+            # New files that are not gitignored are not tracked changes and are left alone (deleting what this step
+            # did not create is not its call), but the agent should hear about them.
+            git ls-files --others --exclude-standard 2>/dev/null | sort > "$TMP/dev-client-heal-untracked.after"
+            fresh="$(comm -13 "$TMP/dev-client-heal-untracked.before" "$TMP/dev-client-heal-untracked.after" 2>/dev/null)"
+            if [ -n "$fresh" ]; then
+              echo "::warning::dev-client heal: the rebuild left new untracked files that are not gitignored (not removed): $(printf '%s' "$fresh" | head -n 20 | tr '\n' ' ')"
+            fi
+          }
+
+          on_exit() {
+            release_lock
+            if [ "$REBUILD_STARTED" = 1 ] && [ "$TREE_CLEANED" != 1 ]; then cleanup_tree; fi
+          }
+          trap on_exit EXIT
+          trap 'exit 143' TERM
+          trap 'exit 130' INT
+
+          # A failed heal. The agent's own probe still files the dev-client-stale card, exactly as before this step.
+          give_up() {
+            echo "::warning::dev-client heal gave up on slot $SLOT: $1. The agent's probe will file the dev-client-stale card as before."
+            {
+              echo "### Dev client heal: gave up (slot $SLOT)"
+              echo ""
+              echo "$1. The agent's probe will file the dev-client-stale card as before."
+              if [ "$INSTALL_RAN" = 1 ] && [ "$BUILD_RAN" != 1 ]; then
+                echo ""; echo "Last lines of the dependency install:"; echo '```'; tail_of "$INSTALL_LOG" 40; echo '```'
+              fi
+              if [ "$BUILD_RAN" = 1 ]; then
+                echo ""; echo "Last lines of the rebuild:"; echo '```'; tail_of "$BUILD_LOG" 40; echo '```'
+              fi
+            } >> "$SUMMARY"
+            exit 0
+          }
+
+          # ---- Guards: nothing here is an error, the product just is not in scope ----------------------------
+          [ -f "$LIB" ] && [ -f "$HELPER" ] || skip "$LIB and $HELPER are not both vendored in this repo (STANDARDS section 27.7)"
+          command -v node >/dev/null 2>&1 || skip "node is not on PATH"
+          node -e 'try{process.exit(JSON.parse(require("fs").readFileSync("package.json","utf8")).scripts[process.argv[1]]?0:1)}catch(e){process.exit(1)}' "$REBUILD" \
+            || skip "package.json declares no \"$REBUILD\" script"
+
+          # ---- Which slot, which simulator. Never slot 0: that is a human's own simulator --------------------
+          . "$LIB"
+          SLOT="$(fleet_slot)"
+          case "$SLOT" in
+            ''|*[!0-9]*|0)
+              echo "::warning::dev-client heal refused: this job's fleet slot resolves to '${SLOT:-nothing}' (FLEET_SLOT='${FLEET_SLOT:-}', RUNNER_NAME='${RUNNER_NAME:-}'). It only ever touches its own slot 1..9, never slot 0, which is a human's simulator."
+              echo "### Dev client heal: refused" >> "$SUMMARY"
+              echo "" >> "$SUMMARY"
+              echo "The job's fleet slot did not resolve to 1..9, so nothing was touched." >> "$SUMMARY"
+              exit 0 ;;
+          esac
+          UDID="$(fleet_sim_target 2>"$SIM_ERR")"
+          case "$UDID" in
+            ''|*[!0-9A-Fa-f-]*)
+              echo "::warning::dev-client heal skipped: no simulator for slot $SLOT ($(head -c 300 "$SIM_ERR" | tr -d '\r' | tr -cd '[:print:]' ))"
+              echo "### Dev client heal: skipped (slot $SLOT)" >> "$SUMMARY"
+              echo "" >> "$SUMMARY"
+              echo "No simulator for the slot; the agent's own probe decides from here." >> "$SUMMARY"
+              exit 0 ;;
+          esac
+
+          # The package manager is the one whose lockfile the product commits. A workspace's lockfile is at the root.
+          if   [ -f pnpm-lock.yaml ]; then PM=pnpm; INSTALL=(pnpm install --frozen-lockfile)
+          elif [ -f yarn.lock ]; then
+            PM=yarn
+            if [ -f .yarnrc.yml ]; then INSTALL=(yarn install --immutable); else INSTALL=(yarn install --frozen-lockfile); fi
+          elif [ -f package-lock.json ]; then PM=npm; INSTALL=(npm ci)
+          elif [ -f bun.lock ] || [ -f bun.lockb ]; then PM=bun; INSTALL=(bun install --frozen-lockfile)
+          fi
+
+          install_deps() {
+            [ -n "$PM" ] || { echo "no lockfile (pnpm-lock.yaml, yarn.lock, package-lock.json, bun.lock) at the repo root"; return 1; }
+            command -v "$PM" >/dev/null 2>&1 || { echo "$PM is not on PATH"; return 1; }
+            local t0=$SECONDS rc
+            echo "dev-client heal: installing dependencies: ${INSTALL[*]}"
+            INSTALL_RAN=1
+            run_logged "$INSTALL_LOG" "${INSTALL[@]}"
+            rc=$?
+            INSTALL_SECS=$(( INSTALL_SECS + SECONDS - t0 ))
+            if [ "$rc" -eq 0 ]; then DEPS_DONE=1; else echo "${INSTALL[*]} exited $rc"; fi
+            return "$rc"
+          }
+
+          git ls-files --others --exclude-standard 2>/dev/null | sort > "$TMP/dev-client-heal-untracked.before"
+
+          # ---- State before ----------------------------------------------------------------------------------
+          echo "dev-client heal: slot $SLOT, simulator $UDID"
+          run_check
+          # The check runs the product's own `expo` and `expo-updates`, so on a fresh checkout (actions/checkout
+          # deletes node_modules) it cannot decide: exit 2. That is "no deps yet", not a verdict, so install once
+          # and ask again. Without this the step would skip exactly the case it exists for.
+          if [ "$CHECK_RC" -eq 2 ] && [ ! -d node_modules ]; then
+            if install_deps; then run_check; else give_up "the dependency install failed, so the client could not be checked"; fi
+          fi
+          BEFORE="$CHECK_STATE"
+          BEFORE_WHY="$(json_field reason | tr '|' '/')"
+
+          if [ "$CHECK_RC" -ne 21 ]; then
+            # 0: fresh, or the product does not use the fingerprint runtimeVersion policy. 2: still undecided; that
+            # is not a verdict, so leave it to the agent's probe.
+            if [ "$CHECK_RC" -eq 0 ]; then MSG="the dev client on slot $SLOT is $BEFORE; nothing to rebuild"; else MSG="could not decide whether the dev client on slot $SLOT is fresh (${BEFORE_WHY:-no reason given}); leaving it to the agent's probe"; fi
+            echo "::notice::dev-client heal: $MSG"
+            {
+              echo "### Dev client heal: $BEFORE (slot $SLOT)"
+              echo ""
+              echo "$MSG. Checked in $(fmt "$SECONDS")."
+            } >> "$SUMMARY"
+            echo "dev-client-heal-result: before=$BEFORE after=$BEFORE rebuilt=no secs=$SECONDS lock_wait=0"
+            exit 0
+          fi
+
+          # ---- Stale or missing: heal it ---------------------------------------------------------------------
+          echo "dev-client heal: the client is $BEFORE (${BEFORE_WHY}); rebuilding on slot $SLOT"
+          if [ "$DEPS_DONE" != 1 ]; then
+            install_deps || give_up "the dependency install failed"
+          fi
+
+          mkdir -p "$LOCK_DIR" 2>/dev/null || give_up "cannot create the lock directory $LOCK_DIR, so heals cannot be serialized"
+          T_LOCK0=$SECONDS
+          acquire_lock || give_up "waited $(fmt "$LOCK_WAIT_SECS") for another heal on this machine to finish (the three Mac instances build one at a time) and it did not"
+          LOCK_WAIT=$(( SECONDS - T_LOCK0 ))
+          if [ $(( STEP_BUDGET_SECS - SECONDS )) -lt "$MIN_BUILD_SECS" ]; then
+            give_up "only $(fmt $(( STEP_BUDGET_SECS - SECONDS ))) of the step's $(fmt "$STEP_BUDGET_SECS") are left after waiting for the lock, which is not enough for a build"
+          fi
+          [ "$LOCK_WAIT" -lt 2 ] || echo "dev-client heal: waited $(fmt "$LOCK_WAIT") for the lock"
+
+          REBUILD_STARTED=1; BUILD_RAN=1
+          T_BUILD0=$SECONDS
+          run_logged "$BUILD_LOG" env "DEV_CLIENT_UDID=$UDID" "$PM" run "$REBUILD"
+          BUILD_RC=$?
+          BUILD_SECS=$(( SECONDS - T_BUILD0 ))
+          release_lock
+          cleanup_tree
+
+          run_check
+          AFTER="$CHECK_STATE"
+          TOTAL=$SECONDS
+
+          if [ "$CHECK_RC" -eq 0 ]; then
+            echo "::notice::dev-client heal: slot $SLOT was $BEFORE, now $AFTER ($(fmt "$TOTAL"))"
+            {
+              echo "### Dev client heal: rebuilt (slot $SLOT)"
+              echo ""
+              echo "| | |"
+              echo "|---|---|"
+              echo "| Before | \`$BEFORE\`: ${BEFORE_WHY} |"
+              echo "| After | \`$AFTER\` |"
+              echo "| Time | $(fmt "$TOTAL"): install $(fmt "$INSTALL_SECS"), waited for the lock $(fmt "$LOCK_WAIT"), rebuild $(fmt "$BUILD_SECS") |"
+            } >> "$SUMMARY"
+            [ "$BUILD_RC" -eq 0 ] || echo "::warning::dev-client heal: \`$PM run $REBUILD\` exited $BUILD_RC but the client now checks out, so it was kept"
+          else
+            give_up "\`$PM run $REBUILD\` exited $BUILD_RC and the client on the slot is still $AFTER after $(fmt "$TOTAL")"
+          fi
+          echo "dev-client-heal-result: before=$BEFORE after=$AFTER rebuilt=yes secs=$TOTAL install=$INSTALL_SECS lock_wait=$LOCK_WAIT build=$BUILD_SECS lock_at=$LOCK_AT unlock_at=$UNLOCK_AT"
+          exit 0
+
       - name: Install Claude Code CLI (job-private HOME)
         # WHY THIS STEP EXISTS. claude-code-action installs the CLI itself, on every step that uses
         # it, by running claude.ai/install.sh. That script stages its download in

@@ -1,0 +1,292 @@
+name: dev client heal (test)
+
+# Check of the "Heal a stale dev client on this slot" step in implementer-callable.yml and
+# milestone-test-callable.yml (STANDARDS section 27.7 "Who repairs it"), on a real fleet-mac instance, without
+# waiting for a real run to meet a stale client.
+#
+# It runs the callables' OWN step text, lifted out of the two files at run time (not a copy that could
+# drift), against a real checkout of a real Expo product (default: puzzle-pop):
+#
+#   1. both callables carry the same script, and it parses;
+#   2. a slot-0 or unresolvable slot is refused and nothing is touched;
+#   3. MISSING: the product's dev client is uninstalled from this instance's slot simulator
+#      (`xcrun simctl uninstall`, state "missing", exit 21) and node_modules is removed, as
+#      actions/checkout leaves a workspace; the implementer's step text then heals it: the check exits 0
+#      afterwards and `git status --porcelain` is empty;
+#   4. FRESH: the milestone-test copy of the step runs again and must do no rebuild (and no install).
+#
+# Start it on two instances at once (the thin caller's `concurrent` input) to see the machine-wide lock
+# serialize the two heals: every heal prints its lock_at and unlock_at, and one of them waits.
+#
+# WHERE IT CAN RUN. Same as implementer-token-remint-test.yml: from a PRIVATE repo, as a reusable workflow.
+# The org's runner group does not allow public repositories, so a self-hosted job from this repo never
+# starts. A private repo with a thin caller on its default branch works:
+#
+#   on:
+#     workflow_dispatch:
+#       inputs: { concurrent: { type: boolean, default: false } }
+#   permissions: { contents: read }
+#   jobs:
+#     test:
+#       strategy:
+#         fail-fast: false
+#         matrix: { n: "${{ fromJSON(inputs.concurrent && '[1,2]' || '[1]') }}" }
+#       uses: Aethrix-Labs/.github/.github/workflows/dev-client-heal-test.yml@<ref>
+#       with: { callable_ref: <ref> }
+#       secrets: inherit
+#
+# It needs FLEET_SKILLS_PAT (as the callables do) to read the callable source and the product. It rebuilds a
+# real dev client, so a run takes as long as `dev-client:rebuild` does, and it leaves a fresh client on the
+# instance's slot simulator. Never prints a secret.
+
+on:
+  workflow_call:
+    inputs:
+      runs_on:
+        description: 'JSON array for runs-on. Must be a fleet-mac instance: the heal needs Xcode and a simulator.'
+        type: string
+        required: false
+        default: '["self-hosted","fleet-mac"]'
+      callable_ref:
+        description: "Ref of Aethrix-Labs/.github whose callables' heal steps are tested."
+        type: string
+        required: false
+        default: "main"
+      product_repo:
+        description: "An Expo product that declares dev-client:rebuild and the fingerprint runtimeVersion policy."
+        type: string
+        required: false
+        default: "Aethrix-Labs/puzzle-pop"
+      product_ref:
+        description: "Ref of the product to check out."
+        type: string
+        required: false
+        default: "main"
+      timeout_minutes:
+        description: "Job timeout."
+        type: string
+        required: false
+        default: "90"
+  workflow_dispatch:
+    inputs:
+      callable_ref:
+        description: "Ref of Aethrix-Labs/.github whose callables' heal steps are tested."
+        type: string
+        required: false
+        default: "main"
+      product_repo:
+        description: "An Expo product that declares dev-client:rebuild and the fingerprint runtimeVersion policy."
+        type: string
+        required: false
+        default: "Aethrix-Labs/puzzle-pop"
+      product_ref:
+        description: "Ref of the product to check out."
+        type: string
+        required: false
+        default: "main"
+      timeout_minutes:
+        description: "Job timeout."
+        type: string
+        required: false
+        default: "90"
+
+permissions:
+  contents: read
+
+jobs:
+  heal:
+    runs-on: ${{ fromJSON(inputs.runs_on || '["self-hosted","fleet-mac"]') }}
+    timeout-minutes: ${{ fromJSON(inputs.timeout_minutes || '90') }}
+    steps:
+      - uses: actions/checkout@v4 # the product, at the workspace root: the step runs from a product's root
+        with:
+          repository: ${{ inputs.product_repo || 'Aethrix-Labs/puzzle-pop' }}
+          ref: ${{ inputs.product_ref || 'main' }}
+          token: ${{ secrets.FLEET_SKILLS_PAT }}
+
+      - uses: actions/checkout@v4 # the callables under test
+        with:
+          repository: Aethrix-Labs/.github
+          path: callable-src
+          ref: ${{ inputs.callable_ref || 'main' }}
+          token: ${{ secrets.FLEET_SKILLS_PAT }}
+
+      - name: Lift the callables' heal steps
+        shell: bash
+        env:
+          CALLABLE_REF: ${{ inputs.callable_ref || 'main' }}
+        run: |
+          # callable-src is this test's own checkout inside the product's work tree. Ignore it, so that
+          # `git status --porcelain` is empty when nothing but the heal could have changed it.
+          echo "callable-src/" >> .git/info/exclude
+          echo "testing the callables at $(git -C callable-src rev-parse --short HEAD) ($CALLABLE_REF)"
+          # The text of one step's `run: |` block, de-indented. Matches the step by its exact name. awk reads
+          # the file itself and strips any CR (see implementer-token-remint-test.yml for why not `tr | awk`).
+          extract() {
+            awk -v name="$2" '
+              { sub(/\r$/, "") }
+              $0 == "      - name: " name { found = 1; next }
+              found && !inrun && $0 == "        run: |" { inrun = 1; next }
+              inrun {
+                if ($0 ~ /^          /) { print substr($0, 11); next }
+                if ($0 ~ /^[ ]*$/) { print ""; next }
+                exit
+              }
+              found && !inrun && $0 ~ /^      - / { exit }
+            ' "callable-src/.github/workflows/$1"
+          }
+          NAME="Heal a stale dev client on this slot"
+          extract implementer-callable.yml "$NAME" > "$RUNNER_TEMP/heal-implementer.sh"
+          extract milestone-test-callable.yml "$NAME" > "$RUNNER_TEMP/heal-milestone-test.sh"
+          for F in heal-implementer heal-milestone-test; do
+            [ -s "$RUNNER_TEMP/$F.sh" ] || { echo "::error::could not find the heal step for $F"; exit 1; }
+            bash -n "$RUNNER_TEMP/$F.sh" || { echo "::error::$F does not parse"; exit 1; }
+            echo "lifted $F: $(wc -l < "$RUNNER_TEMP/$F.sh" | tr -d ' ') lines"
+          done
+          if cmp -s "$RUNNER_TEMP/heal-implementer.sh" "$RUNNER_TEMP/heal-milestone-test.sh"; then
+            echo "ok: the two callables carry the same heal script"
+          else
+            echo "::error::implementer-callable.yml and milestone-test-callable.yml carry DIFFERENT heal scripts; they must be changed together"
+            diff "$RUNNER_TEMP/heal-implementer.sh" "$RUNNER_TEMP/heal-milestone-test.sh" | head -40
+            exit 1
+          fi
+
+      - name: This job's slot and simulator
+        shell: bash
+        run: |
+          . scripts/lib/fleet-slot.sh
+          SLOT="$(fleet_slot)"
+          case "$SLOT" in ''|*[!0-9]*|0) echo "::error::this instance's slot resolves to '${SLOT}'; a test must never run on slot 0"; exit 1 ;; esac
+          UDID="$(fleet_sim_target)" || { echo "::error::no simulator for slot $SLOT"; exit 1; }
+          echo "runner $RUNNER_NAME, slot $SLOT, simulator $UDID"
+          echo "SLOT=$SLOT" >> "$GITHUB_ENV"
+          echo "UDID=$UDID" >> "$GITHUB_ENV"
+          {
+            echo "### dev client heal test: \`$RUNNER_NAME\`, slot $SLOT"
+            echo ""
+            echo "Simulator \`$UDID\`. Callables at \`$(git -C callable-src rev-parse --short HEAD)\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: A slot 0 or unresolvable slot is refused, and nothing is touched
+        shell: bash
+        run: |
+          set +e # a non-zero exit is data here, not an abort
+          FAIL=0
+          # No simulator is booted, no dependency installed, no lock taken on these paths.
+          for CASE in "FLEET_SLOT=0" "RUNNER_NAME=somebody-else"; do
+            OUT="$RUNNER_TEMP/refused.out"
+            if [ "$CASE" = "FLEET_SLOT=0" ]; then
+              env FLEET_SLOT=0 bash --noprofile --norc -eo pipefail "$RUNNER_TEMP/heal-implementer.sh" > "$OUT" 2>&1; RC=$?
+            else
+              env -u FLEET_SLOT RUNNER_NAME=somebody-else bash --noprofile --norc -eo pipefail "$RUNNER_TEMP/heal-implementer.sh" > "$OUT" 2>&1; RC=$?
+            fi
+            if [ "$RC" -eq 0 ] && grep -q '::warning::dev-client heal refused' "$OUT" && [ ! -d node_modules ]; then
+              echo "ok: refused with $CASE"
+            else
+              echo "::error::expected a refusal with $CASE (exit $RC, node_modules present: $([ -d node_modules ] && echo yes || echo no))"; sed 's/^/  | /' "$OUT"; FAIL=1
+            fi
+          done
+          exit "$FAIL"
+
+      - name: Make this slot's dev client missing, as a fresh checkout leaves it
+        shell: bash
+        run: |
+          . scripts/lib/fleet-slot.sh
+          # The check needs the product's own expo and expo-updates, so install first to learn the bundle id.
+          if   [ -f pnpm-lock.yaml ]; then pnpm install --frozen-lockfile
+          elif [ -f yarn.lock ]; then yarn install --frozen-lockfile
+          else npm ci; fi
+          JSON="$(fleet_dev_client_check "$UDID" | tail -n 1)" || true
+          BUNDLE="$(printf '%s' "$JSON" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(JSON.parse(s).bundleId||"")}catch(e){}})')"
+          [ -n "$BUNDLE" ] || { echo "::error::no bundle id from the check (is the fingerprint runtimeVersion policy in use?): $JSON"; exit 1; }
+          echo "bundle id $BUNDLE; state before the test starts: $(printf '%s' "$JSON" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>process.stdout.write(String(JSON.parse(s).state)))')"
+          xcrun simctl uninstall "$UDID" "$BUNDLE" || echo "(nothing to uninstall: it was not installed)"
+          RC=0
+          fleet_dev_client_check "$UDID" > "$RUNNER_TEMP/made-stale.json" || RC=$?
+          [ "$RC" -eq 21 ] || { echo "::error::expected exit 21 (missing) after the uninstall, got $RC"; exit 1; }
+          grep -q '"state":"missing"' "$RUNNER_TEMP/made-stale.json" || { echo "::error::expected state missing"; cat "$RUNNER_TEMP/made-stale.json"; exit 1; }
+          echo "ok: the slot's client is now missing (exit 21)"
+          # What actions/checkout does to a reused workspace: removes everything ignored, node_modules included.
+          git clean -ffdxq -e callable-src
+          [ ! -d node_modules ] || { echo "::error::node_modules is still there"; exit 1; }
+          echo "ok: node_modules removed; the heal step starts from a fresh checkout"
+
+      - name: HEAL, the implementer callable's step text
+        # The callable's step has timeout-minutes 35; give the test step a little more.
+        timeout-minutes: 45
+        shell: bash
+        run: |
+          . scripts/lib/fleet-slot.sh
+          set +e # a non-zero exit is data here, not an abort
+          FAIL=0
+          START="$(date +%s)"
+          GITHUB_STEP_SUMMARY="$RUNNER_TEMP/heal-A.summary" \
+            bash --noprofile --norc -eo pipefail "$RUNNER_TEMP/heal-implementer.sh" 2>&1 | tee "$RUNNER_TEMP/heal-A.log"
+          RC="${PIPESTATUS[0]}"
+          END="$(date +%s)"
+          echo "::group::the step's own job summary"; cat "$RUNNER_TEMP/heal-A.summary"; echo "::endgroup::"
+          cat "$RUNNER_TEMP/heal-A.summary" >> "$GITHUB_STEP_SUMMARY"
+
+          RES="$(grep '^dev-client-heal-result:' "$RUNNER_TEMP/heal-A.log" | tail -n 1)"
+          kv() { printf '%s' "$RES" | tr ' ' '\n' | sed -n "s/^$1=//p"; }
+          echo "result: $RES"
+          [ "$RC" -eq 0 ] || { echo "::error::the step exited $RC; it must always exit 0"; FAIL=1; }
+          [ "$(kv before)" = "missing" ] || { echo "::error::expected before=missing, got '$(kv before)'"; FAIL=1; }
+          [ "$(kv after)" = "fresh" ] || { echo "::error::expected after=fresh, got '$(kv after)'"; FAIL=1; }
+          [ "$(kv rebuilt)" = "yes" ] || { echo "::error::expected rebuilt=yes, got '$(kv rebuilt)'"; FAIL=1; }
+
+          # The check, independently of the step's own re-check.
+          fleet_dev_client_check "$UDID" >/dev/null 2>&1; CRC=$?
+          if [ "$CRC" -eq 0 ]; then echo "ok: the check exits 0 on the healed slot"; else echo "::error::the check exits $CRC after the heal"; FAIL=1; fi
+          # The work tree must hold nothing the agent could commit.
+          PORC="$(git status --porcelain)"
+          if [ -z "$PORC" ]; then echo "ok: git status --porcelain is empty"; else echo "::error::git status --porcelain is not empty after the heal:"; echo "$PORC" | head -20; FAIL=1; fi
+          # Lock released.
+          LOCKP="${FLEET_MAESTRO_LOCK_DIR:-$HOME/.fleet/locks}/fleet-dev-client-heal.lock"
+          if [ -d "$LOCKP" ] && kill -0 "$(cat "$LOCKP/pid" 2>/dev/null)" 2>/dev/null; then
+            echo "note: the lock is held by a live pid ($(cat "$LOCKP/owner" 2>/dev/null)); another instance's heal, which is fine"
+          elif [ -d "$LOCKP" ]; then
+            echo "::error::a lock with no live owner is left behind at $LOCKP"; FAIL=1
+          else
+            echo "ok: no lock left behind"
+          fi
+
+          {
+            echo ""
+            echo "| Scenario | Result | Wall time | Install | Lock wait | Rebuild |"
+            echo "|---|---|---|---|---|---|"
+            echo "| missing -> heal | \`$(kv before)\` -> \`$(kv after)\` | $(( END - START ))s | $(kv install)s | $(kv lock_wait)s | $(kv build)s |"
+            echo ""
+            echo "Lock: acquired at \`$(kv lock_at)\`, released at \`$(kv unlock_at)\` (epoch seconds, this machine's clock)."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "HEAL_WALL=$(( END - START ))" >> "$GITHUB_ENV"
+          exit "$FAIL"
+
+      - name: FRESH, the milestone-test callable's step text does no rebuild
+        shell: bash
+        run: |
+          set +e # a non-zero exit is data here, not an abort
+          FAIL=0
+          START="$(date +%s)"
+          GITHUB_STEP_SUMMARY="$RUNNER_TEMP/heal-B.summary" \
+            bash --noprofile --norc -eo pipefail "$RUNNER_TEMP/heal-milestone-test.sh" 2>&1 | tee "$RUNNER_TEMP/heal-B.log"
+          RC="${PIPESTATUS[0]}"
+          END="$(date +%s)"
+          cat "$RUNNER_TEMP/heal-B.summary" >> "$GITHUB_STEP_SUMMARY"
+          RES="$(grep '^dev-client-heal-result:' "$RUNNER_TEMP/heal-B.log" | tail -n 1)"
+          kv() { printf '%s' "$RES" | tr ' ' '\n' | sed -n "s/^$1=//p"; }
+          echo "result: $RES"
+          [ "$RC" -eq 0 ] || { echo "::error::the step exited $RC"; FAIL=1; }
+          [ "$(kv before)" = "fresh" ] || { echo "::error::expected before=fresh, got '$(kv before)'"; FAIL=1; }
+          [ "$(kv rebuilt)" = "no" ] || { echo "::error::expected rebuilt=no, got '$(kv rebuilt)'"; FAIL=1; }
+          if grep -q 'rebuilding on slot\|installing dependencies'"$RUNNER_TEMP/heal-B.log"; then
+            echo "::error::a fresh client must do no install and no rebuild"; FAIL=1
+          else
+            echo "ok: no install, no rebuild"
+          fi
+          PORC="$(git status --porcelain)"
+          [ -z "$PORC" ] || { echo "::error::git status --porcelain is not empty:"; echo "$PORC" | head; FAIL=1; }
+          {
+            echo "| fresh -> no rebuild | \`$(kv before)\` -> \`$(kv after)\` | $(( END - START ))s | | | |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$FAIL"
