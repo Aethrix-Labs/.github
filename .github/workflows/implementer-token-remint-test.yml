@@ -144,6 +144,35 @@ jobs:
             fi
           fi
 
+      - name: Why no token? (the exchange's own answer)
+        # Only on a failure with no token on disk. `fresh-token.sh` runs curl with -f, which keeps the
+        # error body out of its log, so ask the exchange again without it and print what it says: the
+        # HTTP status, its error fields, and the OIDC claims it judges the request by (repository, ref,
+        # workflow refs: none of them secret). A success is never printed: the body is the token.
+        if: failure()
+        shell: bash
+        run: |
+          set +e
+          [ -s "$RUNNER_TEMP/fleet-token/token" ] && { echo "a token exists; nothing to diagnose"; exit 0; }
+          OIDC="$(curl -sS --max-time 30 -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=claude-code-github-action" | jq -r '.value // empty')"
+          [ -n "$OIDC" ] || { echo "the OIDC id-token request itself failed"; exit 0; }
+          echo "::add-mask::$OIDC"
+          P="$(printf '%s' "$OIDC" | cut -d. -f2 | tr '_-' '/+')"
+          while [ $(( ${#P} % 4 )) -ne 0 ]; do P="${P}="; done
+          CLAIMS="$(printf '%s' "$P" | base64 -d 2>/dev/null)" || CLAIMS="$(printf '%s' "$P" | base64 -D 2>/dev/null)"
+          echo "OIDC claims the exchange sees:"
+          printf '%s' "$CLAIMS" | jq -c '{repository, ref, event_name, workflow_ref, job_workflow_ref, job_workflow_sha}' 2>/dev/null
+          CODE="$(curl -sS --max-time 30 -o "$RUNNER_TEMP/exchange.json" -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer $OIDC" https://api.anthropic.com/api/github/github-app-token-exchange)"
+          echo "exchange answered HTTP $CODE"
+          if [ "$CODE" = "200" ]; then
+            echo "this time the exchange succeeded (not printed: the body is a token)"
+          else
+            jq -c '{type, message, error}' "$RUNNER_TEMP/exchange.json" 2>/dev/null | head -c 800
+          fi
+          rm -f "$RUNNER_TEMP/exchange.json"
+
       - name: Wait for re-mints
         shell: bash
         run: sleep "$SLEEP_SECS"
