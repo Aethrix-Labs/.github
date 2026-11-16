@@ -1,8 +1,8 @@
 name: implementer token re-minter (test)
 
-# Manual check of the runner half of fleet DECISIONS 2026-10-17 "Implementer publishes with a
-# re-minted GitHub token" (STANDARDS §9 "Credential lifetime"), without waiting 60 minutes for a real
-# implementer run to hit minute 55.
+# Check of the runner half of fleet DECISIONS 2026-10-17 "Implementer publishes with a re-minted GitHub
+# token" (STANDARDS §9 "Credential lifetime"), without waiting 60 minutes for a real implementer run to
+# reach minute 55.
 #
 # It runs the implementer callable's OWN "Start the GitHub token re-minter" and "Stop the GitHub token
 # re-minter" steps, lifted out of implementer-callable.yml at run time (not a copy that could drift),
@@ -15,22 +15,60 @@ name: implementer token re-minter (test)
 #      token works against the GitHub API (`gh api repos/$GITHUB_REPOSITORY`);
 #   4. the stop step ends `serve` and removes the token directory.
 #
+# WHERE IT CAN RUN. Run it from a PRIVATE repo, as a reusable workflow, the way the real callables run:
+#   - The GitHub App token exchange (api.anthropic.com/api/github/github-app-token-exchange) judges the
+#     run's OIDC claims, and answers "Invalid OIDC token" to this workflow's own runs in this public repo
+#     on a feature branch (verified 2026-11-16, runs 43855214787 and 43855725148).
+#   - The org's runner group has allows_public_repositories=false, so a self-hosted runner (the Mac) never
+#     picks up a job from this public repo.
+# A private repo with a thin caller on its default branch has neither problem:
+#
+#   on: { workflow_dispatch: {} }
+#   permissions: { contents: read, id-token: write }
+#   jobs:
+#     test:
+#       strategy:
+#         fail-fast: false
+#         matrix: { runs_on: ['["ubuntu-latest"]', '["self-hosted","fleet-mac"]'] }
+#       uses: Aethrix-Labs/.github/.github/workflows/implementer-token-remint-test.yml@<ref>
+#       with: { runs_on: "${{ matrix.runs_on }}", callable_ref: <ref> }
+#       secrets: inherit
+#
 # What it cannot show is that the OIDC request credential outlives minute 60. It prints how long that
 # credential says it lives (its `exp`, never the credential itself) so that question has a number.
 #
-# Never prints a token: only sha256 prefixes and derived facts. Run from the Actions tab or
-# `gh workflow run implementer-token-remint-test.yml --ref <branch>`.
+# Never prints a token: only sha256 prefixes and derived facts.
 
 on:
-  # TEMPORARY (remove before merge): GitHub only dispatches a workflow_dispatch workflow that already
-  # exists on the default branch, so until this PR lands the test runs on pushes to its own branch.
-  push:
-    branches: [ci/implementer-token-reminter]
-    paths:
-      - .github/workflows/implementer-token-remint-test.yml
-      - .github/workflows/implementer-callable.yml
+  workflow_call:
+    inputs:
+      runs_on:
+        description: 'JSON array for runs-on, e.g. ["ubuntu-latest"] or ["self-hosted","fleet-mac"].'
+        type: string
+        required: false
+        default: '["ubuntu-latest"]'
+      callable_ref:
+        description: "Ref of Aethrix-Labs/.github whose implementer-callable.yml steps are tested."
+        type: string
+        required: false
+        default: "main"
+      sleep_secs:
+        description: "Seconds to wait between the first token and the check."
+        type: string
+        required: false
+        default: "200"
+      remint_secs:
+        description: "FLEET_TOKEN_REFRESH_SECS for `serve` (the production default is 1500)."
+        type: string
+        required: false
+        default: "60"
   workflow_dispatch:
     inputs:
+      callable_ref:
+        description: "Ref of Aethrix-Labs/.github whose implementer-callable.yml steps are tested."
+        type: string
+        required: false
+        default: "main"
       sleep_secs:
         description: "Seconds to wait between the first token and the check."
         type: string
@@ -48,23 +86,15 @@ permissions:
 
 jobs:
   remint:
-    name: remint (${{ matrix.label }})
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - label: ubuntu-latest
-            runs_on: '["ubuntu-latest"]'
-          - label: fleet-mac
-            runs_on: '["self-hosted","fleet-mac"]'
-    runs-on: ${{ fromJSON(matrix.runs_on) }}
+    runs-on: ${{ fromJSON(inputs.runs_on || '["ubuntu-latest"]') }}
     timeout-minutes: 15
     env:
-      # `|| 'default'` so a push-triggered run (no inputs) gets the same values as a dispatch.
+      # `|| 'default'` so a caller that leaves an input out gets the same values as the declared defaults.
+      CALLABLE_REF: ${{ inputs.callable_ref || 'main' }}
       SLEEP_SECS: ${{ inputs.sleep_secs || '200' }}
       REMINT_SECS: ${{ inputs.remint_secs || '60' }}
     steps:
-      - uses: actions/checkout@v4 # this repo: the callable under test, and a git repo for `refresh`
+      - uses: actions/checkout@v4 # the calling repo: a git repo with an origin, which `refresh` rewrites
 
       - uses: actions/checkout@v4 # fleet-skills (fresh-token.sh), same checkout the callable makes
         with:
@@ -73,11 +103,19 @@ jobs:
           ref: main
           token: ${{ secrets.FLEET_SKILLS_PAT }}
 
+      - uses: actions/checkout@v4 # the callable under test
+        with:
+          repository: Aethrix-Labs/.github
+          path: callable-src
+          ref: ${{ inputs.callable_ref || 'main' }}
+          token: ${{ secrets.FLEET_SKILLS_PAT }}
+
       - name: Lift the callable's re-minter steps
         shell: bash
         run: |
           case "$SLEEP_SECS$REMINT_SECS" in ""|*[!0-9]*) echo "::error::sleep_secs and remint_secs must be whole numbers"; exit 1 ;; esac
-          CALLABLE=".github/workflows/implementer-callable.yml"
+          CALLABLE="callable-src/.github/workflows/implementer-callable.yml"
+          echo "testing $CALLABLE at $(git -C callable-src rev-parse --short HEAD) ($CALLABLE_REF)"
           # The text of one step's `run: |` block, de-indented. Matches the step by its exact name.
           extract() {
             tr -d '\r' < "$CALLABLE" | awk -v name="$1" '
