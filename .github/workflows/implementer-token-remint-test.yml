@@ -22,6 +22,13 @@ name: implementer token re-minter (test)
 # `gh workflow run implementer-token-remint-test.yml --ref <branch>`.
 
 on:
+  # TEMPORARY (remove before merge): GitHub only dispatches a workflow_dispatch workflow that already
+  # exists on the default branch, so until this PR lands the test runs on pushes to its own branch.
+  push:
+    branches: [ci/implementer-token-reminter]
+    paths:
+      - .github/workflows/implementer-token-remint-test.yml
+      - .github/workflows/implementer-callable.yml
   workflow_dispatch:
     inputs:
       sleep_secs:
@@ -53,8 +60,9 @@ jobs:
     runs-on: ${{ fromJSON(matrix.runs_on) }}
     timeout-minutes: 15
     env:
-      SLEEP_SECS: ${{ inputs.sleep_secs }}
-      REMINT_SECS: ${{ inputs.remint_secs }}
+      # `|| 'default'` so a push-triggered run (no inputs) gets the same values as a dispatch.
+      SLEEP_SECS: ${{ inputs.sleep_secs || '200' }}
+      REMINT_SECS: ${{ inputs.remint_secs || '60' }}
     steps:
       - uses: actions/checkout@v4 # this repo: the callable under test, and a git repo for `refresh`
 
@@ -94,7 +102,7 @@ jobs:
       - name: Start the re-minter (the callable's own step text)
         shell: bash
         env:
-          FLEET_TOKEN_REFRESH_SECS: ${{ inputs.remint_secs }}
+          FLEET_TOKEN_REFRESH_SECS: ${{ inputs.remint_secs || '60' }}
         # Run the way the callable's step runs: the same shell flags, the body as a script of its own.
         run: bash --noprofile --norc -eo pipefail "$RUNNER_TEMP/remint-start.sh"
 
