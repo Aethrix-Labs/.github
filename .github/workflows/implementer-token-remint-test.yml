@@ -117,8 +117,11 @@ jobs:
           CALLABLE="callable-src/.github/workflows/implementer-callable.yml"
           echo "testing $CALLABLE at $(git -C callable-src rev-parse --short HEAD) ($CALLABLE_REF)"
           # The text of one step's `run: |` block, de-indented. Matches the step by its exact name.
+          # awk reads the file itself and strips any CR: a `tr | awk` pipe breaks under pipefail, because
+          # awk exits as soon as the step ends and a `tr` still writing gets SIGPIPE (seen on the Mac).
           extract() {
-            tr -d '\r' < "$CALLABLE" | awk -v name="$1" '
+            awk -v name="$1" '
+              { sub(/\r$/, "") }
               $0 == "      - name: " name { found = 1; next }
               found && !inrun && $0 == "        run: |" { inrun = 1; next }
               inrun {
@@ -127,7 +130,7 @@ jobs:
                 exit
               }
               found && !inrun && $0 ~ /^      - / { exit }
-            '
+            ' "$CALLABLE"
           }
           extract "Start the GitHub token re-minter (fresh-token.sh serve)" > "$RUNNER_TEMP/remint-start.sh"
           extract "Stop the GitHub token re-minter and remove its token" > "$RUNNER_TEMP/remint-stop.sh"
