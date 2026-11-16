@@ -62,6 +62,11 @@ on:
         type: string
         required: false
         default: "60"
+      timeout_minutes:
+        description: "Job timeout. Raise it with sleep_secs for a run that outlasts the OIDC credential."
+        type: string
+        required: false
+        default: "15"
   workflow_dispatch:
     inputs:
       callable_ref:
@@ -79,6 +84,11 @@ on:
         type: string
         required: false
         default: "60"
+      timeout_minutes:
+        description: "Job timeout. Raise it with sleep_secs for a run that outlasts the OIDC credential."
+        type: string
+        required: false
+        default: "15"
 
 permissions:
   contents: read
@@ -87,7 +97,7 @@ permissions:
 jobs:
   remint:
     runs-on: ${{ fromJSON(inputs.runs_on || '["ubuntu-latest"]') }}
-    timeout-minutes: 15
+    timeout-minutes: ${{ fromJSON(inputs.timeout_minutes || '15') }}
     env:
       # `|| 'default'` so a caller that leaves an input out gets the same values as the declared defaults.
       CALLABLE_REF: ${{ inputs.callable_ref || 'main' }}
@@ -243,6 +253,23 @@ jobs:
           echo "mint lines in the serve log: ${MINTS:-0}"
           sed 's/^/  | /' "$LOG"
           [ "${MINTS:-0}" -ge 2 ] || { echo "::error::expected at least 2 mints in ${SLEEP_SECS}s"; FAIL=1; }
+          # `serve` keeps the previous token when a mint fails, so "the file changed since the first
+          # token" can stay true for a long time after minting has stopped working (an expired OIDC
+          # request credential, say). Two more checks that cannot: no failed mint in the log, and the
+          # newest mint is recent (`remaining` counts down from the last mint's 55-minute trust window).
+          FAILED="$(grep -c 'fresh-token:.*failed' "$LOG" 2>/dev/null || true)"
+          if [ "${FAILED:-0}" -gt 0 ]; then
+            echo "::error::${FAILED} failed mint(s) in the serve log"; FAIL=1
+          else
+            echo "ok: no failed mints"
+          fi
+          REM="$(bash .fleet-ci/ci/implementer/fresh-token.sh remaining)"
+          NEED=$(( 3300 - 2 * REMINT_SECS ))
+          if [ "$REM" -gt "$NEED" ]; then
+            echo "ok: the newest mint is recent (${REM}s of its trust window left, need > ${NEED}s)"
+          else
+            echo "::error::the newest mint is stale (${REM}s of its trust window left, need > ${NEED}s): minting stopped"; FAIL=1
+          fi
 
           # The agent half, exactly as the implementer runs it.
           eval "$(bash .fleet-ci/ci/implementer/fresh-token.sh refresh)" || { echo "::error::refresh failed"; FAIL=1; }
