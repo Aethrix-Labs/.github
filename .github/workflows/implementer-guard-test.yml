@@ -1,0 +1,344 @@
+name: implementer failure guard and sleep guard (test)
+
+# Check of two pieces of implementer-callable.yml, without waiting for a real run to die:
+#
+#   A. The "Ensure the hub heard back (tick-report guard)" step: which cause it names, and what it posts to
+#      the hub. It runs the callable's OWN step text, lifted out of the file at run time (not a copy that
+#      could drift), against a mock hub (a local HTTP listener that records every POST). Cases:
+#        - agent step cancelled, no transcript  -> runner-lost (retry apt, do not split, WIP ref said);
+#        - the existing causes keep their precedence (pre-flight, unknown, max-turns, crash, the rebasing
+#          override), a cancelled step with a readable result object keeps that object's cause;
+#        - the card carries no `category` for runner-lost (the hub auto-retries only `pre-flight`);
+#        - on a (shimmed) macOS host, the wake-time evidence sentence both ways;
+#        - every body the guard POSTs parses as JSON;
+#        - a skill that already reported leaves the guard idle.
+#   B. The "Keep this machine awake for the job (sleep guard)" and "Release the sleep guard" steps, with a
+#      shim for caffeinate: the guard outlives its step, is released by the last step, is a no-op where
+#      caffeinate is missing, and a stale one is reaped.
+#
+# It needs no secrets and no private checkout: it runs on a GitHub-hosted runner and reads this public repo.
+# What it CANNOT show is that real caffeinate keeps a real Mac awake, or that kern.waketime reads as the shim
+# says: that needs a fleet-mac runner and a real suspend. See the PR that added it.
+#
+# Never prints a secret: the only credentials are the literal strings the test makes up.
+
+on:
+  workflow_call:
+    inputs:
+      callable_ref:
+        description: "Ref of Aethrix-Labs/.github whose implementer-callable.yml is tested."
+        type: string
+        required: false
+        default: ""
+  workflow_dispatch:
+    inputs:
+      callable_ref:
+        description: "Ref of Aethrix-Labs/.github whose implementer-callable.yml is tested (empty = this ref)."
+        type: string
+        required: false
+        default: ""
+  pull_request:
+    paths:
+      - ".github/workflows/implementer-callable.yml"
+      - ".github/workflows/implementer-guard-test.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4 # the callable under test (public repo: the default token reads it)
+        with:
+          repository: Aethrix-Labs/.github
+          ref: ${{ inputs.callable_ref || github.event.pull_request.head.sha || github.sha }}
+          path: callable-src
+
+      - name: Lift the callable's steps
+        shell: bash
+        run: |
+          CALLABLE="callable-src/.github/workflows/implementer-callable.yml"
+          echo "testing $CALLABLE at $(git -C callable-src rev-parse --short HEAD)"
+          # The text of one step's `run: |` block, de-indented. Matches the step by its exact name.
+          extract() {
+            awk -v name="$1" '
+              { sub(/\r$/, "") }
+              $0 == "      - name: " name { found = 1; next }
+              found && !inrun && $0 == "        run: |" { inrun = 1; next }
+              inrun {
+                if ($0 ~ /^          /) { print substr($0, 11); next }
+                if ($0 ~ /^[ ]*$/) { print ""; next }
+                exit
+              }
+              found && !inrun && $0 ~ /^      - / { exit }
+            ' "$CALLABLE"
+          }
+          extract "Ensure the hub heard back (tick-report guard)" > "$RUNNER_TEMP/guard.sh"
+          extract "Keep this machine awake for the job (sleep guard)" > "$RUNNER_TEMP/sleep-start.sh"
+          extract "Release the sleep guard" > "$RUNNER_TEMP/sleep-stop.sh"
+          for F in guard sleep-start sleep-stop; do
+            [ -s "$RUNNER_TEMP/$F.sh" ] || { echo "::error::could not find the $F step in $CALLABLE"; exit 1; }
+            bash -n "$RUNNER_TEMP/$F.sh" || { echo "::error::$F step does not parse"; exit 1; }
+            echo "lifted $F: $(wc -l < "$RUNNER_TEMP/$F.sh" | tr -d ' ') lines"
+          done
+
+      - name: The failure guard names the right cause
+        shell: bash
+        run: |
+          # This harness counts its own failures (FAIL) and must reach the end, so -e is off; the shell
+          # runs with it and pipefail by default, and a `grep -c` that counts zero would end the step.
+          set +e
+          set -u
+          T="$RUNNER_TEMP/guard-test"
+          rm -rf "$T"; mkdir -p "$T/hub" "$T/shim-darwin" "$T/origin-seed"
+          GUARD="$RUNNER_TEMP/guard.sh"
+          FAIL=0
+
+          # ---- Mock hub: records every POST as one JSON line {path, body} ------------------------------------
+          cat > "$T/hub.py" <<'PY'
+          import json, sys
+          from http.server import BaseHTTPRequestHandler, HTTPServer
+          OUT = sys.argv[1]
+          class H(BaseHTTPRequestHandler):
+              def do_POST(self):
+                  n = int(self.headers.get("Content-Length", "0"))
+                  body = self.rfile.read(n).decode("utf-8", "replace")
+                  with open(OUT + "/posts.jsonl", "a") as f:
+                      f.write(json.dumps({"path": self.path, "body": body}) + "\n")
+                  self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers()
+                  self.wfile.write(b"{}")
+              def log_message(self, *a): pass
+          s = HTTPServer(("127.0.0.1", 0), H)
+          open(OUT + "/port", "w").write(str(s.server_address[1]))
+          s.serve_forever()
+          PY
+          python3 "$T/hub.py" "$T/hub" &
+          HUB_PID=$!
+          trap 'kill "$HUB_PID" 2>/dev/null' EXIT
+          for _ in $(seq 1 50); do [ -s "$T/hub/port" ] && break; sleep 0.1; done
+          [ -s "$T/hub/port" ] || { echo "::error::the mock hub did not start"; exit 1; }
+          HUB="http://127.0.0.1:$(cat "$T/hub/port")"
+
+          # ---- A bare origin that has implementer-wip/M2.31 (and nothing for M2.32) --------------------------
+          git init -q --bare "$T/origin.git"
+          git -C "$T/origin-seed" init -q
+          git -C "$T/origin-seed" -c user.name=t -c user.email=t@example.com commit -q --allow-empty -m seed
+          git -C "$T/origin-seed" push -q "$T/origin.git" HEAD:refs/heads/implementer-wip/M2.31
+
+          # ---- Shims that make a Linux host look like a Mac whose last wake was at a chosen time -------------
+          # The real `sysctl -n kern.waketime` prints `{ sec = N, usec = M } <date>`; usec is nonzero here on
+          # purpose, so a parse that lands on the `sec` inside `usec` reads a tiny number and fails the test.
+          printf '#!/bin/sh\necho Darwin\n' > "$T/shim-darwin/uname"
+          printf '#!/bin/sh\necho "{ sec = ${FAKE_WAKE:-0}, usec = 421318 } Sun Nov 17 16:46:00 2026"\n' > "$T/shim-darwin/sysctl"
+          chmod +x "$T/shim-darwin/uname" "$T/shim-darwin/sysctl"
+
+          # The queue entry and the tick-report the case posted, as parsed JSON (a body that is not JSON
+          # fails the whole test: these strings are interpolated into it by the shell).
+          queue() { jq -c 'select(.path == "/api/v1/queue/entries") | .body | fromjson' "$T/hub/posts.jsonl" 2>/dev/null; }
+          tick()  { jq -c 'select(.path == "/api/autonomous/tick-report") | .body | fromjson' "$T/hub/posts.jsonl" 2>/dev/null; }
+          check() { # check <label> <haystack> <needle>
+            if printf '%s' "$2" | grep -qF -- "$3"; then echo "  ok: [$CASE] $1"; else echo "::error::[$CASE] $1: expected to find: $3"; echo "---- got ----"; printf '%s\n' "$2" | head -c 3000; FAIL=1; fi
+          }
+          refute() { # refute <label> <haystack> <needle>
+            if printf '%s' "$2" | grep -qF -- "$3"; then echo "::error::[$CASE] $1: did not expect: $3"; FAIL=1; else echo "  ok: [$CASE] $1"; fi
+          }
+          valid_json() { # every POST body of the case parses
+            local n bad
+            n="$(wc -l < "$T/hub/posts.jsonl" | tr -d ' ')"
+            bad="$(jq -r '.body | try (fromjson | "") catch "bad"' "$T/hub/posts.jsonl" | grep -c bad)"
+            if [ "$n" -ge 1 ] && [ "$bad" = 0 ]; then echo "  ok: [$CASE] $n POST(s), all valid JSON"; else echo "::error::[$CASE] $n POST(s), $bad not valid JSON"; FAIL=1; fi
+          }
+          phase() { printf '%s\n' "$1" > "$WS/.implementer-phase"; }
+
+          # ---- Run the guard once: run_case <name> <phase breadcrumb or ""> [VAR=value ...] ----------------------
+          # Each case gets a fresh workspace (a clone of the origin, so `git ls-remote origin` works) and a
+          # fresh RUNNER_TEMP. The environment is only what the step's own `env:` block hands it, plus the
+          # runner variables.
+          run_case() {
+            CASE="$1"; PHASE_TEXT="$2"; shift 2
+            WS="$T/$CASE/ws"; RT="$T/$CASE/rt"; LOG="$T/$CASE/log"
+            rm -rf "$T/$CASE"; mkdir -p "$RT"
+            git clone -q "$T/origin.git" "$WS" 2>/dev/null
+            [ -z "$PHASE_TEXT" ] || printf '%s\n' "$PHASE_TEXT" > "$WS/.implementer-phase"
+            : > "$T/hub/posts.jsonl"
+            ( cd "$WS" && env -i PATH="$PATH" HOME="$HOME" \
+                GITHUB_WORKSPACE="$WS" RUNNER_TEMP="$RT" GITHUB_RUN_ID=9001 GITHUB_RUN_ATTEMPT=1 \
+                GITHUB_REPOSITORY=Aethrix-Labs/sobriety-tracker GITHUB_SERVER_URL=https://github.com \
+                GITHUB_OUTPUT="$T/$CASE/output" \
+                QUEUE_SERVICE_ROLE_KEY=made-up AUTONOMOUS_TICK_TOKEN=made-up \
+                IMPLEMENTER_PRODUCT_SLUG=sobriety-tracker IMPLEMENTER_SESSION_ID=sess-1 IMPLEMENTER_HUB_URL="$HUB" \
+                IMPLEMENTER_TARGET_KIND=milestone IMPLEMENTER_TARGET_REF=M2 \
+                AGENT_MAX_TURNS=180 RUN_ACTOR=sgibson53 RUN_ACTOR_TYPE=User \
+                "$@" bash --noprofile --norc -e "$GUARD" ) > "$LOG" 2>&1
+            echo "[$CASE] guard exited $?"
+          }
+
+          # === 1. The incident: step cancelled, no transcript. runner-lost, WIP ref exists ===================
+          run_case incident "building:M2.31" AGENT_OUTCOME=cancelled
+          Q="$(queue)"; K="$(tick)"; L="$(cat "$LOG")"
+          valid_json
+          check "log names the cause"            "$L" "cause=runner-lost"
+          check "reco: retry is apt"             "$(jq -r .recommendation <<<"$Q")" "retry is apt"
+          check "reco: do not split"             "$(jq -r .recommendation <<<"$Q")" "Do not split the step"
+          check "reco: infrastructure failure"   "$(jq -r .recommendation <<<"$Q")" "Infrastructure failure"
+          check "reco: WIP ref exists"           "$(jq -r .recommendation <<<"$Q")" "implementer-wip/M2.31 EXISTS on origin"
+          check "attempt: names the annotation"  "$(jq -r '.attempts[0]' <<<"$Q")" "lost communication with the server"
+          check "attempt: keeps last phase"      "$(jq -r '.attempts[0]' <<<"$Q")" "Last phase reached: building:M2.31"
+          check "no wake evidence off macOS"     "$(jq -r '.attempts[0]' <<<"$Q")" "manual cancel and the job timeout"
+          refute "no category stamped"           "$Q" '"category"'
+          check "variant is workflow-failed"     "$(jq -r .variant <<<"$Q")" "workflow-failed"
+          check "tick outcome is workflow-failed" "$(jq -r .outcome <<<"$K")" "workflow-failed"
+
+          # === 2. Same, but the checkpoint was never pushed ==================================================
+          run_case no-wip "building:M2.32" AGENT_OUTCOME=cancelled
+          Q="$(queue)"; valid_json
+          check "cause"        "$(cat "$LOG")" "cause=runner-lost"
+          check "WIP not found" "$(jq -r .recommendation <<<"$Q")" "implementer-wip/M2.32 was not found on origin"
+
+          # === 3. Same, but no step id recorded yet (phase unknown, a milestone target) =====================
+          run_case no-step "" AGENT_OUTCOME=cancelled
+          Q="$(queue)"; valid_json
+          check "cause"           "$(cat "$LOG")" "cause=runner-lost"
+          check "WIP not checkable" "$(jq -r .recommendation <<<"$Q")" "could not be checked"
+
+          # === 4. Backlog item: the phase carries BL-n directly ===============================================
+          run_case backlog "testing:BL-12" AGENT_OUTCOME=cancelled
+          Q="$(queue)"; valid_json
+          check "WIP ref for a backlog item" "$(jq -r .recommendation <<<"$Q")" "implementer-wip/BL-12 was not found on origin"
+
+          # === 5. The existing causes keep their precedence ==================================================
+          # pre-flight: outcome failure, no transcript. Still stamped, still the auto-retry card.
+          run_case preflight "" AGENT_OUTCOME=failure
+          Q="$(queue)"; valid_json
+          check "cause"               "$(cat "$LOG")" "cause=pre-flight"
+          check "category pre-flight" "$(jq -r .category <<<"$Q")" "pre-flight"
+          refute "not runner-lost"    "$(cat "$LOG")" "runner-lost"
+
+          # unknown: outcome success and no transcript. Nothing above matches, so it stays unknown.
+          run_case unknown "" AGENT_OUTCOME=success
+          Q="$(queue)"; valid_json
+          check "cause"        "$(cat "$LOG")" "cause=unknown"
+          check "reco"         "$(jq -r .recommendation <<<"$Q")" "Cause unknown"
+          refute "no category" "$Q" '"category"'
+
+          # A cancelled step WITH a readable result object keeps that object's cause.
+          mkdir -p "$T/transcripts"
+          printf '[{"type":"result","subtype":"error_max_turns","is_error":true,"num_turns":181}]' > "$T/transcripts/maxturns.json"
+          printf '[{"type":"result","subtype":"success","is_error":false,"num_turns":40}]'          > "$T/transcripts/clean.json"
+          printf '[]'                                                                                > "$T/transcripts/noresult.json"
+          run_case cancelled-maxturns "building:M2.31" AGENT_OUTCOME=cancelled AGENT_EXECUTION_FILE="$T/transcripts/maxturns.json"
+          check "max-turns wins over cancelled" "$(cat "$LOG")" "cause=max-turns"
+          run_case cancelled-clean "building:M2.31" AGENT_OUTCOME=cancelled AGENT_EXECUTION_FILE="$T/transcripts/clean.json"
+          check "clean-exit wins over cancelled" "$(cat "$LOG")" "cause=clean-exit"
+          run_case cancelled-noresult "building:M2.31" AGENT_OUTCOME=cancelled AGENT_EXECUTION_FILE="$T/transcripts/noresult.json"
+          check "crash wins over cancelled (transcript without a result)" "$(cat "$LOG")" "cause=crash"
+          run_case failure-maxturns "building:M2.31" AGENT_OUTCOME=failure AGENT_EXECUTION_FILE="$T/transcripts/maxturns.json"
+          check "max-turns on a failed step" "$(cat "$LOG")" "cause=max-turns"
+
+          # === 6. A skill that already reported leaves the guard idle ========================================
+          run_case reported "building:M2.31" AGENT_OUTCOME=cancelled
+          # run_case already ran it without the breadcrumb; run again with it present.
+          touch "$WS/.tick-report-sent"; : > "$T/hub/posts.jsonl"
+          ( cd "$WS" && env -i PATH="$PATH" GITHUB_WORKSPACE="$WS" RUNNER_TEMP="$RT" AGENT_OUTCOME=cancelled bash --noprofile --norc -e "$GUARD" ) > "$LOG" 2>&1
+          check "idle"     "$(cat "$LOG")" "ensure-report guard idle"
+          [ ! -s "$T/hub/posts.jsonl" ] && echo "  ok: [reported] nothing posted" || { echo "::error::[reported] posted while idle"; FAIL=1; }
+
+          # === 7. Wake-time evidence on a (shimmed) Mac, both ways ============================================
+          NOW="$(date +%s)"
+          # the start epoch lives in RUNNER_TEMP, which run_case creates: so pass it through a hook file
+          mac_case() { # mac_case <case> <start> <wake>
+            local c="$1" start="$2" wake="$3"
+            CASE="$c"; WS="$T/$c/ws"; RT="$T/$c/rt"; LOG="$T/$c/log"
+            rm -rf "$T/$c"; mkdir -p "$RT"
+            git clone -q "$T/origin.git" "$WS" 2>/dev/null
+            printf 'building:M2.31\n' > "$WS/.implementer-phase"
+            printf '%s\n' "$start" > "$RT/fleet-job-start-epoch"
+            : > "$T/hub/posts.jsonl"
+            ( cd "$WS" && env -i PATH="$T/shim-darwin:$PATH" HOME="$HOME" FAKE_WAKE="$wake" \
+                GITHUB_WORKSPACE="$WS" RUNNER_TEMP="$RT" GITHUB_RUN_ID=9001 GITHUB_RUN_ATTEMPT=1 \
+                GITHUB_REPOSITORY=Aethrix-Labs/sobriety-tracker GITHUB_SERVER_URL=https://github.com \
+                QUEUE_SERVICE_ROLE_KEY=made-up AUTONOMOUS_TICK_TOKEN=made-up \
+                IMPLEMENTER_PRODUCT_SLUG=sobriety-tracker IMPLEMENTER_SESSION_ID=sess-1 IMPLEMENTER_HUB_URL="$HUB" \
+                IMPLEMENTER_TARGET_KIND=milestone IMPLEMENTER_TARGET_REF=M2 AGENT_MAX_TURNS=180 \
+                AGENT_OUTCOME=cancelled bash --noprofile --norc -e "$GUARD" ) > "$LOG" 2>&1
+            echo "[$c] guard exited $?"
+          }
+          mac_case mac-woke "$NOW" "$((NOW + 1380))"      # woke 23 minutes after the job started
+          Q="$(queue)"; valid_json
+          check "cause"                 "$(cat "$LOG")" "cause=runner-lost"
+          check "suspended evidence"    "$(jq -r '.attempts[0]' <<<"$Q")" "woke from sleep 23 minute(s) after this job started"
+          mac_case mac-no-wake "$NOW" "$((NOW - 3600))"   # last wake an hour BEFORE the job
+          Q="$(queue)"; valid_json
+          check "no-wake evidence"      "$(jq -r '.attempts[0]' <<<"$Q")" "no wake from sleep since this job started"
+          mac_case mac-garbage "$NOW" "not-a-number"
+          Q="$(queue)"; valid_json
+          check "garbage wake time still classifies" "$(cat "$LOG")" "cause=runner-lost"
+          refute "and adds no evidence sentence" "$(jq -r '.attempts[0]' <<<"$Q")" "The host reports"
+
+          exit "$FAIL"
+
+      - name: The sleep guard starts, outlives its step, and is released
+        shell: bash
+        run: |
+          set +e # counts its own failures (FAIL), see the step above
+          set -u
+          T="$RUNNER_TEMP/sleep-test"
+          rm -rf "$T"; mkdir -p "$T/with" "$T/rt"
+          FAIL=0
+          ok()  { echo "  ok: $1"; }
+          bad() { echo "::error::$1"; FAIL=1; }
+
+          # A caffeinate that just sleeps. It must be a script named caffeinate: the step recognizes its
+          # own process by `caffeinate` in the command line.
+          # No `exec`: that would rename the process to `sleep`, and args= must still show caffeinate.
+          printf '#!/bin/sh\nsleep 600\n' > "$T/with/caffeinate"
+          chmod +x "$T/with/caffeinate"
+
+          run_step() { ( cd "$T" && env -i PATH="$1" HOME="$HOME" RUNNER_TEMP="$T/rt" bash --noprofile --norc -e "$2" ); }
+
+          # --- a runner WITH caffeinate -----------------------------------------------------------------------
+          OUT="$(run_step "$T/with:$PATH" "$RUNNER_TEMP/sleep-start.sh" 2>&1)"; RC=$?
+          echo "$OUT"
+          [ "$RC" = 0 ] && ok "start step exits 0" || bad "start step exited $RC"
+          PID="$(cat "$T/rt/fleet-caffeinate.pid" 2>/dev/null || true)"
+          case "$PID" in ""|*[!0-9]*) bad "no pid file"; PID="" ;; *) ok "pid file written ($PID)" ;; esac
+          [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null && ok "guard is still running after its step ended" || bad "guard did not survive its step"
+          [ -s "$T/rt/fleet-job-start-epoch" ] && ok "job start epoch recorded" || bad "no job start epoch"
+          echo "$OUT" | grep -q 'sleep guard running' && ok "notice printed" || bad "no running notice"
+
+          # a second start (an earlier job's guard left behind) reaps the first and starts its own
+          OUT="$(run_step "$T/with:$PATH" "$RUNNER_TEMP/sleep-start.sh" 2>&1)"
+          PID2="$(cat "$T/rt/fleet-caffeinate.pid" 2>/dev/null || true)"
+          sleep 1
+          if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then bad "the stale guard (pid $PID) was not reaped"; else ok "the stale guard was reaped"; fi
+          [ -n "$PID2" ] && [ "$PID2" != "$PID" ] && kill -0 "$PID2" 2>/dev/null && ok "a fresh guard replaced it ($PID2)" || bad "no fresh guard"
+
+          OUT="$(run_step "$T/with:$PATH" "$RUNNER_TEMP/sleep-stop.sh" 2>&1)"; RC=$?
+          echo "$OUT"
+          [ "$RC" = 0 ] && ok "release step exits 0" || bad "release step exited $RC"
+          sleep 1
+          if kill -0 "$PID2" 2>/dev/null; then bad "guard still running after release"; else ok "guard is gone after release"; fi
+          [ ! -e "$T/rt/fleet-caffeinate.pid" ] && [ ! -e "$T/rt/fleet-job-start-epoch" ] && ok "pid file and epoch removed" || bad "state left behind"
+
+          # --- release with nothing to release, and with a pid that is no longer a caffeinate -----------------
+          run_step "$T/with:$PATH" "$RUNNER_TEMP/sleep-stop.sh" > /dev/null 2>&1 && ok "release with no pid file exits 0" || bad "release with no pid file failed"
+          sleep 600 & SLEEPER=$!
+          echo "$SLEEPER" > "$T/rt/fleet-caffeinate.pid"
+          run_step "$T/with:$PATH" "$RUNNER_TEMP/sleep-stop.sh" > /dev/null 2>&1
+          kill -0 "$SLEEPER" 2>/dev/null && ok "a reused pid (not a caffeinate) is left alone" || bad "release killed a process that was not a caffeinate"
+          kill "$SLEEPER" 2>/dev/null
+
+          # --- a runner WITHOUT caffeinate: a notice, exit 0, no files ----------------------------------------
+          rm -rf "$T/rt"; mkdir -p "$T/rt" "$T/without"
+          for B in bash sh env tr date grep sleep kill ps nohup head cat rm uname sed; do
+            P="$(command -v "$B" 2>/dev/null)" && ln -sf "$P" "$T/without/$B"
+          done
+          OUT="$(run_step "$T/without" "$RUNNER_TEMP/sleep-start.sh" 2>&1)"; RC=$?
+          echo "$OUT"
+          [ "$RC" = 0 ] && ok "no caffeinate: exits 0" || bad "no caffeinate: exited $RC"
+          echo "$OUT" | grep -q 'sleep guard not needed here' && ok "no caffeinate: says so" || bad "no caffeinate: no notice"
+          [ -z "$(ls -A "$T/rt")" ] && ok "no caffeinate: left nothing behind" || bad "no caffeinate: wrote files"
+
+          exit "$FAIL"

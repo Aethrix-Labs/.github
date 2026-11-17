@@ -94,6 +94,68 @@ jobs:
       # "did it run out of turns?" test both read it, so they cannot drift apart.
       AGENT_MAX_TURNS: "180"
     steps:
+      - name: Keep this machine awake for the job (sleep guard)
+        # WHY THIS STEP EXISTS. sobriety-tracker run 44120902444 (2026-11-17) failed with "The self-hosted
+        # runner lost communication with the server": GitHub marked the job failed 23 minutes in, and the
+        # agent step's own clock (duration_ms 825178, about 13m45s) was about 30 minutes short of the
+        # wall clock, i.e. the runner Mac was suspended mid-run. The agent had not failed; the job was
+        # dropped from under it. Nothing in this file kept the host awake.
+        #
+        # Starts `caffeinate -ims -t N` detached, so the host cannot idle-sleep (-i), spin its disk down
+        # (-m) or sleep on AC (-s) while the job runs. Not `-w $$`: `$$` is this step's own shell, which
+        # exits when the step does, and would release the assertion straight away. Not `-d`/`-u`: the
+        # display may sleep, only the system must not (this Mac is also a person's machine).
+        #
+        # How it ends: the last step ("Release the sleep guard") stops it with `always()`, which covers a
+        # failed, timed-out or cancelled job. `-t` is the backstop for a runner that dies before reaching
+        # that step: the assertion lapses by itself a little after the 120-minute job timeout.
+        #
+        # What it cannot do: stop a lid-close or a manual Sleep, or a host whose power settings sleep
+        # regardless. The host-side fix is `sudo pmset -a sleep 0` on each runner host, a manual step.
+        #
+        # NEVER a gate: continue-on-error, and every path exits 0. A runner without caffeinate (Linux,
+        # WSL, anything that is not macOS) takes the first branch and does nothing.
+        continue-on-error: true
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          # Nothing below may fail the job. The shell has -e on by default; turn it off.
+          set +e
+
+          if ! command -v caffeinate >/dev/null 2>&1; then
+            echo "::notice::implementer-callable: no caffeinate on this runner ($(uname -s 2>/dev/null)); sleep guard not needed here"
+            exit 0
+          fi
+
+          PID_FILE="$RUNNER_TEMP/fleet-caffeinate.pid"
+          # A guard left behind by an earlier job on this runner instance (a hard-killed runner never reached
+          # its release step) would otherwise sit there until its own -t lapses. Stop it only if the pid is
+          # still a caffeinate: pids are reused, and this host runs other jobs.
+          if [ -f "$PID_FILE" ]; then
+            OLD="$(tr -d ' \t\r\n' < "$PID_FILE" 2>/dev/null)"
+            case "$OLD" in
+              ""|*[!0-9]*) ;;
+              *) if ps -p "$OLD" -o args= 2>/dev/null | grep -q 'caffeinate'; then kill "$OLD" 2>/dev/null; fi ;;
+            esac
+            rm -f "$PID_FILE"
+          fi
+
+          # Job start, for the ensure-report guard: it compares this with the host's last wake time to say
+          # whether the machine was suspended during the run.
+          date +%s > "$RUNNER_TEMP/fleet-job-start-epoch" 2>/dev/null
+
+          # 120-minute job timeout (7200s) plus margin.
+          nohup caffeinate -ims -t 7800 > /dev/null 2>&1 < /dev/null &
+          CPID=$!
+          sleep 1
+          if kill -0 "$CPID" 2>/dev/null; then
+            echo "$CPID" > "$PID_FILE"
+            echo "::notice::implementer-callable: sleep guard running (caffeinate pid ${CPID}); stopped by the last step, lapses by itself after 7800s"
+          else
+            echo "::warning::implementer-callable: caffeinate did not stay up, so this host can still idle-sleep mid-run (a sleeping runner drops the job with 'lost communication with the server'). Check the host's power settings: sudo pmset -a sleep 0"
+          fi
+          exit 0
+
       - uses: actions/checkout@v4 # consumer repo at $GITHUB_WORKSPACE
         with:
           fetch-depth: 0 # needed for full git history (commit skill reads log)
@@ -818,7 +880,13 @@ jobs:
           #   clean-exit  subtype success, is_error false, turns well under the cap
           #   pre-flight  the agent step failed and no transcript exists: the action died in its own setup,
           #               before the agent started
-          #   unknown     a transcript exists but jq is unavailable or a field would not parse
+          #   runner-lost the agent step was CANCELLED and no result object could be read: the runner lost
+          #               contact with GitHub (typically a suspended host), or the run was cancelled by hand
+          #               or hit the job timeout. Internal to this guard: the hub reads no cause field, only
+          #               the free text below, and no `category` is stamped for it (only `pre-flight` is
+          #               one the hub acts on, with an auto-retry)
+          #   unknown     a transcript exists but jq is unavailable or a field would not parse, or nothing
+          #               above matched
           EXEC_FILE="${AGENT_EXECUTION_FILE:-}"
           if [ -z "$EXEC_FILE" ]; then
             EXEC_FILE="${RUNNER_TEMP:-}/claude-execution-output.json"
@@ -881,6 +949,61 @@ jobs:
             fi
             PF_ATTEMPT="claude-code-action failed before the agent started: it wrote no transcript, so no agent session ran. Its own error line could not be read from inside the job (check-run annotations and the job log are only populated once the job completes), so it is not quoted here; it is in the log of the agent step.${PF_BOT}"
             PF_RECO="Read the first lines of the agent step's log in the run for the action's error. If it says 'non-human actor' or allowed_bots, the run was started by a bot: re-dispatch it as a person (the hub's Plan / Retry runs under GITHUB_MERGE_TOKEN as sgibson53, which passes). Any other pre-flight error is an action setup problem, not a budget or agent failure: fix what the log names, then re-dispatch."
+          fi
+          # Runner lost: the agent step was cancelled and no result object could be read, so the agent never
+          # said how it stopped. A cancelled step on a self-hosted runner is the signature of the job being
+          # dropped from under it (sobriety-tracker run 44120902444, 2026-11-17: "The self-hosted runner lost
+          # communication with the server", the host suspended mid-run). It sits AFTER the cases above and
+          # only takes what would otherwise be `unknown`: a readable result object keeps its own cause, and
+          # `pre-flight` needs outcome `failure`, so the two cannot both match.
+          #
+          # A manual cancel and the 120-minute job timeout also end a step as `cancelled`. They cannot be
+          # told apart from here by outcome alone, so the text names them, and on macOS the host's last wake
+          # time is the evidence that separates them: a wake after this job started means the machine slept
+          # during the run. The agent's own duration is not available for this (it lives in the result
+          # object this case does not have), which is why wake time is used instead. Evidence only: it adds
+          # a sentence and never changes the cause.
+          RL_WAKE_NOTE=""; RL_WIP_NOTE=""
+          if [ "$CAUSE" = "unknown" ] && [ "${AGENT_OUTCOME:-}" = "cancelled" ]; then
+            CAUSE="runner-lost"
+            START_FILE="${RUNNER_TEMP:-/tmp}/fleet-job-start-epoch"
+            if [ "$(uname -s 2>/dev/null)" = "Darwin" ] && [ -s "$START_FILE" ]; then
+              RL_START="$(tr -cd '0-9' < "$START_FILE" | head -c 12)"
+              # `{ sec = 1731859566, usec = 421318 } Sun Nov 17 ...`. Anchored to the leading brace: an
+              # unanchored `.*sec = ` is greedy and lands on the `sec` inside `usec`.
+              RL_WAKE="$(sysctl -n kern.waketime 2>/dev/null | sed -n 's/^{ *sec = \([0-9][0-9]*\),.*/\1/p' | head -n 1)"
+              case "$RL_START$RL_WAKE" in
+                *[!0-9]*|"") ;;
+                *)
+                  if [ -n "$RL_START" ] && [ -n "$RL_WAKE" ]; then
+                    if [ "$RL_WAKE" -gt "$RL_START" ]; then
+                      RL_WAKE_NOTE=" The host reports it last woke from sleep $(( (RL_WAKE - RL_START) / 60 )) minute(s) after this job started, so the machine was suspended during the run."
+                    else
+                      RL_WAKE_NOTE=" The host reports no wake from sleep since this job started, so a suspended host is NOT supported by the evidence here: a manual cancel or the job timeout is more likely."
+                    fi
+                  fi ;;
+              esac
+            fi
+            # The agent pushes its finished work to implementer-wip/<step id> at tests-green (the id is the
+            # half after the colon of the phase breadcrumb, the same one the run-metrics step reads). Say
+            # whether that ref exists: it is where the work is if the run was dropped after tests passed.
+            RL_ITEM="${LAST_PHASE#*:}"
+            case "$LAST_PHASE" in *:*) ;; *) RL_ITEM="" ;; esac
+            if printf '%s' "$RL_ITEM" | grep -Eq '^(M[0-9]+\.[0-9]+[a-z]?|BL-[0-9]+)$'; then
+              RL_REF="implementer-wip/${RL_ITEM}"
+              # `|| RL_RC=$?`: this step runs under `bash -e`, and ls-remote exits 2 when the ref is absent,
+              # which would end the guard before it posted anything.
+              RL_RC=0
+              GIT_TERMINAL_PROMPT=0 GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME=20 \
+                git -C "${GITHUB_WORKSPACE:-.}" ls-remote --exit-code --heads origin "$RL_REF" > /dev/null 2>&1 || RL_RC=$?
+              case "$RL_RC" in
+                0) RL_WIP_NOTE=" The WIP checkpoint branch ${RL_REF} EXISTS on origin: the work reached tests-green before the run was cut off, so it should be there to resume from." ;;
+                2) RL_WIP_NOTE=" The WIP checkpoint branch ${RL_REF} was not found on origin: the run was cut off before its first checkpoint, so there is no work to recover." ;;
+                *) RL_WIP_NOTE=" Could not check whether the WIP checkpoint branch ${RL_REF} exists (git ls-remote failed): look for it before retrying." ;;
+              esac
+            else
+              RL_WIP_NOTE=" The agent had not recorded a step id (phase '${LAST_PHASE}'), so the WIP checkpoint branch implementer-wip/<step id> could not be checked: look for one before retrying."
+            fi
           fi
           echo "::notice::implementer-callable: agent result cause=${CAUSE} subtype=${R_SUBTYPE:-?} is_error=${R_ERR:-?} turns=${R_TURNS:-?}/${CAP:-?} bg_started=${R_BG:-?} bg_completed=${R_DONE:-?} stop_reason=${R_STOP:-?}"
 
@@ -949,6 +1072,9 @@ jobs:
             pre-flight)
               ATTEMPT="${PF_ATTEMPT} The agent never ran, so it sent no queue entry or tick-report."
               RECO="$PF_RECO" ;;
+            runner-lost)
+              ATTEMPT="The agent step was cancelled and wrote no readable result object, so there is no account of how it stopped: no queue entry or tick-report was sent. A cancelled agent step on a self-hosted runner usually means the runner lost contact with GitHub (the job's annotation reads 'The self-hosted runner lost communication with the server') because the host went to sleep. A manual cancel and the job timeout end a step the same way.${RL_WAKE_NOTE}"
+              RECO="Died at phase '${LAST_PHASE}'. Infrastructure failure, not a budget or agent failure: the runner lost contact or was suspended mid-run, so retry is apt. Do not split the step; the run never got far enough to say it was too big.${RL_WIP_NOTE} If the run was cancelled by hand or hit the 120-minute job timeout instead, decide from that and ignore the retry advice. If it recurs on the same runner host, the host is still sleeping: sudo pmset -a sleep 0." ;;
             *)
               ATTEMPT="The agent ended without sending a tick-report or queue entry; cause unknown (the agent step's result object could not be read from this job)."
               RECO="Cause unknown - read the run log (and the transcript artifact, if one is attached) before choosing between retry and splitting the step. The last phase reached was '${LAST_PHASE}'." ;;
@@ -1416,7 +1542,8 @@ jobs:
           retention-days: 7
 
       - name: Stop the GitHub token re-minter and remove its token
-        # Pairs with "Start the GitHub token re-minter" above; keep it the LAST step. Several runner
+        # Pairs with "Start the GitHub token re-minter" above; keep it the last step but one (only "Release
+        # the sleep guard" follows, so the host stays awake while this one runs). Several runner
         # instances share each self-hosted host (six on the PC, three on the Mac), and a live `serve`
         # keeps minting a repo-write installation token every 25 minutes into a directory the next job on
         # this instance would find. Stop it and delete the token whatever happened: `always()` covers a
@@ -1463,4 +1590,34 @@ jobs:
           done
 
           rm -rf "$STATE_DIR" "$RUNNER_TEMP/fresh-token-serve.pid" "$LOG"
+          exit 0
+
+      - name: Release the sleep guard
+        # Pairs with "Keep this machine awake for the job (sleep guard)" above; keep it the LAST step.
+        # `always()` runs it on a failed, timed-out or cancelled job too. A runner that dies before it
+        # gets here is covered by caffeinate's own -t. Never a gate: exits 0 on every path, and does
+        # nothing where no guard was started (no pid file).
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          set +e
+
+          PID_FILE="$RUNNER_TEMP/fleet-caffeinate.pid"
+          if [ -f "$PID_FILE" ]; then
+            PID="$(tr -d ' \t\r\n' < "$PID_FILE" 2>/dev/null)"
+            case "$PID" in
+              ""|*[!0-9]*) ;;
+              *)
+                # Only a pid that is still a caffeinate is signalled: pids are reused.
+                if ps -p "$PID" -o args= 2>/dev/null | grep -q 'caffeinate'; then
+                  kill "$PID" 2>/dev/null
+                  echo "::notice::implementer-callable: released the sleep guard (stopped caffeinate pid ${PID})"
+                else
+                  echo "::notice::implementer-callable: sleep guard already gone (pid ${PID} is not a caffeinate any more)"
+                fi ;;
+            esac
+          fi
+          rm -f "$PID_FILE" "$RUNNER_TEMP/fleet-job-start-epoch"
           exit 0
