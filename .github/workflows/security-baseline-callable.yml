@@ -540,8 +540,9 @@ jobs:
     # coverage and reports complete: false. Only a cancelled run stops it.
     if: ${{ !cancelled() }}
     runs-on: [self-hosted, fleet]
-    # STANDARDS §28.6. A script, one push and one PR, plus up to 3 minutes proving the PR's checks start.
-    timeout-minutes: 20
+    # STANDARDS §28.6. A script, one push and one PR (the ~17 minutes this job always budgeted), plus up to
+    # 10 minutes proving the PR's checks start.
+    timeout-minutes: 30
     permissions:
       contents: write       # push the backlog branch
       pull-requests: write  # open the PR
@@ -621,6 +622,8 @@ jobs:
       - name: Open the backlog PR
         id: pr
         if: ${{ steps.route.outputs.backlog_changed == 'true' }}
+        # STANDARDS §28.6. Token exchange, one push, one PR and two labels, plus the 10-minute checks poll below.
+        timeout-minutes: 15
         env:
           PRODUCT_SLUG: ${{ inputs.product_slug }}
           FILED: ${{ steps.route.outputs.filed }}
@@ -705,9 +708,13 @@ jobs:
           # ---- Prove the trap is gone, on every run: did the PR's checks start? ----
           # Not a gate (observability, STANDARDS §18.2): a hub or API stall must not turn a good run red. The
           # answer is in the annotations and the step summary, and in the checks_started job output.
+          # Polls for up to 10 minutes: on a busy self-hosted runner a check can start well after 3 minutes
+          # (unbiased-news#413 and puzzle-pop#676 both did, and both merged). Seeing no check can only mean
+          # "not started yet", never "will not start", so that outcome is a notice, not a warning.
           STARTED=""
           CHECKS=""
-          for _ in $(seq 1 18); do
+          POLL_END=$((SECONDS + 600))
+          while [ "$SECONDS" -lt "$POLL_END" ]; do
             CHECKS="$(GH_TOKEN="$APP_TOKEN" gh pr checks "$PR_NUM" --json name --jq '[.[].name] | join(", ")' 2>/dev/null || true)"
             if [ -n "$CHECKS" ]; then STARTED="true"; break; fi
             sleep 10
@@ -722,11 +729,11 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
           else
             echo "checks_started=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::No checks appeared on $PR_URL within 3 minutes. The required security-review check may not be firing for PRs opened this way; if so the PR cannot merge."
+            echo "::notice::No checks appeared on $PR_URL within 10 minutes. They may still be queued for a runner; the App token does trigger workflows for these PRs."
             {
               echo "### security-baseline PR"
               echo "$PR_URL"
-              echo "**No checks started within 3 minutes.** The PR token trap may not be solved: look at the PR before trusting this path."
+              echo "**No checks started within 10 minutes.** They may still be queued for a runner (the App token does trigger workflows for these PRs); check the PR if it has not merged."
             } >> "$GITHUB_STEP_SUMMARY"
           fi
 
