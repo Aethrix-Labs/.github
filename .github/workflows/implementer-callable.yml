@@ -160,6 +160,14 @@ jobs:
         with:
           fetch-depth: 0 # needed for full git history (commit skill reads log)
 
+      - name: Mark the start of this run's UI self-check output
+        # `.ui-self-check/` is still TRACKED on the products' main, so the checkout above already
+        # holds every old screenshot. This marker's mtime is the line between that history and what
+        # this run writes: "Collect this run's UI self-check files" ships only files newer than it,
+        # so an artifact carries the run's evidence, not hundreds of MB of history (STANDARDS §28.6).
+        # It must come after the checkout (which stamps the tracked files) and before the agent.
+        run: touch "$RUNNER_TEMP/ui-self-check.marker"
+
       - uses: actions/checkout@v4 # fleet-skills repo (CI skills under ci/)
         with:
           repository: Aethrix-Labs/fleet-skills
@@ -687,6 +695,15 @@ jobs:
           # simulator) does not thrash: it takes the blocked path and the loop is held
           # (`verification-unavailable`, STANDARDS §23.9) — it no longer silently no-ops.
           UI_SELF_CHECK_MOBILE: ${{ inputs.runner_label == 'fleet-mac' && '1' || '0' }}
+          # Where this run's UI self-check screenshots end up (STANDARDS §28.6, §23.9 Track A): the
+          # "Upload this run's UI self-check files" step below publishes them as an artifact of this
+          # name, kept 30 days, and the PR body cites it as "artifact `$UI_SELF_CHECK_ARTIFACT` on
+          # $UI_SELF_CHECK_RUN_URL (30 days)". The agent reads these two from its env rather than
+          # from GITHUB_*, because whether the CLI's Bash tool inherits the action's process env is
+          # not settled (see RUNNER_TEMP below). UI_SELF_CHECK_ARTIFACT must equal the upload step's
+          # `name`; change them together.
+          UI_SELF_CHECK_ARTIFACT: ui-self-check-${{ github.run_id }}-${{ github.run_attempt }}
+          UI_SELF_CHECK_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           # Where the token re-minter (step above) writes, and where the agent's
           # `fresh-token.sh refresh` looks: $RUNNER_TEMP/fleet-token, else /tmp/fleet-token, which holds
           # nothing. claude-code-action hands the CLI a copy of its own process env (parse-sdk-options.ts),
@@ -1540,6 +1557,78 @@ jobs:
           path: ${{ steps.ensure-report.outputs.transcript_path }}
           if-no-files-found: warn
           retention-days: 7
+
+      - name: Collect this run's UI self-check files
+        id: ui-self-check-collect
+        # Gathers what the agent wrote to `.ui-self-check/` during THIS run, for the upload below.
+        # Only files newer than the marker the checkout-time step touched: the directory is still
+        # tracked on the products' main, so uploading it as-is would put the whole screenshot history
+        # in every artifact. tooling-probe.json is collected with the screenshots on purpose: for a
+        # BLOCKED / CLIENT STALE PR it is the evidence (the runner probe's verdict, STANDARDS §23.9
+        # Track A). The files are COPIED, with their relative paths, into $RUNNER_TEMP rather than
+        # listed in the upload's `path`, so the upload step needs no glob over the workspace and a
+        # file the agent overwrote in place (an old tracked name) is still caught by its new mtime.
+        # Observability, never a gate: exits 0 on every path, and `count` is 0 on any path that
+        # collected nothing, which is what skips the upload (a missing marker must not fall back to
+        # "everything", so it counts as 0, not as an unfiltered copy).
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          set +e
+
+          SRC="${GITHUB_WORKSPACE}/.ui-self-check"
+          MARKER="$RUNNER_TEMP/ui-self-check.marker"
+          DST="$RUNNER_TEMP/ui-self-check-upload"
+          COUNT=0
+          KB=0
+
+          rm -rf "$DST"
+          if [ ! -d "$SRC" ]; then
+            echo "::notice::implementer-callable: UI self-check: no .ui-self-check/ directory, nothing to upload"
+          elif [ ! -f "$MARKER" ]; then
+            echo "::notice::implementer-callable: UI self-check: start marker missing, so this run's files cannot be told from tracked history; nothing uploaded"
+          else
+            mkdir -p "$DST"
+            # find | while, with relative paths and no GNU-only `cp --parents`: the fleet-mac host has
+            # BSD cp. NUL-delimited so a file name with a space survives.
+            (
+              cd "$SRC" || exit 0
+              find . -type f -newer "$MARKER" -print0 | while IFS= read -r -d '' F; do
+                mkdir -p "$DST/$(dirname "$F")" && cp "$F" "$DST/$F"
+              done
+            )
+            # Counted from what landed in $DST, not inside the loop: the loop runs in a subshell.
+            COUNT=$(find "$DST" -type f | wc -l | tr -d ' ')
+            KB=$(du -sk "$DST" 2>/dev/null | cut -f1)
+            case "$COUNT" in ""|*[!0-9]*) COUNT=0 ;; esac
+            if [ "$COUNT" = "0" ]; then
+              echo "::notice::implementer-callable: UI self-check: no files written this run (none newer than the start marker); nothing to upload"
+            else
+              echo "::notice::implementer-callable: UI self-check: collected ${COUNT} file(s), ${KB:-?} KB, for artifact ui-self-check-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            fi
+          fi
+
+          echo "count=${COUNT}" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Upload this run's UI self-check files
+        id: ui-self-check-upload
+        # The only place a verification screenshot survives once ci-commit stops committing them
+        # (STANDARDS §28.6: a GitHub Actions artifact, 30 days). Until that change ships, runs both
+        # commit and upload; the overlap is expected. `name` must equal UI_SELF_CHECK_ARTIFACT on the
+        # agent step, because the PR body cites that name. One run is one plan step is at most one PR,
+        # so one artifact per run attempt is the whole contract. Never a gate: continue-on-error, and
+        # `ignore` rather than `warn` because the count check above already says when there is nothing.
+        if: always() && steps.ui-self-check-collect.outputs.count != '0'
+        uses: actions/upload-artifact@v4
+        continue-on-error: true
+        with:
+          name: ui-self-check-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ui-self-check-upload/
+          if-no-files-found: ignore
+          retention-days: 30
 
       - name: Stop the GitHub token re-minter and remove its token
         # Pairs with "Start the GitHub token re-minter" above; keep it the last step but one (only "Release
