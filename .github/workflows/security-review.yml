@@ -227,6 +227,8 @@ jobs:
             npm-audit.json
             deterministic-findings.json
           if-no-files-found: ignore
+          # Fleet STANDARDS §28.6: every upload sets retention-days; diagnostic output read only while triaging this PR.
+          retention-days: 7
 
   semantic:
     runs-on: ${{ github.event.repository.private && fromJSON('["self-hosted","fleet"]') || 'ubuntu-latest' }}
@@ -393,6 +395,8 @@ jobs:
           name: semantic-findings
           path: semantic-findings.json
           if-no-files-found: ignore
+          # Fleet STANDARDS §28.6: every upload sets retention-days; diagnostic output read only while triaging this PR.
+          retention-days: 7
 
       - name: Emit security-review queue entry
         if: always()
