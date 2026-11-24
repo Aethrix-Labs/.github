@@ -664,6 +664,108 @@ jobs:
           echo "::warning::implementer-callable: token re-minter gave no token: ${WHY}. This run falls back to the job-start GitHub token and will stop with credential-expiring around minute 55. Read the re-minter log above, and confirm the job has id-token: write."
           exit 0
 
+      - name: Implementer pre-flight (SHADOW, reads only, never stops the agent)
+        # skill-suite-health item 8a. The fleet is moving the implementer's pre-flight (guards, run id,
+        # target resolution, open-PR lookup, red-main check, WIP resume) out of SKILL.md into
+        # .fleet-ci/ci/implementer/preflight.mjs. Before anything depends on it, real runs have to show it
+        # resolves the same run id and work item as the agent. This step produces the script's side of that
+        # comparison; the "Compare the pre-flight shadow result with what the agent did" step after the
+        # agent produces the other half and prints the verdict.
+        #
+        # SHADOW MODE CHANGES NOTHING. `--mode=shadow` makes no hub POST, writes no breadcrumb, does not
+        # apply WIP, and reports proceed=true whatever it found. Nothing here is gated on its result, it
+        # does not use --github-output, and the agent's prompt, env and SKILL.md are untouched. The result
+        # goes to $RUNNER_TEMP, outside the workspace, so it can never be staged. `--mode=live`, a hub write
+        # from the script and skipping the agent are item 8, which waits on the evidence this produces.
+        #
+        # Placed directly before the agent, after the probe, the dev-client heal, the CLI install and the
+        # token re-minter, so the script sees the HEAD and working tree the agent will see.
+        #
+        # NEVER a gate: continue-on-error, a 5-minute bound, and every path below exits 0. A crash is a
+        # ::warning:: and leaves no result file; the agreement step then reports preflight=absent.
+        #
+        # QUEUE_SERVICE_ROLE_KEY and AUTONOMOUS_TICK_TOKEN are the agent step's own and are passed because
+        # the script reads them; shadow mode never sends either anywhere.
+        continue-on-error: true
+        timeout-minutes: 5
+        shell: bash
+        env:
+          QUEUE_SERVICE_ROLE_KEY: ${{ secrets.QUEUE_SERVICE_ROLE_KEY }}
+          AUTONOMOUS_TICK_TOKEN: ${{ secrets.AUTONOMOUS_TICK_TOKEN }}
+          IMPLEMENTER_PRODUCT_SLUG: ${{ inputs.product_slug }}
+          IMPLEMENTER_SESSION_ID: ${{ inputs.session_id }}
+          IMPLEMENTER_HUB_URL: ${{ inputs.hub_url }}
+          IMPLEMENTER_TARGET_KIND: ${{ inputs.target_kind }}
+          IMPLEMENTER_TARGET_REF: ${{ inputs.target_ref }}
+          # Only used when the token re-minter left no token; see GH_TOKEN below.
+          FALLBACK_GH_TOKEN: ${{ github.token }}
+        run: |
+          # Nothing below may fail the job. The shell has -e on by default; turn it off.
+          set +e
+
+          SCRIPT=".fleet-ci/ci/implementer/preflight.mjs"
+          OUT="$RUNNER_TEMP/implementer-preflight.json"
+          LOG="$RUNNER_TEMP/implementer-preflight.log"
+
+          # First, before any skip below: a result left in $RUNNER_TEMP by an earlier job on this runner
+          # would otherwise be read by the agreement step as this run's.
+          rm -f "$OUT" "$LOG"
+
+          if [ ! -f "$SCRIPT" ]; then
+            echo "::notice::implementer pre-flight shadow: $SCRIPT not present in .fleet-ci (fleet-skills vending not landed yet); skipping"
+            exit 0
+          fi
+          if ! command -v node >/dev/null 2>&1; then
+            echo "::notice::implementer pre-flight shadow: node is not on PATH for this runner; skipping"
+            exit 0
+          fi
+
+          # GH_TOKEN for the script's open-PR and check-run reads. The agent's own token is minted INSIDE the
+          # agent step (claude-code-action's OIDC exchange), so it does not exist yet. The closest thing is
+          # what the agent switches to on its first `fresh-token.sh refresh`: the token the re-minter step
+          # wrote. Read the file directly rather than calling `refresh`, which also rewrites the origin URL
+          # and is not read-only. With no re-minter token, fall back to the job's own token, which has no
+          # `checks: read`: the red-main read then fails open as "none" (a ::warning:: in the log below).
+          TOKEN_FILE="$RUNNER_TEMP/fleet-token/token"
+          if [ -s "$TOKEN_FILE" ]; then
+            GH_TOKEN="$(cat "$TOKEN_FILE")"
+            TOKEN_SRC="the token re-minter"
+          else
+            GH_TOKEN="$FALLBACK_GH_TOKEN"
+            TOKEN_SRC="the job token (no re-minter token; red-main may read as none)"
+          fi
+          export GH_TOKEN
+          unset FALLBACK_GH_TOKEN
+          echo "implementer pre-flight shadow: gh reads use ${TOKEN_SRC}"
+
+          node "$SCRIPT" --mode=shadow --out="$OUT" > "$LOG" 2>&1
+          RC=$?
+
+          # Printed prefixed, capped and with control characters removed, so no line of it can start a
+          # workflow command (`::...`) at column 0 and a runaway log cannot flood this one.
+          head -c 20000 "$LOG" | tr -d '\r' | tr -cd '[:print:]\n' | sed 's/^/  | /'
+
+          if [ "$RC" -ne 0 ]; then
+            rm -f "$OUT"
+            echo "::warning::implementer pre-flight shadow crashed (exit ${RC}); no result was written, so the agreement step will report preflight=absent. The agent is unaffected."
+            exit 0
+          fi
+
+          LINE="$(grep -m1 '^implementer preflight (shadow): ' "$LOG" | tr -cd '[:print:]' | cut -c1-600)"
+          if [ -z "$LINE" ]; then
+            echo "::warning::implementer pre-flight shadow exited 0 but printed no summary line; the result file, if any, is still compared"
+          else
+            echo "$LINE"
+            {
+              echo "### Implementer pre-flight (shadow)"
+              echo '```'
+              echo "$LINE"
+              echo '```'
+            } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+          fi
+          rm -f "$LOG"
+          exit 0
+
       - name: Run implementer agent
         id: agent
         uses: anthropics/claude-code-action@v1
@@ -1242,6 +1344,12 @@ jobs:
           if [ -f "$RUN_ID_FILE" ]; then
             AGENT_RUN_ID="$(tr -d '\r\n' < "$RUN_ID_FILE" | head -c 128)"
           fi
+          # Step outputs for the pre-flight agreement step below, which reuses this step's reads of the
+          # breadcrumbs instead of parsing them a second time. Additive only: nothing here changes what
+          # this step does. `run_id_read=1` says the read happened (an empty `agent_run_id` then means the
+          # agent wrote none), and it sits ahead of the exit below so a missing run id still gets compared.
+          echo "run_id_read=1" >> "${GITHUB_OUTPUT:-/dev/null}"
+          echo "agent_run_id=${AGENT_RUN_ID}" >> "${GITHUB_OUTPUT:-/dev/null}"
           case "$AGENT_RUN_ID" in
             ""|*[!A-Za-z0-9_-]*)
               echo "::notice::implementer-callable: no usable run-id breadcrumb (.implementer-run-id missing, empty or malformed); the agent died before generating its run_id, so there is no loop to attach a run-metrics record to"
@@ -1283,6 +1391,12 @@ jobs:
               *:*) WORK_ITEM="${PHASE_RAW#*:}" ;;
             esac
           fi
+
+          # For the pre-flight agreement step (see the run_id_read note above): the phase breadcrumb's first
+          # line as read, and the work-item half of it. `phase_read=1` says this parse happened.
+          echo "phase_read=1" >> "${GITHUB_OUTPUT:-/dev/null}"
+          echo "phase_raw=${PHASE_RAW:-}" >> "${GITHUB_OUTPUT:-/dev/null}"
+          echo "work_item=${WORK_ITEM}" >> "${GITHUB_OUTPUT:-/dev/null}"
 
           # Two values off one breadcrumb, deliberately not the same test:
           #   STEP_RESOLVED — did the agent get past Step 1 at all? Any work-item half that is not
@@ -1513,6 +1627,12 @@ jobs:
           # shellcheck disable=SC2086
           set -- $COUNTS
           N_COMPLETED="${1:-}"; N_STARTED="${2:-}"; N_TOTAL="${3:-}"
+          # For the pre-flight agreement step: run-started records the hub holds for this run_id, only when
+          # the trail was read and parsed (absent otherwise, which is not the same as 0).
+          case "$N_STARTED" in
+            ""|*[!0-9]*) ;;
+            *) echo "n_started=${N_STARTED}" >> "${GITHUB_OUTPUT:-/dev/null}" ;;
+          esac
 
           # §18.1a: run_id repeats across a rerun at an unchanged HEAD, so on attempt 2+ a
           # `run-completed` in the trail may belong to the earlier attempt. The record this step
@@ -1541,6 +1661,142 @@ jobs:
             *)
               echo "::notice::implementer-callable: activity bracket intact (run-completed x${N_COMPLETED}, run-started x${N_STARTED:-?}, ${N_TOTAL:-?} record(s) for run_id ${AGENT_RUN_ID})${ATTEMPT_CAVEAT}" ;;
           esac
+          exit 0
+
+      - name: Compare the pre-flight shadow result with what the agent did (agreement)
+        id: preflight-agreement
+        # skill-suite-health item 8a, the verdict half. The shadow step above left the script's result in
+        # $RUNNER_TEMP; this prints ONE line saying whether the script resolved the same run id and the
+        # same work item as the agent:
+        #
+        #   ::notice::preflight agreement: run_id=<match|mismatch|n/a> work_item=<match|mismatch|n/a> preflight=<route or outcome> agent_phase=<phase or none>
+        #
+        # Item 8 (live mode) waits on about five real runs reading `match match`, or a correct no-work
+        # agreement. Any `mismatch` goes back to the fleet session with the run URL.
+        #
+        # The agent's side comes from the "Record the run's model and turns" step's outputs, not from a
+        # second parse of the breadcrumbs: that step already reads `.implementer-run-id` and
+        # `.implementer-phase` (the work-item id is the part after the first colon) and counts the hub's
+        # `run-started` records for the run_id. This step therefore sits after it. Where that step returned
+        # before reaching a read (no QUEUE_SERVICE_ROLE_KEY, no jq, or no usable run id), the value it
+        # would have supplied is `n/a`, and agent_phase is `unread`: "we could not read it", not "none".
+        #
+        #   normal case   run_id: the script's run_id equals the agent's. work_item: the script's
+        #                 work_item.id equals the work-item half of the agent's phase breadcrumb.
+        #   no-work case  the script's work_item is null (a guard or a no-candidate exit), or its outcome
+        #                 is set (shadow reports proceed=true whatever it found, so a set outcome is the
+        #                 "would have stopped" signal; that includes a blocked backlog item, whose
+        #                 work_item is set). The agent agrees when it resolved no work item (no phase
+        #                 breadcrumb, or one still reading `unknown`, which is how the agent's own run
+        #                 metrics read it) AND, on the first attempt of the run, the hub holds no
+        #                 `run-started` for the run_id. The count is skipped on a rerun, because run_id
+        #                 repeats across attempts and an earlier attempt's record would read as a
+        #                 mismatch; then, and when the trail could not be read, the phase breadcrumb alone
+        #                 decides. The step summary says which basis was used.
+        #   route=error   the script could not parse planning.json or backlog.json, so it names no item.
+        #                 work_item is n/a; run_id is compared as usual.
+        #   no result     the shadow step skipped or crashed: preflight=absent, run_id and work_item n/a.
+        #
+        # Observability only, never a gate: every path exits 0, and continue-on-error backstops the rest.
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 2
+        shell: bash
+        env:
+          # Through env, never interpolated into the script body. Empty when the run-metrics step did not
+          # get as far as setting them.
+          RUN_ID_READ: ${{ steps.record-run.outputs.run_id_read }}
+          AGENT_RUN_ID: ${{ steps.record-run.outputs.agent_run_id }}
+          PHASE_READ: ${{ steps.record-run.outputs.phase_read }}
+          AGENT_PHASE_RAW: ${{ steps.record-run.outputs.phase_raw }}
+          AGENT_WORK_ITEM: ${{ steps.record-run.outputs.work_item }}
+          AGENT_N_STARTED: ${{ steps.record-run.outputs.n_started }}
+          ATTEMPT_NO: ${{ github.run_attempt }}
+        run: |
+          # Nothing below may fail the run. The shell has -e on by default; turn it off.
+          set +e
+
+          RESULT="$RUNNER_TEMP/implementer-preflight.json"
+
+          # The agent's phase, for the line: the part of the breadcrumb before the first colon.
+          if [ "$PHASE_READ" != "1" ]; then
+            AGENT_PHASE="unread"
+          elif [ -z "$AGENT_PHASE_RAW" ]; then
+            AGENT_PHASE="none"
+          else
+            AGENT_PHASE=""
+            case "$AGENT_PHASE_RAW" in
+              *:*) AGENT_PHASE="$(printf '%s' "${AGENT_PHASE_RAW%%:*}" | tr -cd 'A-Za-z0-9_.-' | cut -c1-40)" ;;
+            esac
+            [ -n "$AGENT_PHASE" ] || AGENT_PHASE="malformed"
+          fi
+
+          PF_LABEL="absent"
+          RUN_V="n/a"
+          WORK_V="n/a"
+          BASIS=""
+
+          if [ -s "$RESULT" ] && command -v node >/dev/null 2>&1; then
+            # One node call, four fields, `|`-separated and reduced to a safe charset: the values come from
+            # a file, and the line below is a workflow command. A `|` is a non-whitespace IFS, so an empty
+            # field (a null run_id, no work item) survives the read.
+            PARSED="$(node -e '
+              const fs = require("fs");
+              try {
+                const r = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+                const clean = (v) => String(v == null ? "" : v).replace(/[^A-Za-z0-9_.-]/g, "_").slice(0, 80);
+                const wi = r.work_item && typeof r.work_item === "object" ? r.work_item.id : null;
+                process.stdout.write([clean(r.run_id), clean(wi), clean(r.route), clean(r.outcome)].join("|"));
+              } catch (e) {
+                process.exit(3);
+              }
+            ' "$RESULT" 2>/dev/null)"
+            if [ $? -ne 0 ]; then
+              PF_LABEL="unreadable"
+            else
+              IFS='|' read -r PF_RUN PF_ITEM PF_ROUTE PF_OUTCOME <<< "$PARSED"
+              if   [ -n "$PF_OUTCOME" ]; then PF_LABEL="$PF_OUTCOME"
+              elif [ -n "$PF_ROUTE" ];   then PF_LABEL="$PF_ROUTE"
+              else PF_LABEL="unknown"
+              fi
+
+              # run_id. A null run_id (the script tripped Guard 1 or 2 before it computed one) agrees with
+              # an agent that wrote none.
+              if [ "$RUN_ID_READ" = "1" ]; then
+                if [ "$PF_RUN" = "$AGENT_RUN_ID" ]; then RUN_V="match"; else RUN_V="mismatch"; fi
+              fi
+
+              # work_item.
+              if [ "$PHASE_READ" = "1" ]; then
+                if [ "$PF_ROUTE" = "error" ] && [ -z "$PF_OUTCOME" ]; then
+                  WORK_V="n/a"
+                elif [ -n "$PF_OUTCOME" ] || [ -z "$PF_ITEM" ]; then
+                  # No-work case.
+                  if [ -n "$AGENT_WORK_ITEM" ] && [ "$AGENT_WORK_ITEM" != "unknown" ]; then
+                    WORK_V="mismatch"
+                  elif [ "$ATTEMPT_NO" = "1" ] && [ -n "$AGENT_N_STARTED" ]; then
+                    BASIS="no-work: phase breadcrumb and run-started count (${AGENT_N_STARTED} run-started)"
+                    if [ "$AGENT_N_STARTED" -gt 0 ]; then WORK_V="mismatch"; else WORK_V="match"; fi
+                  else
+                    BASIS="no-work: phase breadcrumb alone (run-started count unavailable: attempt ${ATTEMPT_NO}, trail $([ -n "$AGENT_N_STARTED" ] && echo read || echo unread))"
+                    WORK_V="match"
+                  fi
+                else
+                  if [ "$AGENT_WORK_ITEM" = "$PF_ITEM" ]; then WORK_V="match"; else WORK_V="mismatch"; fi
+                fi
+              fi
+            fi
+          fi
+
+          LINE="preflight agreement: run_id=${RUN_V} work_item=${WORK_V} preflight=${PF_LABEL} agent_phase=${AGENT_PHASE}"
+          echo "::notice::${LINE}"
+          {
+            echo "### Implementer pre-flight agreement"
+            echo '```'
+            echo "$LINE"
+            echo '```'
+            [ -z "$BASIS" ] || echo "Basis: ${BASIS}"
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
           exit 0
 
       - name: Upload the agent transcript (failure path only)
