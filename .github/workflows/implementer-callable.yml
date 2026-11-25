@@ -664,28 +664,38 @@ jobs:
           echo "::warning::implementer-callable: token re-minter gave no token: ${WHY}. This run falls back to the job-start GitHub token and will stop with credential-expiring around minute 55. Read the re-minter log above, and confirm the job has id-token: write."
           exit 0
 
-      - name: Implementer pre-flight (SHADOW, reads only, never stops the agent)
-        # skill-suite-health item 8a. The fleet is moving the implementer's pre-flight (guards, run id,
-        # target resolution, open-PR lookup, red-main check, WIP resume) out of SKILL.md into
-        # .fleet-ci/ci/implementer/preflight.mjs. Before anything depends on it, real runs have to show it
-        # resolves the same run id and work item as the agent. This step produces the script's side of that
-        # comparison; the "Compare the pre-flight shadow result with what the agent did" step after the
-        # agent produces the other half and prints the verdict.
+      - name: Implementer pre-flight (live once report.mjs is vended, else shadow)
+        # skill-suite-health items 8a and 8. The implementer's pre-flight (guards, run id, target
+        # resolution, open-PR lookup, red-main check, WIP resume) lives in
+        # .fleet-ci/ci/implementer/preflight.mjs.
+        #
+        # THE SWITCH is whether .fleet-ci/ci/implementer/report.mjs exists. fleet-skills vends it together
+        # with the SKILL.md that reads this step's result, so the vend turns live mode on and reverting it
+        # (vending deletes orphaned files) turns live mode off. Keep the shadow path: it is the rollback.
+        #
+        # LIVE MODE (`--mode=live`) writes to the hub (tick-start, run-started), writes the run-id and
+        # phase breadcrumbs, applies a WIP checkpoint, and decides whether an agent starts. The agent step
+        # is skipped unless proceed=true, and "Send the implementer's run-completed and tick-report"
+        # reports after it. `mode` is written to the step outputs BEFORE node runs, so a crash or timeout
+        # leaves mode=live with proceed empty: no agent, and the ensure-report guard files the failure.
+        # In live mode a missing preflight.mjs or node is that same crash, not a quiet skip.
         #
         # SHADOW MODE CHANGES NOTHING. `--mode=shadow` makes no hub POST, writes no breadcrumb, does not
-        # apply WIP, and reports proceed=true whatever it found. Nothing here is gated on its result, it
-        # does not use --github-output, and the agent's prompt, env and SKILL.md are untouched. The result
-        # goes to $RUNNER_TEMP, outside the workspace, so it can never be staged. `--mode=live`, a hub write
-        # from the script and skipping the agent are item 8, which waits on the evidence this produces.
+        # apply WIP, and reports proceed=true whatever it found. It does not use --github-output, so
+        # `mode=shadow` is this step's only output and nothing is gated off. The "Compare the pre-flight
+        # shadow result with what the agent did" step compares its result with the agent's.
+        #
+        # In both modes the result goes to $RUNNER_TEMP, outside the workspace, so it can never be staged.
         #
         # Placed directly before the agent, after the probe, the dev-client heal, the CLI install and the
         # token re-minter, so the script sees the HEAD and working tree the agent will see.
         #
-        # NEVER a gate: continue-on-error, a 5-minute bound, and every path below exits 0. A crash is a
-        # ::warning:: and leaves no result file; the agreement step then reports preflight=absent.
+        # The step itself never fails the job: continue-on-error, a 5-minute bound, and every path below
+        # exits 0. A shadow crash is a ::warning::; a live crash is an ::error::. Both leave no result file.
         #
         # QUEUE_SERVICE_ROLE_KEY and AUTONOMOUS_TICK_TOKEN are the agent step's own and are passed because
-        # the script reads them; shadow mode never sends either anywhere.
+        # the script reads them; only live mode sends them to the hub.
+        id: preflight
         continue-on-error: true
         timeout-minutes: 5
         shell: bash
@@ -708,24 +718,33 @@ jobs:
           LOG="$RUNNER_TEMP/implementer-preflight.log"
 
           # First, before any skip below: a result left in $RUNNER_TEMP by an earlier job on this runner
-          # would otherwise be read by the agreement step as this run's.
+          # would otherwise be read by a later step as this run's.
           rm -f "$OUT" "$LOG"
 
-          if [ ! -f "$SCRIPT" ]; then
-            echo "::notice::implementer pre-flight shadow: $SCRIPT not present in .fleet-ci (fleet-skills vending not landed yet); skipping"
-            exit 0
-          fi
-          if ! command -v node >/dev/null 2>&1; then
-            echo "::notice::implementer pre-flight shadow: node is not on PATH for this runner; skipping"
-            exit 0
+          if [ -f ".fleet-ci/ci/implementer/report.mjs" ]; then MODE=live; else MODE=shadow; fi
+          # Before node runs, so a live crash still reads as live (with no `proceed`) in the later steps.
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+
+          # Shadow only. Live mode falls through, so either fault fails node below and is reported.
+          if [ "$MODE" = "shadow" ]; then
+            if [ ! -f "$SCRIPT" ]; then
+              echo "::notice::implementer pre-flight shadow: $SCRIPT not present in .fleet-ci (fleet-skills vending not landed yet); skipping"
+              exit 0
+            fi
+            if ! command -v node >/dev/null 2>&1; then
+              echo "::notice::implementer pre-flight shadow: node is not on PATH for this runner; skipping"
+              exit 0
+            fi
           fi
 
           # GH_TOKEN for the script's open-PR and check-run reads. The agent's own token is minted INSIDE the
           # agent step (claude-code-action's OIDC exchange), so it does not exist yet. The closest thing is
           # what the agent switches to on its first `fresh-token.sh refresh`: the token the re-minter step
           # wrote. Read the file directly rather than calling `refresh`, which also rewrites the origin URL
-          # and is not read-only. With no re-minter token, fall back to the job's own token, which has no
-          # `checks: read`: the red-main read then fails open as "none" (a ::warning:: in the log below).
+          # and is not read-only. Whether that token can read check runs is fresh-token.sh's business (it
+          # has to ask the exchange for `checks: read`). With no re-minter token, fall back to the job's own
+          # token, which has no `checks: read`: the red-main read then fails open as "none" (a ::warning::
+          # in the log below).
           TOKEN_FILE="$RUNNER_TEMP/fleet-token/token"
           if [ -s "$TOKEN_FILE" ]; then
             GH_TOKEN="$(cat "$TOKEN_FILE")"
@@ -736,9 +755,13 @@ jobs:
           fi
           export GH_TOKEN
           unset FALLBACK_GH_TOKEN
-          echo "implementer pre-flight shadow: gh reads use ${TOKEN_SRC}"
+          echo "implementer pre-flight ${MODE}: gh reads use ${TOKEN_SRC}"
 
-          node "$SCRIPT" --mode=shadow --out="$OUT" > "$LOG" 2>&1
+          if [ "$MODE" = "live" ]; then
+            node "$SCRIPT" --mode=live --out="$OUT" --github-output > "$LOG" 2>&1
+          else
+            node "$SCRIPT" --mode=shadow --out="$OUT" > "$LOG" 2>&1
+          fi
           RC=$?
 
           # Printed prefixed, capped and with control characters removed, so no line of it can start a
@@ -747,17 +770,21 @@ jobs:
 
           if [ "$RC" -ne 0 ]; then
             rm -f "$OUT"
-            echo "::warning::implementer pre-flight shadow crashed (exit ${RC}); no result was written, so the agreement step will report preflight=absent. The agent is unaffected."
+            if [ "$MODE" = "live" ]; then
+              echo "::error::implementer pre-flight (live) crashed (exit ${RC}); no result was written, so the agent will not start and the ensure-report guard reports this run"
+            else
+              echo "::warning::implementer pre-flight shadow crashed (exit ${RC}); no result was written, so the agreement step will report preflight=absent. The agent is unaffected."
+            fi
             exit 0
           fi
 
-          LINE="$(grep -m1 '^implementer preflight (shadow): ' "$LOG" | tr -cd '[:print:]' | cut -c1-600)"
+          LINE="$(grep -m1 "^implementer preflight (${MODE}): " "$LOG" | tr -cd '[:print:]' | cut -c1-600)"
           if [ -z "$LINE" ]; then
-            echo "::warning::implementer pre-flight shadow exited 0 but printed no summary line; the result file, if any, is still compared"
+            echo "::warning::implementer pre-flight ${MODE} exited 0 but printed no summary line; the result file, if any, is still used"
           else
             echo "$LINE"
             {
-              echo "### Implementer pre-flight (shadow)"
+              echo "### Implementer pre-flight (${MODE})"
               echo '```'
               echo "$LINE"
               echo '```'
@@ -768,6 +795,10 @@ jobs:
 
       - name: Run implementer agent
         id: agent
+        # A live pre-flight that stopped the run (proceed=false) or crashed (proceed empty) starts no
+        # agent. In shadow mode this is always true. With no status function in it, `success()` still
+        # applies, as it did before this condition existed.
+        if: steps.preflight.outputs.mode != 'live' || steps.preflight.outputs.proceed == 'true'
         uses: anthropics/claude-code-action@v1
         env:
           # Used by the implementer's queue packets + activity records and the
@@ -817,13 +848,14 @@ jobs:
           # Set by the pre-install step above; empty means it fell back and the action installs itself.
           path_to_claude_code_executable: ${{ steps.claude-cli.outputs.path }}
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # The sentence after "follow it exactly" follows the pre-flight mode, because the SKILL.md it
+          # describes does: the shadow-mode skill runs its own guards and has no "Before you start".
           prompt: |
             You are running as the **implementer agent** in CI.
 
             Read `.fleet-ci/ci/implementer/SKILL.md` and follow
-            it exactly. It defines the pre-flight guards, the flow (resolve
-            the directed target → implement the next unblocked step → invoke
-            commit → exit), and the failure modes.
+            it exactly.
+            ${{ steps.preflight.outputs.mode == 'live' && 'The callable already ran the pre-flight; its result is at $RUNNER_TEMP/implementer-preflight.json, and the "Before you start" section of SKILL.md says how to use it.' || 'It defines the pre-flight guards, the flow (resolve the directed target → implement the next unblocked step → invoke commit → exit), and the failure modes.' }}
 
             When ready to commit, read `.fleet-ci/ci/ci-commit/SKILL.md`
             and follow its flow. The commit skill handles tier classification,
@@ -841,6 +873,29 @@ jobs:
             --effort ${{ inputs.effort }}
             --max-turns ${{ env.AGENT_MAX_TURNS }}
             --allowedTools Read,Bash,Write,Edit,Glob,Grep
+
+      - name: Send the implementer's run-completed and tick-report (report.mjs send)
+        id: report
+        # skill-suite-health item 8, live mode only. The agent records one outcome and stops; this sends
+        # `run-completed` and the tick-report from it. When the live pre-flight stopped the run it sends
+        # the tick-report that stop owes (nothing on Guard 0). When there is no outcome to send (a dead
+        # agent, a crashed pre-flight) it sends nothing and the ensure-report guard below reports. The
+        # script always exits 0, and a delivered tick-report drops `.tick-report-sent`, which that guard
+        # keys off. In shadow mode the agent still reports for itself.
+        #
+        # Directly after the agent step so its `.agent-activity` lines are in the file before the
+        # breadcrumb step prints it.
+        if: always() && steps.preflight.outputs.mode == 'live'
+        continue-on-error: true
+        timeout-minutes: 3
+        shell: bash
+        env:
+          QUEUE_SERVICE_ROLE_KEY: ${{ secrets.QUEUE_SERVICE_ROLE_KEY }}
+          AUTONOMOUS_TICK_TOKEN: ${{ secrets.AUTONOMOUS_TICK_TOKEN }}
+          IMPLEMENTER_PRODUCT_SLUG: ${{ inputs.product_slug }}
+          IMPLEMENTER_SESSION_ID: ${{ inputs.session_id }}
+          IMPLEMENTER_HUB_URL: ${{ inputs.hub_url }}
+        run: node .fleet-ci/ci/implementer/report.mjs send
 
       - name: Print the agent's activity breadcrumb
         # STANDARDS §18.2 (breadcrumb rule, added 2026-10-06) — this step is the PRINTING HALF that
@@ -920,8 +975,12 @@ jobs:
         # surface the death in the decision queue and tell the orchestrator the tick
         # failed so the session goes `errored` instead of hanging. When the breadcrumb
         # IS present the skill already reported and this guard no-ops.
+        # In live pre-flight mode the breadcrumb is dropped by `report.mjs send` instead, and a run the
+        # pre-flight stopped or crashed in (no agent) reaches this guard when nothing was delivered.
+        # The one skip is Guard 0 (proceed=false and report=false): the hub has no session for the
+        # run, so there is nothing to report.
         # Writes are observability, not gates — POSTs warn-and-continue.
-        if: always()
+        if: always() && !(steps.preflight.outputs.proceed == 'false' && steps.preflight.outputs.report == 'false')
         env:
           QUEUE_SERVICE_ROLE_KEY: ${{ secrets.QUEUE_SERVICE_ROLE_KEY }}
           AUTONOMOUS_TICK_TOKEN: ${{ secrets.AUTONOMOUS_TICK_TOKEN }}
@@ -939,6 +998,10 @@ jobs:
           AGENT_OUTCOME: ${{ steps.agent.outcome }}
           RUN_ACTOR: ${{ github.actor }}
           RUN_ACTOR_TYPE: ${{ github.event.sender.type }}
+          # What the pre-flight step said, for the two causes where no agent was ever started.
+          PREFLIGHT_MODE: ${{ steps.preflight.outputs.mode }}
+          PREFLIGHT_PROCEED: ${{ steps.preflight.outputs.proceed }}
+          PREFLIGHT_OUTCOME: ${{ steps.preflight.outputs.outcome }}
         run: |
           # If the skill delivered its own tick-report it dropped this breadcrumb —
           # the hub already heard back, so this guard has nothing to do. Absent → fall
@@ -1006,10 +1069,25 @@ jobs:
           #               one the hub acts on, with an auto-retry)
           #   unknown     a transcript exists but jq is unavailable or a field would not parse, or nothing
           #               above matched
+          # Two more come from the live pre-flight step, which can end a run before any agent starts.
+          # Neither is a `crash` or a `pre-flight` death (that name is the
+          # action's own setup failing, and the hub auto-retries it), and neither reads a transcript:
+          #   preflight-stopped  the pre-flight stopped the run (proceed=false), the agent step was
+          #                      skipped, and the tick-report that stop owes did not land
+          #   preflight-crashed  mode is live and the pre-flight wrote no `proceed`: it crashed or was
+          #                      cut off before the agent
+          NO_AGENT_CAUSE=""
+          if [ "${AGENT_OUTCOME:-}" = "skipped" ] && [ "${PREFLIGHT_PROCEED:-}" = "false" ]; then
+            NO_AGENT_CAUSE="preflight-stopped"
+          elif [ "${PREFLIGHT_MODE:-}" = "live" ] && [ -z "${PREFLIGHT_PROCEED:-}" ]; then
+            NO_AGENT_CAUSE="preflight-crashed"
+          fi
           EXEC_FILE="${AGENT_EXECUTION_FILE:-}"
           if [ -z "$EXEC_FILE" ]; then
             EXEC_FILE="${RUNNER_TEMP:-}/claude-execution-output.json"
           fi
+          # No agent ran, so a transcript at that path is not this run's: do not read or upload it.
+          [ -z "$NO_AGENT_CAUSE" ] || EXEC_FILE=""
           CAP="${AGENT_MAX_TURNS:-}"
           case "$CAP" in ""|*[!0-9]*) CAP="" ;; esac
           R_KIND=""; R_SUBTYPE=""; R_ERR=""; R_TURNS=""; R_BG=""; R_DONE=""; R_STOP=""
@@ -1032,7 +1110,7 @@ jobs:
             case "$R_DONE" in ""|*[!0-9]*) R_DONE="" ;; esac
             R_STOP="$(printf '%s' "$R_STOP" | tr -cd 'A-Za-z0-9_-' | head -c 32)"
           fi
-          CAUSE="unknown"
+          CAUSE="${NO_AGENT_CAUSE:-unknown}"
           BG_WAIT=""
           if [ "$R_KIND" = "none" ]; then
             CAUSE="crash"
@@ -1191,6 +1269,14 @@ jobs:
             pre-flight)
               ATTEMPT="${PF_ATTEMPT} The agent never ran, so it sent no queue entry or tick-report."
               RECO="$PF_RECO" ;;
+            preflight-stopped)
+              # The outcome lands in the JSON body below: keep it to a plain token.
+              PF_STOP_OUTCOME="$(printf '%s' "${PREFLIGHT_OUTCOME:-}" | tr -cd 'A-Za-z0-9_-' | head -c 64)"
+              ATTEMPT="The preflight stopped the run (${PF_STOP_OUTCOME:-outcome unreported}) and its tick-report did not land. No agent was started."
+              RECO="The stop itself was decided before any agent ran, so this is not a budget or agent failure. Read the pre-flight step's log for why it stopped the run, and the report.mjs send step's log for why the tick-report did not land. Fix the stop reason before re-dispatching: the same target at the same commit is likely to stop again." ;;
+            preflight-crashed)
+              ATTEMPT="The preflight crashed before the agent: the live pre-flight step wrote no result, so no agent was started."
+              RECO="Read the pre-flight step's log in the run for the error (a script error, a missing tool on the runner, or the step's 5-minute bound). No agent ran, so do not split the step. Retry once the cause is clear; if it recurs, reverting the fleet change that vends report.mjs returns runs to shadow mode." ;;
             runner-lost)
               ATTEMPT="The agent step was cancelled and wrote no readable result object, so there is no account of how it stopped: no queue entry or tick-report was sent. A cancelled agent step on a self-hosted runner usually means the runner lost contact with GitHub (the job's annotation reads 'The self-hosted runner lost communication with the server') because the host went to sleep. A manual cancel and the job timeout end a step the same way.${RL_WAKE_NOTE}"
               RECO="Died at phase '${LAST_PHASE}'. Infrastructure failure, not a budget or agent failure: the runner lost contact or was suspended mid-run, so retry is apt. Do not split the step; the run never got far enough to say it was too big.${RL_WIP_NOTE} If the run was cancelled by hand or hit the 120-minute job timeout instead, decide from that and ignore the retry advice. If it recurs on the same runner host, the host is still sleeping: sudo pmset -a sleep 0." ;;
@@ -1307,7 +1393,10 @@ jobs:
         #
         # Observability, not a gate (STANDARDS §18.2): every failure path warns and continues, the
         # step never exits non-zero, and continue-on-error backstops the rest.
-        if: always()
+        #
+        # Skipped when the agent step was: a run the live pre-flight stopped writes `.implementer-run-id`
+        # with no agent behind it, and would otherwise leave an all-null calibration row.
+        if: always() && steps.agent.outcome != 'skipped'
         continue-on-error: true
         timeout-minutes: 5
         env:
@@ -1698,7 +1787,10 @@ jobs:
         #   no result     the shadow step skipped or crashed: preflight=absent, run_id and work_item n/a.
         #
         # Observability only, never a gate: every path exits 0, and continue-on-error backstops the rest.
-        if: always()
+        #
+        # Shadow mode only: in live mode the agent takes its run id and work item from the script's result,
+        # so there are no two sides to compare.
+        if: always() && steps.preflight.outputs.mode != 'live'
         continue-on-error: true
         timeout-minutes: 2
         shell: bash
