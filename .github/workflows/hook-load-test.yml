@@ -1,0 +1,345 @@
+name: claude-code-action hook loading (test)
+
+# Answers one question: does anthropics/claude-code-action@v1 run Claude Code hooks, and by which route?
+# The fleet's CI hooks wait on the answer (fleet-command-center SKILL_SUITE_DIAGNOSIS.md S7,
+# skill-suite-health 7c), and STANDARDS §19.7 rule 2 forbids shipping one until DECISIONS.md records it.
+#
+# One job per route, each ending in one printed line, collected into the run summary:
+#
+#   route <n> (<name>): LOADS | DOES NOT LOAD | UNSUPPORTED — <evidence>
+#
+#   1. settings input      a PreToolUse hook on Bash, passed through the action's `settings` input.
+#   2. --plugin-dir        a throwaway plugin carrying the same hook, written into $RUNNER_TEMP.
+#   3. vended plugin       the real .fleet-ci/plugins/fleet-skills/, loaded the same way as route 2.
+#   4. plugins input       the route 2 plugin through `plugin_marketplaces` + `plugins`. `plugins` takes
+#                          names, not paths, so the job wraps the plugin in a throwaway local marketplace.
+#
+# HOW A VERDICT IS REACHED. Routes 1, 2 and 4: the hook appends a line to a marker file, and the marker
+# existing is the proof. Route 3: the vended hooks write nothing, so the agent writes a broken
+# docs/backlog.json in a scratch git repo, and the proof is both the plugin in the transcript's init
+# message AND a `hook_response` event carrying the sidecar gate's message. A hosted runner has no
+# ~/products/scripts/, so the gate says its script is missing. That is still the vended hook running.
+# `--include-hook-events` is on every route so the CLI puts hook events in the transcript.
+#
+# A fourth word, INCONCLUSIVE, is not an answer. It means the route was never exercised (the agent did not
+# make the probe tool call: bad auth, outage, usage limit), so a missing marker proves nothing. It fails
+# the summary job. Re-run; do not record it in DECISIONS.md.
+#
+# WHAT IT CAN'T SHOW.
+#   - Self-hosted runners. This repo is public and the org's runner group does not take public repos, so
+#     every job runs on ubuntu-latest, with an empty ~/.claude and a CLI the action installs itself.
+#     A fleet runner has its own ~/.claude and a pre-installed CLI (same pinned version).
+#   - Whether a blocking hook can stop a tool call, or what `if` and `onFailure` do. Only that hooks load
+#     and fire: PreToolUse on Bash (routes 1, 2, 4), PostToolUse on Write (route 3).
+#   - Anything about a later action version. `@v1` moves; the verdict lines name the CLI version they saw.
+#
+# THIS REPO IS PUBLIC, so its logs are too. Route 3 checks out the private fleet-skills repo: nothing
+# uploads it or the transcript, show_full_output and display_report stay off, and the only thing quoted
+# from it is the start of the gate's one-line message. Do not re-run with debug logging, which makes the
+# action print the full transcript.
+#
+# Auth differs from the callables in one way: `github_token` is passed, which skips the action's OIDC
+# exchange for a Claude App token (so no `id-token: write`). The exchange has nothing to do with hooks
+# and has refused runs from this repo before (see implementer-token-remint-test.yml).
+#
+# The action refuses bot actors, so a person dispatches this from the Actions tab.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  route:
+    name: route ${{ matrix.route }} (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { route: 1, name: "settings input" }
+          - { route: 2, name: "--plugin-dir test plugin" }
+          - { route: 3, name: "--plugin-dir vended fleet plugin" }
+          - { route: 4, name: "plugins input" }
+    # One key per leg: a leg leaves the others' keys empty, and an empty value does not overwrite.
+    outputs:
+      line1: ${{ steps.verdict.outputs.line1 }}
+      line2: ${{ steps.verdict.outputs.line2 }}
+      line3: ${{ steps.verdict.outputs.line3 }}
+      line4: ${{ steps.verdict.outputs.line4 }}
+    steps:
+      # The action configures git in the workspace, so give it a checkout like every callable does.
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4 # the vended plugin, from the same place implementer-callable.yml gets it
+        if: matrix.route == 3
+        with:
+          repository: Aethrix-Labs/fleet-skills
+          path: .fleet-ci
+          ref: main
+          token: ${{ secrets.FLEET_SKILLS_PAT }}
+          persist-credentials: false
+
+      - name: Build this route's fixture
+        id: prepare
+        shell: python
+        env:
+          ROUTE: ${{ matrix.route }}
+        run: |
+          import json, os, pathlib, re, subprocess
+
+          route = os.environ["ROUTE"]
+          temp = pathlib.Path(os.environ["RUNNER_TEMP"])
+          workspace = pathlib.Path(os.environ["GITHUB_WORKSPACE"])
+          marker = temp / "hook-probe-marker"
+          marker.unlink(missing_ok=True)
+
+          def output(key, value):
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+                  f.write(f"{key}<<__END__\n{value}\n__END__\n")
+
+          def write_json(path, data):
+              path.parent.mkdir(parents=True, exist_ok=True)
+              path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+          hooks = {"PreToolUse": [{"matcher": "Bash", "hooks": [
+              {"type": "command", "command": f'echo "route {route} PreToolUse fired" >> "{marker}"'}]}]}
+
+          def write_plugin(root):
+              write_json(root / ".claude-plugin" / "plugin.json",
+                         {"name": "hook-probe", "version": "0.0.1", "description": "hook load probe"})
+              write_json(root / "hooks" / "hooks.json", {"hooks": hooks})
+
+          claude_args = ["--model claude-sonnet-5-5", "--max-turns 3", "--include-hook-events"]
+          prompt = "Run `echo hook-probe` with Bash, then stop."
+          tools = "Bash"
+          settings = marketplaces = plugins = unsupported = ""
+          needed_inputs = []
+
+          if route == "1":
+              settings = json.dumps({"hooks": hooks})
+              needed_inputs = ["settings"]
+          elif route == "2":
+              plugin = temp / "hook-probe-plugin"
+              write_plugin(plugin)
+              claude_args.append(f'--plugin-dir "{plugin}"')
+              needed_inputs = ["claude_args"]
+          elif route == "3":
+              plugin = workspace / ".fleet-ci" / "plugins" / "fleet-skills"
+              claude_args.append(f'--plugin-dir "{plugin}"')
+              needed_inputs = ["claude_args"]
+              # The sidecar gate only looks at files inside a git repo.
+              scratch = workspace / "hook-probe-scratch"
+              (scratch / "docs").mkdir(parents=True, exist_ok=True)
+              subprocess.run(["git", "init", "-q", str(scratch)], check=True)
+              target = scratch / "docs" / "backlog.json"
+              tools = "Write"
+              prompt = (f"This is a hook test. Use the Write tool to create {target} with exactly this content, "
+                        "which is deliberately broken JSON: { \n"
+                        "If a hook sends you a message after that call, repeat it verbatim in your reply. "
+                        "Then stop. Do not fix the file or run anything.")
+          else:
+              market = temp / "hook-probe-market"
+              write_plugin(market / "plugins" / "hook-probe")
+              write_json(market / ".claude-plugin" / "marketplace.json",
+                         {"name": "hook-probe-market", "owner": {"name": "hook-load-test"},
+                          "plugins": [{"name": "hook-probe", "source": "./plugins/hook-probe"}]})
+              marketplaces = str(market)
+              plugins = "hook-probe@hook-probe-market"
+              needed_inputs = ["plugin_marketplaces", "plugins"]
+
+          claude_args.append(f"--allowedTools {tools}")
+
+          # GitHub only warns about an input an action doesn't declare, so read the downloaded action.yml.
+          action_yml = (pathlib.Path(os.environ["RUNNER_WORKSPACE"]).parent
+                        / "_actions" / "anthropics" / "claude-code-action" / "v1" / "action.yml")
+          try:
+              text = action_yml.read_text(encoding="utf-8")
+              block = re.search(r"^inputs:\n(.*?)^\S", text, re.M | re.S).group(1)
+              declared = set(re.findall(r"^  (\w+):", block, re.M))
+              missing = [name for name in needed_inputs if name not in declared]
+              if missing:
+                  unsupported = f"action.yml at v1 declares no `{'`, `'.join(missing)}` input"
+          except (OSError, AttributeError) as e:
+              print(f"::warning::could not read the action's inputs from {action_yml}: {e}")
+
+          output("prompt", prompt)
+          output("claude_args", "\n".join(claude_args))
+          output("settings", settings)
+          output("plugin_marketplaces", marketplaces)
+          output("plugins", plugins)
+          output("unsupported", unsupported)
+
+      - name: Run claude-code-action
+        id: agent
+        if: steps.prepare.outputs.unsupported == ''
+        continue-on-error: true # the verdict step reads what happened
+        timeout-minutes: 8
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ github.token }}
+          prompt: ${{ steps.prepare.outputs.prompt }}
+          claude_args: ${{ steps.prepare.outputs.claude_args }}
+          settings: ${{ steps.prepare.outputs.settings }}
+          plugin_marketplaces: ${{ steps.prepare.outputs.plugin_marketplaces }}
+          plugins: ${{ steps.prepare.outputs.plugins }}
+
+      - name: Verdict
+        id: verdict
+        if: always()
+        shell: python
+        env:
+          ROUTE: ${{ matrix.route }}
+          NAME: ${{ matrix.name }}
+          UNSUPPORTED: ${{ steps.prepare.outputs.unsupported }}
+          PREPARE_OUTCOME: ${{ steps.prepare.outcome }}
+          AGENT_OUTCOME: ${{ steps.agent.outcome }}
+          EXECUTION_FILE: ${{ steps.agent.outputs.execution_file }}
+        run: |
+          import json, os, pathlib, shutil, subprocess
+
+          route = os.environ["ROUTE"]
+          temp = pathlib.Path(os.environ["RUNNER_TEMP"])
+          marker = temp / "hook-probe-marker"
+          GATE = "sidecar gate hook"
+
+          def short(text, limit=240):
+              text = " ".join(str(text).split())
+              return text if len(text) <= limit else text[:limit] + "…"
+
+          def load_transcript():
+              path = pathlib.Path(os.environ["EXECUTION_FILE"] or temp / "claude-execution-output.json")
+              try:
+                  data = json.loads(path.read_text(encoding="utf-8"))
+                  return [m for m in data if isinstance(m, dict)]
+              except (OSError, ValueError, TypeError):
+                  return []
+
+          def blocks(messages, kind):
+              for m in messages:
+                  content = (m.get("message") or {}).get("content")
+                  if isinstance(content, list):
+                      yield from (b for b in content if isinstance(b, dict) and b.get("type") == kind)
+
+          def probe_ran(messages):
+              """True when the tool call that should trigger the hook was made and did not fail."""
+              failed = {b.get("tool_use_id") for b in blocks(messages, "tool_result") if b.get("is_error")}
+              answered = {b.get("tool_use_id") for b in blocks(messages, "tool_result")}
+              tool, key, wanted = (("Write", "file_path", "hook-probe-scratch/docs/backlog.json") if route == "3"
+                                   else ("Bash", "command", "hook-probe"))
+              return any(b.get("name") == tool
+                         and wanted in str((b.get("input") or {}).get(key, "")).replace("\\", "/")
+                         and b.get("id") in answered and b.get("id") not in failed
+                         for b in blocks(messages, "tool_use"))
+
+          def run_cli(*args):
+              """Run the CLI the action installed, with no prompt, so it never calls the API."""
+              cli = shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
+              try:
+                  res = subprocess.run([cli, *args], stdin=subprocess.DEVNULL, capture_output=True,
+                                       text=True, timeout=120)
+              except (OSError, subprocess.TimeoutExpired) as e:
+                  return None, str(e)
+              return res.returncode, (res.stdout + res.stderr).strip()
+
+          def judge():
+              if os.environ["UNSUPPORTED"]:
+                  return "UNSUPPORTED", os.environ["UNSUPPORTED"]
+              if os.environ["PREPARE_OUTCOME"] != "success":
+                  return "INCONCLUSIVE", "the fixture step did not succeed, so the action never ran"
+
+              messages = load_transcript()
+              init = next((m for m in messages if m.get("type") == "system" and m.get("subtype") == "init"), {})
+              cli = f"CLI {init.get('claude_code_version', 'version unknown')}"
+              wanted_plugin = "fleet-skills" if route == "3" else "hook-probe"
+              plugin = next((p for p in init.get("plugins") or [] if p.get("name") == wanted_plugin), None)
+              listed = (f"init lists {plugin.get('source') or plugin.get('name')}" if plugin
+                        else f"init does not list {wanted_plugin}")
+              plugin_errors = init.get("plugin_errors")
+              if plugin_errors:
+                  listed += f", plugin_errors: {short(json.dumps(plugin_errors))}"
+              note = "" if route == "1" else f"; {listed}"
+
+              if route != "3" and marker.exists():
+                  first = (marker.read_text(encoding="utf-8").splitlines() or [""])[0]
+                  return "LOADS", f"marker written ('{first}'){note}; {cli}"
+
+              if route == "3":
+                  for m in messages:
+                      if m.get("type") == "system" and m.get("subtype") == "hook_response":
+                          said = f"{m.get('stderr') or ''}\n{m.get('output') or ''}"
+                          if GATE in said:
+                              quote = short(said[said.index(GATE):].splitlines()[0], 200)
+                              proof = f"{m.get('hook_name')} exit {m.get('exit_code')}: '{quote}'"
+                              if plugin:
+                                  return "LOADS", f"{proof}; {listed}; {cli}"
+                              return "INCONCLUSIVE", f"the gate fired but {listed} ({proof}); {cli}"
+
+              # Nothing fired. Was the flag or command even there? Ask the installed CLI.
+              if route in ("2", "3"):
+                  _, text = run_cli("--plugin-dir", str(temp), "-p")
+                  if "unknown option" in text and "--plugin-dir" in text:
+                      return "UNSUPPORTED", f"'{short(text)}'"
+
+              if not messages:
+                  if route == "4":
+                      # The action installs plugins before the agent starts. Replay that to get its error.
+                      for args in (("plugin", "marketplace", "add", str(temp / "hook-probe-market")),
+                                   ("plugin", "install", "hook-probe@hook-probe-market")):
+                          code, text = run_cli(*args)
+                          if code is not None and ("unknown command" in text or "unknown option" in text):
+                              return "UNSUPPORTED", f"'{short(text)}'"
+                          if code not in (0, None):
+                              if "already" not in text:
+                                  return "DOES NOT LOAD", f"`claude {' '.join(args[:-1])}` failed: '{short(text)}'"
+                  return "INCONCLUSIVE", (f"no transcript (agent step: {os.environ['AGENT_OUTCOME']}); "
+                                          "read that step's log")
+
+              if not probe_ran(messages):
+                  result = next((m for m in messages if m.get("type") == "result"), {})
+                  return "INCONCLUSIVE", (f"the agent never completed the probe tool call (result "
+                                          f"{result.get('subtype')}, is_error {result.get('is_error')}, agent "
+                                          f"step: {os.environ['AGENT_OUTCOME']}){note}; {cli}")
+
+              if route == "3":
+                  if GATE in json.dumps(messages):
+                      return "INCONCLUSIVE", (f"the transcript mentions '{GATE}' but has no hook_response "
+                                              f"event for it{note}; {cli}")
+                  return "DOES NOT LOAD", f"Write succeeded and no sidecar gate hook fired{note}; {cli}"
+              return "DOES NOT LOAD", f"`echo hook-probe` ran and no marker was written{note}; {cli}"
+
+          try:
+              verdict, evidence = judge()
+          except Exception as e:  # a judge bug must not read as an answer
+              verdict, evidence = "INCONCLUSIVE", f"the verdict step failed: {short(repr(e))}"
+
+          line = f"route {route} ({os.environ['NAME']}): {verdict} — {' '.join(evidence.split())}"
+          print(line)
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+              f.write(f"line{route}={line}\n")
+
+  summary:
+    needs: route
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Collect the verdict lines
+        shell: python
+        env:
+          LINES: ${{ toJSON(needs.route.outputs) }}
+        run: |
+          import json, os, sys
+
+          got = json.loads(os.environ["LINES"] or "{}") or {}
+          lines = [got.get(f"line{n}") or f"route {n}: INCONCLUSIVE — no verdict line, read that job's log"
+                   for n in range(1, 5)]
+          body = "\n".join(lines)
+          print(body)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
+              f.write(f"## Hook loading verdicts\n\n```text\n{body}\n```\n")
+          if any(": INCONCLUSIVE — " in line for line in lines):
+              sys.exit("At least one route was not exercised. Re-run before recording anything.")
