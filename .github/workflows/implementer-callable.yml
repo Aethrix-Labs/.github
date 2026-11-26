@@ -1002,6 +1002,8 @@ jobs:
           PREFLIGHT_MODE: ${{ steps.preflight.outputs.mode }}
           PREFLIGHT_PROCEED: ${{ steps.preflight.outputs.proceed }}
           PREFLIGHT_OUTCOME: ${{ steps.preflight.outputs.outcome }}
+          # Tells a cancel from a failed setup step when the pre-flight never ran.
+          JOB_STATUS: ${{ job.status }}
         run: |
           # If the skill delivered its own tick-report it dropped this breadcrumb —
           # the hub already heard back, so this guard has nothing to do. Absent → fall
@@ -1069,25 +1071,70 @@ jobs:
           #               one the hub acts on, with an auto-retry)
           #   unknown     a transcript exists but jq is unavailable or a field would not parse, or nothing
           #               above matched
-          # Two more come from the live pre-flight step, which can end a run before any agent starts.
-          # Neither is a `crash` or a `pre-flight` death (that name is the
-          # action's own setup failing, and the hub auto-retries it), and neither reads a transcript:
-          #   preflight-stopped  the pre-flight stopped the run (proceed=false), the agent step was
-          #                      skipped, and the tick-report that stop owes did not land
-          #   preflight-crashed  mode is live and the pre-flight wrote no `proceed`: it crashed or was
-          #                      cut off before the agent
+          # Four more are for runs that ended before any agent started: two from the live pre-flight step,
+          # two for a run that never reached it. None is a `crash` or a `pre-flight` death (that name is
+          # the action's own setup failing, and the hub auto-retries it), and none reads a transcript:
+          #   preflight-stopped       the pre-flight stopped the run (proceed=false), the agent step was
+          #                           skipped, and the tick-report that stop owes did not land
+          #   preflight-crashed       mode is live and the pre-flight wrote no `proceed`: it crashed or
+          #                           was cut off before the agent
+          #   cancelled-before-agent  the agent step was skipped, the pre-flight never wrote its mode,
+          #                           and the job is `cancelled`
+          #   setup-failed            the same, with the job not cancelled: an earlier step failed
+          # One more is checked before the result-object causes and reads no transcript either:
+          #   report-undelivered      the agent recorded an outcome (`report.mjs record`) and no
+          #                           tick-report landed: the agent finished, only the report is missing
           NO_AGENT_CAUSE=""
           if [ "${AGENT_OUTCOME:-}" = "skipped" ] && [ "${PREFLIGHT_PROCEED:-}" = "false" ]; then
             NO_AGENT_CAUSE="preflight-stopped"
           elif [ "${PREFLIGHT_MODE:-}" = "live" ] && [ -z "${PREFLIGHT_PROCEED:-}" ]; then
             NO_AGENT_CAUSE="preflight-crashed"
+          elif [ "${AGENT_OUTCOME:-}" = "skipped" ] && [ -z "${PREFLIGHT_MODE:-}" ]; then
+            if [ "${JOB_STATUS:-}" = "cancelled" ]; then
+              NO_AGENT_CAUSE="cancelled-before-agent"
+            else
+              NO_AGENT_CAUSE="setup-failed"
+            fi
+          fi
+          # The recorded outcome: `report.mjs record` writes it as the agent's last act, and `report.mjs
+          # send` reports from it. Reaching here with one for this run (same GITHUB_RUN_ID and attempt)
+          # means no tick-report landed. The agent can write this file, so every field that reaches a
+          # JSON body is matched against the whole value, and one that does not match is dropped. The
+          # outcome list is report.mjs's RECORDABLE: it sends nothing for any other value, so the guard
+          # ignores the file then and falls through to the causes below.
+          REC_OUTCOME=""; REC_PR_URL=""; REC_WORK_ITEM=""; REC_QUEUE_ID=""
+          OUTCOME_FILE="${RUNNER_TEMP:-/tmp}/implementer-outcome.json"
+          if [ -z "$NO_AGENT_CAUSE" ] && [ -f "$OUTCOME_FILE" ] && command -v jq >/dev/null 2>&1 \
+              && jq -e -s 'length == 1 and (.[0] | type == "object")' "$OUTCOME_FILE" >/dev/null 2>&1; then
+            rec_field() { # rec_field <key>: the string value, only when the file is this run's
+              jq -r --arg key "$1" --arg run "${GITHUB_RUN_ID:-}" --arg attempt "${GITHUB_RUN_ATTEMPT:-}" \
+                'select(.github_run_id == $run and .github_run_attempt == $attempt) | .[$key] | strings' \
+                "$OUTCOME_FILE" 2>/dev/null || true
+            }
+            REC_OUTCOME="$(rec_field outcome)"
+            case "$REC_OUTCOME" in
+              committed|queued-for-approval|blocked-strategic|blocked-human|blocked-local|blocked-adversary-cap-hit|blocked-tests|guard-tripped) ;;
+              *) REC_OUTCOME="" ;;
+            esac
+          fi
+          if [ -n "$REC_OUTCOME" ]; then
+            REC_PR_URL="$(rec_field pr_url)"
+            REC_WORK_ITEM="$(rec_field work_item_id)"
+            REC_QUEUE_ID="$(rec_field queue_entry_id)"
+            PR_RE='^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[0-9]+$'
+            WORK_ITEM_RE='^[A-Za-z0-9_.-]{1,64}$'
+            QUEUE_ID_RE='^[A-Za-z0-9_.:-]{1,128}$'
+            [[ "$REC_PR_URL" =~ $PR_RE ]] || REC_PR_URL=""
+            [[ "$REC_WORK_ITEM" =~ $WORK_ITEM_RE ]] || REC_WORK_ITEM=""
+            [[ "$REC_QUEUE_ID" =~ $QUEUE_ID_RE ]] || REC_QUEUE_ID=""
           fi
           EXEC_FILE="${AGENT_EXECUTION_FILE:-}"
           if [ -z "$EXEC_FILE" ]; then
             EXEC_FILE="${RUNNER_TEMP:-}/claude-execution-output.json"
           fi
-          # No agent ran, so a transcript at that path is not this run's: do not read or upload it.
-          [ -z "$NO_AGENT_CAUSE" ] || EXEC_FILE=""
+          # No agent ran (a transcript at that path is not this run's), or the agent finished and recorded
+          # its outcome (it did not die): do not read or upload it.
+          [ -z "$NO_AGENT_CAUSE$REC_OUTCOME" ] || EXEC_FILE=""
           CAP="${AGENT_MAX_TURNS:-}"
           case "$CAP" in ""|*[!0-9]*) CAP="" ;; esac
           R_KIND=""; R_SUBTYPE=""; R_ERR=""; R_TURNS=""; R_BG=""; R_DONE=""; R_STOP=""
@@ -1111,6 +1158,7 @@ jobs:
             R_STOP="$(printf '%s' "$R_STOP" | tr -cd 'A-Za-z0-9_-' | head -c 32)"
           fi
           CAUSE="${NO_AGENT_CAUSE:-unknown}"
+          [ -z "$REC_OUTCOME" ] || CAUSE="report-undelivered"
           BG_WAIT=""
           if [ "$R_KIND" = "none" ]; then
             CAUSE="crash"
@@ -1204,7 +1252,7 @@ jobs:
           fi
           echo "::notice::implementer-callable: agent result cause=${CAUSE} subtype=${R_SUBTYPE:-?} is_error=${R_ERR:-?} turns=${R_TURNS:-?}/${CAP:-?} bg_started=${R_BG:-?} bg_completed=${R_DONE:-?} stop_reason=${R_STOP:-?}"
 
-          # Merge reconcile (implementer PACKETS.md, workflow-failed).
+          # Merge reconcile (fleet skills/implementer/RECORDS.md § workflow-failed).
           # The exit contract is NOT atomic with the commit side effects: on a
           # commit-phase death the PR may have opened, gone green and been merged
           # by the hub while only the in-band tick-report died. Reporting that as
@@ -1214,9 +1262,11 @@ jobs:
           # Best-effort and racy by design; the hub's merge-webhook reconcile
           # stays authoritative. This is the early exit so the common case never
           # shows a spurious retry card.
+          # Skipped when there is a recorded outcome: that is the run's own account, so it is sent as is
+          # instead of being inferred from GitHub.
           RECONCILED=""
           PR_URL=""
-          if [ "$LAST_PHASE" = "committing" ]; then
+          if [ -z "$REC_OUTCOME" ] && [ "$LAST_PHASE" = "committing" ]; then
             WORK_BRANCH="$(git -C "${GITHUB_WORKSPACE:-.}" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
             case "$WORK_BRANCH" in
               ""|HEAD|main|master)
@@ -1247,6 +1297,21 @@ jobs:
           # advice is reserved for an actual max-turns death. Plain ASCII, no double quotes or
           # backslashes: these are interpolated into the JSON body below.
           case "$CAUSE" in
+            report-undelivered)
+              REC_PR_NOTE="no PR recorded"
+              REC_PR_CHECK="No PR URL is recorded, so check the repo for a PR from this run"
+              if [ -n "$REC_PR_URL" ]; then
+                REC_PR_NOTE="PR ${REC_PR_URL}"
+                REC_PR_CHECK="Check the PR ${REC_PR_URL}"
+              fi
+              ATTEMPT="The agent recorded the outcome ${REC_OUTCOME} (${REC_PR_NOTE}), but the report step's tick-report did not land. This guard sends the recorded outcome in its place."
+              RECO="Do not retry and do not split the step: the agent finished and recorded ${REC_OUTCOME}. ${REC_PR_CHECK}, and read the log of the report.mjs send step for why the tick-report POST failed." ;;
+            cancelled-before-agent)
+              ATTEMPT="The run was cancelled before the agent started (the pre-flight never ran). No agent ran; nothing to recover."
+              RECO="Re-dispatch if the cancel was not intended." ;;
+            setup-failed)
+              ATTEMPT="A setup step failed before the pre-flight ran. No agent was started."
+              RECO="Open the run and read the log of the first failed step; fix what it names, then re-dispatch. No agent ran, so do not split the step." ;;
             max-turns)
               ATTEMPT="claude-code-action used ${R_TURNS} of ${CAP} turns (result subtype ${R_SUBTYPE}), at or near its turn cap, before the skill's own exit path; no in-band queue entry or tick-report was sent."
               RECO="Died at phase '${LAST_PHASE}'. building/testing/adversary → the step is likely over-sized for the effective build budget (split it) or a green command is stuck (see the Step 4 debug cap); committing → check the commit skill's mid-flight activity records; step-identified → the agent may have walked into work outside its lane (e.g. an unmarked human-only step)." ;;
@@ -1286,8 +1351,9 @@ jobs:
           esac
           # rebasing (implementer Step 1d) works an existing PR after a hub merge-conflict send-back,
           # so the split-the-step and plain-retry advice above is wrong whatever the cause: the work
-          # is already on the PR. The background-wait case keeps its own advice (the fix is the skill).
-          if [ "$LAST_PHASE" = "rebasing" ] && [ -z "$BG_WAIT" ]; then
+          # is already on the PR. The background-wait case keeps its own advice (the fix is the skill),
+          # and so does a recorded outcome (the agent did not die).
+          if [ "$LAST_PHASE" = "rebasing" ] && [ -z "$BG_WAIT" ] && [ -z "$REC_OUTCOME" ]; then
             RECO="Died while rebasing an existing PR after a hub send-back. Do not split the step - the work is already on the PR. Check whether the rebased branch was pushed (the PR's head and its comments) before retrying."
           fi
           ATTEMPT="${ATTEMPT} Last phase reached: ${LAST_PHASE}. Run: ${RUN_URL}${RUN_ID_NOTE}${TRANSCRIPT_NOTE}"
@@ -1299,7 +1365,7 @@ jobs:
           # request_id, and the hub answers a repeated request_id with the existing (already
           # resolved) entry: the second failure files no card. Attempt 1's input stays
           # byte-identical to the run-ID-only key, so its hash does not change. Shape per
-          # implementer PACKETS.md § workflow-failed.
+          # fleet skills/implementer/RECORDS.md § workflow-failed.
           if [ -n "$RECONCILED" ]; then
             echo "::notice::implementer-callable: skipping workflow-failed entry (reconciled); the hub emits completed-unacknowledged off the tick-report"
           elif [ -n "$QUEUE_SERVICE_ROLE_KEY" ]; then
@@ -1344,7 +1410,8 @@ jobs:
           fi
 
           # Tick-report — outcome `workflow-failed` (reserved for this handler
-          # per implementer SKILL.md Step 7; orchestrator maps it to `errored`).
+          # per implementer SKILL.md "How every run ends"; orchestrator maps it to `errored`), except
+          # that a reconciled run sends `completed-unacknowledged` and a recorded outcome is sent as is.
           if [ -n "$IMPLEMENTER_SESSION_ID" ] && [ -n "$AUTONOMOUS_TICK_TOKEN" ]; then
             # pr_url is z.string().url().optional() hub-side, so omit it entirely
             # rather than sending an empty string.
@@ -1353,6 +1420,14 @@ jobs:
             if [ -n "$RECONCILED" ]; then
               TICK_OUTCOME="completed-unacknowledged"
               PR_FIELD="\"pr_url\": \"$PR_URL\","
+            fi
+            # Stay empty without a recorded outcome. Omitted when empty, as report.mjs does.
+            WORK_ITEM_FIELD=""; QUEUE_ID_FIELD=""
+            if [ -n "$REC_OUTCOME" ]; then
+              TICK_OUTCOME="$REC_OUTCOME"
+              [ -z "$REC_PR_URL" ] || PR_FIELD="\"pr_url\": \"$REC_PR_URL\","
+              [ -z "$REC_WORK_ITEM" ] || WORK_ITEM_FIELD="\"work_item_id\": \"$REC_WORK_ITEM\","
+              [ -z "$REC_QUEUE_ID" ] || QUEUE_ID_FIELD="\"queue_entry_id\": \"$REC_QUEUE_ID\","
             fi
             TICK_SENT=""
             for attempt in 1 2 3; do
@@ -1364,7 +1439,7 @@ jobs:
                     \"session_id\": \"$IMPLEMENTER_SESSION_ID\",
                     \"run_id\": \"$GITHUB_RUN_ID\",
                     \"outcome\": \"$TICK_OUTCOME\",
-                    ${PR_FIELD}
+                    ${PR_FIELD}${WORK_ITEM_FIELD}${QUEUE_ID_FIELD}
                     \"run_url\": \"$RUN_URL\",
                     \"last_phase\": \"$LAST_PHASE\"
                   }"; then
@@ -1446,10 +1521,10 @@ jobs:
           esac
 
           # step_id_hint — the work-item id out of the `<phase>:<work-item-id>` phase breadcrumb this
-          # workflow already parses for the failure handler (implementer PACKETS.md, run-metrics;
-          # hub BL-128). The hub fills run_metrics.step_id / outcome / iterations_used by copying
-          # them off this run's agent-written `run-completed`; no run-completed, no values, and the
-          # table cannot tell that case from a crashed run. This is the callable's own second-best
+          # workflow already parses for the failure handler (fleet skills/implementer/RECORDS.md
+          # § run-metrics; hub BL-128). The hub fills run_metrics.step_id / outcome / iterations_used
+          # by copying them off this run's agent-written `run-completed`; no run-completed, no values,
+          # and the table cannot tell that case from a crashed run. This is the callable's own second-best
           # answer to "which step was this", and NEVER the authority — hence the name: a hint is
           # what a workflow inferred from a local file, `step_id` is what the agent asserted about
           # its own run. The hub prefers run-completed and falls back to this.
@@ -1676,8 +1751,9 @@ jobs:
           # `.implementer-run-id` is written at Step 1 the moment the run_id is generated, but three
           # clean exits happen after that and before `run-started` — directed milestone not found,
           # milestone with no unblocked step, backlog item gone from `## Open`. All three exit
-          # `success` with tick-outcome `guard-tripped`, and implementer PACKETS.md says they
-          # "write no activity records (tick-report only)". That is routine: SKILL.md Step 1 calls the
+          # `success` with tick-outcome `guard-tripped`, and fleet skills/implementer/RECORDS.md
+          # § run-completed says they "write no activity records (tick-report only)".
+          # That is routine: SKILL.md Step 1 calls the
           # second one the defensive path for a step consumed between enumeration and dispatch. So the
           # warning is gated on STEP_RESOLVED — the phase breadcrumb showing the agent got past Step 1
           # — and NOT on run-started being present, which is 0 on the five real incidents too.

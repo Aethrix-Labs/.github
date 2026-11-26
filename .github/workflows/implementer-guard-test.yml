@@ -9,6 +9,10 @@ name: implementer failure guard and sleep guard (test)
 #        - the existing causes keep their precedence (pre-flight, unknown, max-turns, crash, the rebasing
 #          override), a cancelled step with a readable result object keeps that object's cause;
 #        - the card carries no `category` for runner-lost (the hub auto-retries only `pre-flight`);
+#        - this run's recorded outcome with no tick-report -> report-undelivered (the tick-report carries
+#          that outcome and the PR, no transcript is uploaded); a stale, unreadable or unrecordable
+#          outcome file is ignored, and a malformed field in a good one is dropped;
+#        - agent skipped and no pre-flight mode -> cancelled-before-agent or setup-failed, by job status;
 #        - on a (shimmed) macOS host, the wake-time evidence sentence both ways;
 #        - every body the guard POSTs parses as JSON;
 #        - a skill that already reported leaves the guard idle.
@@ -155,11 +159,15 @@ jobs:
           # ---- Run the guard once: run_case <name> <phase breadcrumb or ""> [VAR=value ...] ----------------------
           # Each case gets a fresh workspace (a clone of the origin, so `git ls-remote origin` works) and a
           # fresh RUNNER_TEMP. The environment is only what the step's own `env:` block hands it, plus the
-          # runner variables.
+          # runner variables. SEED_OUTCOME / SEED_TRANSCRIPT, when set, are written into that RUNNER_TEMP
+          # as the recorded-outcome file and the transcript at the action's default path.
+          SEED_OUTCOME=""; SEED_TRANSCRIPT=""
           run_case() {
             CASE="$1"; PHASE_TEXT="$2"; shift 2
             WS="$T/$CASE/ws"; RT="$T/$CASE/rt"; LOG="$T/$CASE/log"
             rm -rf "$T/$CASE"; mkdir -p "$RT"
+            [ -z "$SEED_OUTCOME" ] || printf '%s\n' "$SEED_OUTCOME" > "$RT/implementer-outcome.json"
+            [ -z "$SEED_TRANSCRIPT" ] || printf '%s\n' "$SEED_TRANSCRIPT" > "$RT/claude-execution-output.json"
             git clone -q "$T/origin.git" "$WS" 2>/dev/null
             [ -z "$PHASE_TEXT" ] || printf '%s\n' "$PHASE_TEXT" > "$WS/.implementer-phase"
             : > "$T/hub/posts.jsonl"
@@ -276,6 +284,121 @@ jobs:
           Q="$(queue)"; valid_json
           check "garbage wake time still classifies" "$(cat "$LOG")" "cause=runner-lost"
           refute "and adds no evidence sentence" "$(jq -r '.attempts[0]' <<<"$Q")" "The host reports"
+
+          # === 8. A recorded outcome whose tick-report did not land ==========================================
+          # rec <outcome> <pr_url> [attempt]: the file `report.mjs record` writes, for run 9001
+          rec() {
+            jq -nc --arg o "$1" --arg pr "$2" --arg a "${3:-1}" \
+              '{version: 1, outcome: $o, pr_url: $pr, queue_entry_id: "qe-7", iterations_used: 1,
+                work_item_id: "M2.31", run_id: "abc123", github_run_id: "9001", github_run_attempt: $a}'
+          }
+          PR="https://github.com/Aethrix-Labs/sobriety-tracker/pull/42"
+          CLEAN="$(cat "$T/transcripts/clean.json")" # what the guard would otherwise card as clean-exit
+
+          SEED_OUTCOME="$(rec committed "$PR")"; SEED_TRANSCRIPT="$CLEAN"
+          run_case undelivered "committing:M2.31" AGENT_OUTCOME=success PREFLIGHT_MODE=live PREFLIGHT_PROCEED=true
+          Q="$(queue)"; K="$(tick)"; valid_json
+          check "cause"                        "$(cat "$LOG")" "cause=report-undelivered"
+          check "tick carries the outcome"     "$(jq -r .outcome <<<"$K")" "committed"
+          check "tick carries the PR"          "$(jq -r .pr_url <<<"$K")" "$PR"
+          check "tick carries the work item"   "$(jq -r .work_item_id <<<"$K")" "M2.31"
+          check "tick carries the queue entry" "$(jq -r .queue_entry_id <<<"$K")" "qe-7"
+          refute "tick is not workflow-failed" "$K" "workflow-failed"
+          check "attempt: outcome and PR"      "$(jq -r '.attempts[0]' <<<"$Q")" "recorded the outcome committed (PR $PR)"
+          check "attempt: did not land"        "$(jq -r '.attempts[0]' <<<"$Q")" "tick-report did not land"
+          check "reco: no retry, no split"     "$(jq -r .recommendation <<<"$Q")" "Do not retry and do not split the step"
+          check "reco: check the PR"           "$(jq -r .recommendation <<<"$Q")" "Check the PR $PR"
+          check "reco: the send step's log"    "$(jq -r .recommendation <<<"$Q")" "report.mjs send step"
+          refute "no category stamped"         "$Q" '"category"'
+          refute "no transcript uploaded"      "$(cat "$T/$CASE/output" 2>/dev/null)" "transcript_path"
+          refute "no transcript mentioned"     "$(jq -r '.attempts[0]' <<<"$Q")" "transcript"
+
+          # A rebase send-back records committed too; the rebasing override must not replace the advice.
+          # The phase is bare here and in the reconcile cases below: the guard matches those two exactly,
+          # and each has a control run showing the branch is live with this setup.
+          run_case undelivered-rebasing "rebasing" AGENT_OUTCOME=success
+          check "keeps its own advice" "$(queue | jq -r .recommendation)" "Do not retry and do not split the step"
+          SEED_OUTCOME=""
+          run_case rebasing-control "rebasing" AGENT_OUTCOME=success
+          check "setup overrides the advice" "$(queue | jq -r .recommendation)" "Died while rebasing"
+          SEED_OUTCOME="$(rec committed "$PR")"
+
+          # The record outlives a step that then died: the record still wins over the result object.
+          SEED_TRANSCRIPT="$(cat "$T/transcripts/maxturns.json")"
+          run_case undelivered-maxturns "committing:M2.31" AGENT_OUTCOME=success
+          check "record wins over max-turns" "$(cat "$LOG")" "cause=report-undelivered"
+
+          # No PR on a blocked outcome: the field is omitted, not sent empty.
+          SEED_OUTCOME="$(rec blocked-tests "")"; SEED_TRANSCRIPT=""
+          run_case undelivered-no-pr "testing:M2.31" AGENT_OUTCOME=success
+          K="$(tick)"; valid_json
+          check "tick outcome"       "$(jq -r .outcome <<<"$K")" "blocked-tests"
+          check "pr_url omitted"     "$(jq -r 'has("pr_url")' <<<"$K")" "false"
+          check "attempt says so"    "$(queue | jq -r '.attempts[0]')" "no PR recorded"
+
+          # Agent-written values that would break or extend the JSON body are dropped.
+          SEED_OUTCOME="$(rec committed "$PR" | jq -c --arg q 'x", "outcome": "workflow-failed' \
+            '.pr_url += ("\n" + $q) | .work_item_id = $q | .queue_entry_id = $q')"
+          run_case undelivered-hostile "committing:M2.31" AGENT_OUTCOME=success
+          K="$(tick)"; valid_json
+          check "tick outcome survives"        "$(jq -r .outcome <<<"$K")" "committed"
+          check "bad pr_url dropped"           "$(jq -r 'has("pr_url")' <<<"$K")" "false"
+          check "bad work_item_id dropped"     "$(jq -r 'has("work_item_id")' <<<"$K")" "false"
+          check "bad queue_entry_id dropped"   "$(jq -r 'has("queue_entry_id")' <<<"$K")" "false"
+          refute "nothing injected in the card" "$(queue)" 'x\"'
+
+          # Files that are not this run's record fall through to the causes below.
+          SEED_TRANSCRIPT="$CLEAN"
+          ignored() { # ignored <case> <file text>
+            SEED_OUTCOME="$2"
+            run_case "$1" "committing:M2.31" AGENT_OUTCOME=success
+            check "ignored"                  "$(cat "$LOG")" "cause=clean-exit"
+            check "tick is workflow-failed"  "$(tick | jq -r .outcome)" "workflow-failed"
+          }
+          ignored rec-other-attempt   "$(rec committed "$PR" 2)"
+          ignored rec-other-run       "$(rec committed "$PR" | jq -c '.github_run_id = "8000"')"
+          ignored rec-unrecordable    "$(rec completed-unacknowledged "$PR")"
+          ignored rec-unparseable     '{"outcome": "committed",'
+          ignored rec-trailing-junk   "$(rec committed "$PR") junk"
+          # The merge reconcile: needs a real branch in the workspace and a `gh` that reports it merged. The
+          # first run shows the setup does reconcile; with a record, the record is sent and the card is filed.
+          mkdir -p "$T/shim-gh"
+          printf '#!/bin/sh\necho %s\n' "$PR" > "$T/shim-gh/gh"; chmod +x "$T/shim-gh/gh"
+          git -C "$T/origin-seed" push -q "$T/origin.git" HEAD:refs/heads/feat/work
+          git --git-dir="$T/origin.git" symbolic-ref HEAD refs/heads/feat/work
+          SEED_OUTCOME=""; SEED_TRANSCRIPT=""
+          run_case reconcile-control "committing" AGENT_OUTCOME=success PATH="$T/shim-gh:$PATH"
+          check "setup reconciles"          "$(tick | jq -r .outcome)" "completed-unacknowledged"
+          SEED_OUTCOME="$(rec committed "$PR")"
+          run_case reconcile-skipped "committing" AGENT_OUTCOME=success PATH="$T/shim-gh:$PATH"
+          check "the record is sent"        "$(tick | jq -r .outcome)" "committed"
+          check "the card is still filed"   "$(queue | jq -r .variant)" "workflow-failed"
+          SEED_OUTCOME=""
+
+          # === 9. The pre-flight never ran =====================================================================
+          # A transcript left at the default path is not this run's: not read, not uploaded.
+          SEED_TRANSCRIPT="$CLEAN"
+          run_case cancelled-early "" AGENT_OUTCOME=skipped JOB_STATUS=cancelled
+          Q="$(queue)"; valid_json
+          check "cause"                   "$(cat "$LOG")" "cause=cancelled-before-agent"
+          check "attempt"                 "$(jq -r '.attempts[0]' <<<"$Q")" "cancelled before the agent started (the pre-flight never ran). No agent ran; nothing to recover."
+          check "reco"                    "$(jq -r .recommendation <<<"$Q")" "Re-dispatch if the cancel was not intended"
+          refute "no category stamped"    "$Q" '"category"'
+          refute "no transcript uploaded" "$(cat "$T/$CASE/output" 2>/dev/null)" "transcript_path"
+          check "tick is workflow-failed" "$(tick | jq -r .outcome)" "workflow-failed"
+
+          run_case setup-failed "" AGENT_OUTCOME=skipped JOB_STATUS=failure
+          Q="$(queue)"; valid_json
+          check "cause"                   "$(cat "$LOG")" "cause=setup-failed"
+          check "attempt"                 "$(jq -r '.attempts[0]' <<<"$Q")" "A setup step failed before the pre-flight ran"
+          check "reco"                    "$(jq -r .recommendation <<<"$Q")" "first failed step"
+          refute "no category stamped"    "$Q" '"category"'
+          refute "no transcript uploaded" "$(cat "$T/$CASE/output" 2>/dev/null)" "transcript_path"
+          SEED_TRANSCRIPT=""
+
+          # A live pre-flight that was cut off keeps its own cause, cancelled or not.
+          run_case cancelled-in-preflight "" AGENT_OUTCOME=skipped JOB_STATUS=cancelled PREFLIGHT_MODE=live
+          check "still preflight-crashed" "$(cat "$LOG")" "cause=preflight-crashed"
 
           exit "$FAIL"
 
