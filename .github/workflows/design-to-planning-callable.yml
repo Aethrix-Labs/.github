@@ -213,8 +213,8 @@ jobs:
             Read `.fleet-ci/ci/design-to-planning/SKILL.md` and follow its Headless
             mode exactly for spec $DTP_SPEC_SLUG (docs/specs/FEATURE_$DTP_SPEC_SLUG.md).
 
-            Plan one milestone, run the plan-reviewer loop per lite-planner Step 3's
-            CI venue (`.fleet-ci/ci/lite-planner/SKILL.md`), commit through
+            Plan one milestone, run the plan-reviewer loop per the runner venue in
+            `.fleet-ci/ci/plan-reviewer/CALLERS.md`, commit through
             `.fleet-ci/ci/ci-commit/SKILL.md`. Do not implement.
 
             Runtime context:
