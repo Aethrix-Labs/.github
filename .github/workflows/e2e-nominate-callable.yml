@@ -116,7 +116,7 @@ jobs:
         id: vend
         shell: bash
         run: |
-          if [ -f ".fleet-ci/ci/e2e-suite-review/SKILL.md" ]; then
+          if [ -f ".fleet-ci/ci/e2e-suite-review/SKILL.md" ] && test -f ".fleet-ci/ci/e2e-suite-review/CI.md"; then
             echo "vended=true" >> "$GITHUB_OUTPUT"
           else
             echo "vended=false" >> "$GITHUB_OUTPUT"
@@ -352,7 +352,7 @@ jobs:
         id: vend
         shell: bash
         run: |
-          if grep -qF '## Removal sweep (CI)' ".fleet-ci/ci/e2e-suite-review/SKILL.md" 2>/dev/null; then
+          if grep -qF '## Removal sweep (CI)' ".fleet-ci/ci/e2e-suite-review/SKILL.md" 2>/dev/null && test -f ".fleet-ci/ci/e2e-suite-review/CI.md"; then
             echo "vended=true" >> "$GITHUB_OUTPUT"
           else
             echo "vended=false" >> "$GITHUB_OUTPUT"
