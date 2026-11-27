@@ -301,6 +301,22 @@ jobs:
           echo "path=$BIN" >> "$GITHUB_OUTPUT"
           echo "claude-cli pre-install: $GOT at $BIN (installer HOME was $CLI_HOME)"
 
+      - name: CI headless-rule hooks (--settings, only when vended)
+        # The fleet's CI hooks (STANDARDS §19.7 rule 2). Every agent step in this job adds `args` to its
+        # claude_args. The hooks are insurance, so a missing file adds nothing, with a ::warning::, and
+        # never fails the job. Never use the action's `settings` input instead: the action saves that into
+        # the runner user's settings, where it outlives the job. Same step in every callable that runs
+        # claude-code-action: change them together.
+        id: ci-hooks
+        shell: bash
+        run: |
+          FILE=".fleet-ci/ci/_fleet/ci-hooks/settings.json"
+          if [ -f "$FILE" ]; then
+            echo "args=--settings $FILE" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::CI headless-rule hooks not loaded: $FILE is missing"
+          fi
+
       - name: Run Claude semantic review
         if: steps.gate.outputs.run == 'true'
         id: semantic
@@ -335,6 +351,7 @@ jobs:
             --effort medium
             --max-turns 25
             --allowedTools Read,Bash,Write
+            ${{ steps.ci-hooks.outputs.args }}
 
       - name: Emit security-review queue entry (semantic failure)
         if: failure() && steps.semantic.outcome == 'failure' && steps.gate.outputs.run == 'true'
