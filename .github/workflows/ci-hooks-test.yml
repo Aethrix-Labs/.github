@@ -1,0 +1,303 @@
+name: CI headless-rule hooks (test)
+
+# Do the fleet's CI headless-rule hooks load through `--settings` in claude_args, on every runner the
+# agent callables use, without leaving anything in the runner user's own settings? Fleet DECISIONS
+# 2026-11-27 "the CI hooks load through --settings"; STANDARDS §19.7 rule 2; skill-suite-health item 21.
+# The verdicts are recorded in fleet-command-center, before the callables are wired.
+#
+# One job per runner. Each loads the vended ci/_fleet/ci-hooks/settings.json and has the agent make one
+# Bash call with `run_in_background: true`. Each ends in one line, also written to the step summary:
+#
+#   ci-hooks on <label> (<runner>): PASS | FAIL | INCONCLUSIVE — hook: <evidence>; user settings: <evidence>
+#
+# PASS needs both:
+#   1. THE HOOK BLOCKED THE CALL: the transcript (`--include-hook-events`) has a PreToolUse
+#      `hook_response` with exit 2 and the "CI headless rule" message, and the call's tool result is an
+#      error carrying it. The vended command exits 0 when it can't find its script, so a wrong path would
+#      load fine and block nothing. Only this assertion catches that.
+#   2. NOTHING OF OURS WAS SAVED in the runner user's ~/.claude/settings.json, hashed before and after the
+#      agent step. claude-code-action itself rewrites that file on EVERY run, with or without a `settings`
+#      input (base-action/src/setup-claude-code-settings.ts): it keeps what is there, adds
+#      `enableAllProjectMcpServers: true`, and creates the file if it is missing (every leg of
+#      hook-load-test.yml run 45830790719 logged "No existing settings file found, creating new one").
+#      So the check passes when the file is byte-identical, OR when that one write is the only
+#      difference, and the line says which. It fails on any other change, and whenever the file names
+#      the hooks, even if it did before the job started. Another job on the same host shares the file,
+#      so re-run once before believing an unexplained change.
+# INCONCLUSIVE means the hook was never exercised (no agent run, or no background Bash call). Re-run.
+#
+# WHERE IT CAN RUN. All three runners only from a PRIVATE repo, as a reusable workflow: this repo is
+# public and the org's runner group has allows_public_repositories=false, so a self-hosted job from here
+# never starts. A private repo with this thin caller on its default branch works (one dispatch, three
+# jobs). `fleet-mac` is started by hand, so check it is online first, or that job just queues.
+#
+#   on: { workflow_dispatch: {} }
+#   permissions: { contents: read }
+#   jobs:
+#     test:
+#       uses: Aethrix-Labs/.github/.github/workflows/ci-hooks-test.yml@main
+#       secrets: inherit
+#
+# Dispatched from this repo's own Actions tab it runs the ubuntu-latest job only. THAT LOG IS PUBLIC:
+# nothing prints or uploads the transcript, the vended files or the runner's settings (hashes and
+# top-level key names only), and show_full_output stays off. Don't re-run it with debug logging. In any
+# repo, the action itself prints an EXISTING ~/.claude/settings.json to the log.
+#
+# As in hook-load-test.yml, `github_token` is passed, which skips the action's OIDC exchange (so no
+# `id-token: write`), and the action refuses bot actors, so a person dispatches this.
+
+on:
+  workflow_call:
+    inputs:
+      runners:
+        description: "JSON array of runs-on arrays, one job each."
+        type: string
+        required: false
+        default: '[["ubuntu-latest"],["self-hosted","fleet"],["self-hosted","fleet-mac"]]'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  hooks:
+    name: ci-hooks on ${{ join(matrix.runs_on, ' ') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # `inputs.runners` is empty only on a dispatch from this repo, which can reach ubuntu-latest only.
+        runs_on: ${{ fromJSON(inputs.runners || '[["ubuntu-latest"]]') }}
+    runs-on: ${{ matrix.runs_on }}
+    timeout-minutes: 20
+    steps:
+      # The action configures git in the workspace, so give it a checkout like every callable does.
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4 # the vended hooks, from the same place the callables get them
+        with:
+          repository: Aethrix-Labs/fleet-skills
+          path: .fleet-ci
+          ref: main
+          token: ${{ secrets.FLEET_SKILLS_PAT }}
+          persist-credentials: false
+
+      - name: Install Claude Code CLI (job-private HOME)
+        # The same script as in every callable that runs claude-code-action (see the comment on it in
+        # implementer-callable.yml). Without it the action installs the CLI into the runner user's real
+        # HOME, and the test would not run the CLI the way the callables do.
+        id: claude-cli
+        continue-on-error: true
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          CLI_HOME="$RUNNER_TEMP/claude-cli-home"
+          PIN_SRC="$RUNNER_WORKSPACE/../_actions/anthropics/claude-code-action/v1/src/entrypoints/run.ts"
+          fall_back() {
+            echo "::warning::claude-cli pre-install skipped: $1. claude-code-action will install the CLI itself into the shared ~/.claude/downloads, where a concurrent job can make that fail with 'Checksum verification failed'."
+            exit 0
+          }
+          VERSION="$(sed -n 's/.*claudeCodeVersion = "\([0-9][0-9.]*\)".*/\1/p' "$PIN_SRC" 2>/dev/null | head -n 1)" || VERSION=""
+          [ -n "$VERSION" ] || fall_back "could not read the pinned CLI version from $PIN_SRC"
+          rm -rf "$CLI_HOME"
+          mkdir -p "$CLI_HOME" || fall_back "could not create $CLI_HOME"
+          for ATTEMPT in 1 2 3; do
+            env -u XDG_DATA_HOME -u XDG_CONFIG_HOME -u XDG_CACHE_HOME -u XDG_STATE_HOME -u CLAUDE_CONFIG_DIR HOME="$CLI_HOME" \
+              bash -c 'set -o pipefail; curl -fsSL https://claude.ai/install.sh | bash -s -- "$1"' _ "$VERSION" && break
+            echo "claude-cli pre-install: attempt $ATTEMPT failed"
+            [ "$ATTEMPT" -lt 3 ] && sleep 5
+          done
+          BIN="$CLI_HOME/.local/bin/claude"
+          [ -x "$BIN" ] || fall_back "the installer left no executable at $BIN"
+          GOT="$(env HOME="$CLI_HOME" "$BIN" --version 2>/dev/null | head -n 1)" || true
+          case "$GOT" in
+            "$VERSION"*) ;;
+            *) fall_back "$BIN reports '$GOT', not the pinned $VERSION" ;;
+          esac
+          echo "path=$BIN" >> "$GITHUB_OUTPUT"
+          echo "claude-cli pre-install: $GOT at $BIN (installer HOME was $CLI_HOME)"
+
+      - name: CI headless-rule hooks (--settings, only when vended)
+        # The step the callables get. The hooks are insurance, so a missing file adds nothing to
+        # claude_args and never fails the job. Never pass the action's `settings` input instead: the
+        # action saves that into the runner user's settings, where it outlives the job.
+        id: ci-hooks
+        shell: bash
+        run: |
+          FILE=".fleet-ci/ci/_fleet/ci-hooks/settings.json"
+          if [ -f "$FILE" ]; then
+            echo "args=--settings $FILE" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::CI headless-rule hooks not loaded: $FILE is missing"
+          fi
+
+      - name: Hash the runner user's settings.json (before)
+        id: before
+        shell: python3 {0}
+        run: |
+          import hashlib, json, os, pathlib
+
+          path = pathlib.Path.home() / ".claude" / "settings.json"
+          raw = path.read_bytes() if path.is_file() else None
+
+          def canonical(obj):
+              return hashlib.sha256(json.dumps(obj, sort_keys=True).encode()).hexdigest()
+
+          # What the action's own write should leave behind: the same JSON plus its one key. A file it
+          # can't parse it replaces outright, which loses content, so no change to one is expected.
+          expected, keys = None, {}
+          try:
+              text = (raw or b"").decode("utf-8")
+              current = json.loads(text) if text.strip() else {}
+              expected = canonical({**current, "enableAllProjectMcpServers": True})
+              keys = {key: canonical(value) for key, value in current.items()}
+          except (ValueError, TypeError):
+              print("::warning::the runner user's settings.json is not a JSON object")
+
+          state = {"sha": hashlib.sha256(raw).hexdigest() if raw is not None else None,
+                   "expected": expected, "keys": keys}
+          print("before:", f"sha256 {state['sha']}" if raw is not None else "no file")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+              f.write(f"state={json.dumps(state)}\n")
+
+      - name: Run claude-code-action
+        id: agent
+        if: steps.ci-hooks.outputs.args != ''
+        continue-on-error: true # the verdict step reads what happened
+        timeout-minutes: 8
+        uses: anthropics/claude-code-action@v1
+        with:
+          path_to_claude_code_executable: ${{ steps.claude-cli.outputs.path }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ github.token }}
+          prompt: |
+            This is a test of a CI hook. Make exactly one Bash tool call: the command `echo hook-probe`,
+            with the tool's `run_in_background` parameter set to true. A hook is expected to refuse it.
+            The refusal is the result being tested, so do not retry, do not run it any other way, and do
+            not call any other tool. Then stop.
+          claude_args: |
+            --model claude-sonnet-5-5
+            --max-turns 3
+            --include-hook-events
+            --allowedTools Bash
+            ${{ steps.ci-hooks.outputs.args }}
+
+      - name: Verdict (hash the runner user's settings.json after)
+        if: always()
+        shell: python3 {0}
+        env:
+          LABEL: ${{ join(matrix.runs_on, ' ') }}
+          RUNNER: ${{ runner.name }}
+          HOOKS_ARGS: ${{ steps.ci-hooks.outputs.args }}
+          BEFORE: ${{ steps.before.outputs.state }}
+          AGENT_OUTCOME: ${{ steps.agent.outcome }}
+          EXECUTION_FILE: ${{ steps.agent.outputs.execution_file }}
+        run: |
+          import hashlib, json, os, pathlib, sys
+
+          RULE = "CI headless rule"
+
+          def short(text, limit=200):
+              text = " ".join(str(text).split())
+              return text if len(text) <= limit else text[:limit] + "…"
+
+          def canonical(obj):
+              return hashlib.sha256(json.dumps(obj, sort_keys=True).encode()).hexdigest()
+
+          def judge_settings():
+              if not os.environ["BEFORE"]:
+                  return "INCONCLUSIVE", "not hashed before the agent step"
+              before = json.loads(os.environ["BEFORE"])
+              path = pathlib.Path.home() / ".claude" / "settings.json"
+              raw = path.read_bytes() if path.is_file() else None
+              sha = hashlib.sha256(raw).hexdigest() if raw is not None else None
+              name = lambda value: f"sha256 {value[:12]}" if value else "no file"
+              change = f"before {name(before['sha'])}, after {name(sha)}"
+
+              if raw is not None and (b"ci_headless" in raw or b"ci-hooks" in raw):
+                  return "FAIL", f"the file names the CI hooks ({change})"
+              if sha == before["sha"]:
+                  return "PASS", f"byte-identical ({name(sha)})"
+              if raw is None:
+                  return "FAIL", f"the file was removed ({change})"
+              try:
+                  after = json.loads(raw.decode("utf-8"))
+                  after_hash = canonical(after)
+              except ValueError:
+                  return "FAIL", f"the file is no longer JSON ({change})"
+              if before["expected"] and after_hash == before["expected"]:
+                  what = "created it" if before["sha"] is None else "rewrote it"
+                  return "PASS", (f"not byte-identical, only the action's own write, which {what}: the same JSON "
+                                  f"plus enableAllProjectMcpServers ({change})")
+              keys = ({key: canonical(value) for key, value in after.items()}
+                      if isinstance(after, dict) else {})
+              differing = sorted(k for k in set(keys) | set(before["keys"])
+                                 if keys.get(k) != before["keys"].get(k))
+              return "FAIL", f"changed beyond the action's own write ({change}; top-level keys: {differing})"
+
+          def load_transcript():
+              if os.environ["AGENT_OUTCOME"] in ("", "skipped"):
+                  return []
+              fallback = pathlib.Path(os.environ["RUNNER_TEMP"]) / "claude-execution-output.json"
+              try:
+                  data = json.loads(pathlib.Path(os.environ["EXECUTION_FILE"] or fallback)
+                                    .read_text(encoding="utf-8"))
+                  return [m for m in data if isinstance(m, dict)]
+              except (OSError, ValueError, TypeError):
+                  return []
+
+          def blocks(messages, kind):
+              for m in messages:
+                  content = (m.get("message") or {}).get("content")
+                  if isinstance(content, list):
+                      yield from (b for b in content if isinstance(b, dict) and b.get("type") == kind)
+
+          def judge_hook(messages):
+              if not os.environ["HOOKS_ARGS"]:
+                  return "INCONCLUSIVE", "the vended settings.json is missing, so the agent step was skipped"
+              if not messages:
+                  return "INCONCLUSIVE", (f"no transcript (agent step: {os.environ['AGENT_OUTCOME'] or 'not run'}); "
+                                          "read that step's log")
+              probes = {b.get("id") for b in blocks(messages, "tool_use")
+                        if b.get("name") == "Bash" and (b.get("input") or {}).get("run_in_background") is True}
+              if not probes:
+                  return "INCONCLUSIVE", "the agent made no Bash call with run_in_background: true"
+              results = [b for b in blocks(messages, "tool_result") if b.get("tool_use_id") in probes]
+              if not results:
+                  return "INCONCLUSIVE", "the transcript has no result for the background Bash call"
+              if any(not b.get("is_error") for b in results):
+                  return "FAIL", "a Bash call with run_in_background: true ran; nothing blocked it"
+
+              responses = [m for m in messages if m.get("type") == "system"
+                           and m.get("subtype") == "hook_response" and m.get("hook_event") == "PreToolUse"]
+              for m in responses:
+                  said = f"{m.get('stderr') or ''}\n{m.get('output') or ''}"
+                  if m.get("exit_code") == 2 and RULE in said:
+                      if any(RULE in json.dumps(b.get("content")) for b in results):
+                          quote = short(said[said.index(RULE):], 90)
+                          return "PASS", f"{m.get('hook_name')} blocked the background call, exit 2: '{quote}'"
+              return "FAIL", (f"the call was refused, but not by a PreToolUse hook_response with exit 2 and "
+                              f"'{RULE}' ({len(responses)} PreToolUse response(s)): "
+                              f"'{short(results[0].get('content'))}'")
+
+          def guarded(judge, *args):
+              try:
+                  return judge(*args)
+              except Exception as e:  # a judge bug must not read as an answer
+                  return "INCONCLUSIVE", f"the verdict step failed: {short(repr(e))}"
+
+          messages = load_transcript()
+          init = next((m for m in messages if m.get("type") == "system" and m.get("subtype") == "init"), {})
+          hook, hook_evidence = guarded(judge_hook, messages)
+          settings, settings_evidence = guarded(judge_settings)
+
+          states = {hook, settings}
+          verdict = "FAIL" if "FAIL" in states else "INCONCLUSIVE" if "INCONCLUSIVE" in states else "PASS"
+          line = (f"ci-hooks on {os.environ['LABEL']} ({os.environ['RUNNER']}): {verdict} — "
+                  f"hook: {hook_evidence}; user settings: {settings_evidence}; "
+                  f"CLI {init.get('claude_code_version', 'version unknown')}")
+          line = " ".join(line.split())
+          print(line)
+          print(f"::{'notice' if verdict == 'PASS' else 'error'}::{line}")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
+              f.write(f"```text\n{line}\n```\n")
+          sys.exit(0 if verdict == "PASS" else 1)
