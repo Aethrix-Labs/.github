@@ -162,6 +162,22 @@ jobs:
           echo "path=$BIN" >> "$GITHUB_OUTPUT"
           echo "claude-cli pre-install: $GOT at $BIN (installer HOME was $CLI_HOME)"
 
+      - name: CI headless-rule hooks (--settings, only when vended)
+        # The fleet's CI hooks (STANDARDS §19.7 rule 2). Every agent step in this job adds `args` to its
+        # claude_args. The hooks are insurance, so a missing file adds nothing, with a ::warning::, and
+        # never fails the job. Never use the action's `settings` input instead: the action saves that into
+        # the runner user's settings, where it outlives the job. Same step in every callable that runs
+        # claude-code-action: change them together.
+        id: ci-hooks
+        shell: bash
+        run: |
+          FILE=".fleet-ci/ci/_fleet/ci-hooks/settings.json"
+          if [ -f "$FILE" ]; then
+            echo "args=--settings $FILE" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::CI headless-rule hooks not loaded: $FILE is missing"
+          fi
+
       - name: Run e2e-nominate agent
         id: agent
         if: steps.vend.outputs.vended == 'true'
@@ -208,6 +224,7 @@ jobs:
             --effort high
             --max-turns ${{ env.AGENT_MAX_TURNS }}
             --allowedTools Read,Bash,Write,Edit,Glob,Grep
+            ${{ steps.ci-hooks.outputs.args }}
             # --max-turns 120 is an unmeasured estimate: up to 10 judge dispatches, plus
             # nominating, plus ci-commit. Revisit once a completed run reports num_turns.
 
@@ -428,6 +445,22 @@ jobs:
           echo "path=$BIN" >> "$GITHUB_OUTPUT"
           echo "claude-cli pre-install: $GOT at $BIN (installer HOME was $CLI_HOME)"
 
+      - name: CI headless-rule hooks (--settings, only when vended)
+        # The fleet's CI hooks (STANDARDS §19.7 rule 2). Every agent step in this job adds `args` to its
+        # claude_args. The hooks are insurance, so a missing file adds nothing, with a ::warning::, and
+        # never fails the job. Never use the action's `settings` input instead: the action saves that into
+        # the runner user's settings, where it outlives the job. Same step in every callable that runs
+        # claude-code-action: change them together.
+        id: ci-hooks
+        shell: bash
+        run: |
+          FILE=".fleet-ci/ci/_fleet/ci-hooks/settings.json"
+          if [ -f "$FILE" ]; then
+            echo "args=--settings $FILE" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::CI headless-rule hooks not loaded: $FILE is missing"
+          fi
+
       - name: Run e2e-removal-sweep agent
         id: agent
         if: steps.approved.outputs.any == 'true'
@@ -466,6 +499,7 @@ jobs:
             --effort medium
             --max-turns ${{ env.AGENT_MAX_TURNS }}
             --allowedTools Read,Bash,Write,Edit,Glob,Grep
+            ${{ steps.ci-hooks.outputs.args }}
             # --max-turns 80 is an unmeasured estimate: per-spec grep for registrations and
             # helpers, playwright --list, two commits and the PR. Revisit once a completed run
             # reports num_turns.

@@ -584,6 +584,22 @@ jobs:
           echo "path=$BIN" >> "$GITHUB_OUTPUT"
           echo "claude-cli pre-install: $GOT at $BIN (installer HOME was $CLI_HOME)"
 
+      - name: CI headless-rule hooks (--settings, only when vended)
+        # The fleet's CI hooks (STANDARDS §19.7 rule 2). Every agent step in this job adds `args` to its
+        # claude_args. The hooks are insurance, so a missing file adds nothing, with a ::warning::, and
+        # never fails the job. Never use the action's `settings` input instead: the action saves that into
+        # the runner user's settings, where it outlives the job. Same step in every callable that runs
+        # claude-code-action: change them together.
+        id: ci-hooks
+        shell: bash
+        run: |
+          FILE=".fleet-ci/ci/_fleet/ci-hooks/settings.json"
+          if [ -f "$FILE" ]; then
+            echo "args=--settings $FILE" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::CI headless-rule hooks not loaded: $FILE is missing"
+          fi
+
       - name: Start the GitHub token re-minter (fresh-token.sh serve)
         # The runner half of fleet DECISIONS 2026-10-17 "Implementer publishes with a re-minted GitHub
         # token" (STANDARDS §9 "Credential lifetime"). claude-code-action exchanges the job's OIDC
@@ -844,6 +860,9 @@ jobs:
           # is the CLI's behavior, not something the action's source settles. Set it here so it does not
           # depend on that. It is the runner's own value, not a secret.
           RUNNER_TEMP: ${{ runner.temp }}
+          # The CI Stop hook (ci-hooks) refuses the agent's first stop while this file is missing. Live
+          # mode only: a shadow run reports for itself and writes no outcome file.
+          FLEET_CI_OUTCOME_FILE: ${{ steps.preflight.outputs.mode == 'live' && format('{0}/implementer-outcome.json', runner.temp) || '' }}
         with:
           # Set by the pre-install step above; empty means it fell back and the action installs itself.
           path_to_claude_code_executable: ${{ steps.claude-cli.outputs.path }}
@@ -873,6 +892,7 @@ jobs:
             --effort ${{ inputs.effort }}
             --max-turns ${{ env.AGENT_MAX_TURNS }}
             --allowedTools Read,Bash,Write,Edit,Glob,Grep
+            ${{ steps.ci-hooks.outputs.args }}
 
       - name: Send the implementer's run-completed and tick-report (report.mjs send)
         id: report

@@ -261,6 +261,22 @@ jobs:
           echo "path=$BIN" >> "$GITHUB_OUTPUT"
           echo "claude-cli pre-install: $GOT at $BIN (installer HOME was $CLI_HOME)"
 
+      - name: CI headless-rule hooks (--settings, only when vended)
+        # The fleet's CI hooks (STANDARDS §19.7 rule 2). Every agent step in this job adds `args` to its
+        # claude_args. The hooks are insurance, so a missing file adds nothing, with a ::warning::, and
+        # never fails the job. Never use the action's `settings` input instead: the action saves that into
+        # the runner user's settings, where it outlives the job. Same step in every callable that runs
+        # claude-code-action: change them together.
+        id: ci-hooks
+        shell: bash
+        run: |
+          FILE=".fleet-ci/ci/_fleet/ci-hooks/settings.json"
+          if [ -f "$FILE" ]; then
+            echo "args=--settings $FILE" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::CI headless-rule hooks not loaded: $FILE is missing"
+          fi
+
       # ---- Doc reconciliation (Sonnet, every day, unconditional), STANDARDS §24.2.
       # Runs regardless of signals-pending vs. idle — only pre-build (nothing
       # shipped yet, no reconciliation target) and the master switch gate it. ----
@@ -306,6 +322,7 @@ jobs:
             --effort ${{ inputs.doc_reconciliation_effort }}
             --max-turns ${{ env.DOC_RECONCILIATION_MAX_TURNS }}
             --allowedTools Read,Bash,Write,Edit,Glob,Grep
+            ${{ steps.ci-hooks.outputs.args }}
 
       # Snapshot steps (one after each agent step): move this agent step's result object to its
       # own per-step path, so the default path is EMPTY before the next agent step runs. A copy
@@ -382,6 +399,7 @@ jobs:
             --effort ${{ inputs.recommender_effort }}
             --max-turns ${{ env.RECOMMENDER_MAX_TURNS }}
             --allowedTools Read,Bash,Glob,Grep
+            ${{ steps.ci-hooks.outputs.args }}
 
       # See the doc-reconciliation snapshot step's note.
       - name: Snapshot recommender result (calibration)
@@ -448,6 +466,7 @@ jobs:
             --effort ${{ inputs.proposer_effort }}
             --max-turns ${{ env.PROPOSER_MAX_TURNS }}
             --allowedTools Read,Bash,Glob,Grep
+            ${{ steps.ci-hooks.outputs.args }}
 
       # See the doc-reconciliation snapshot step's note. The proposer is the last agent step, so
       # nothing would overwrite its result, but it is snapshotted the same way so all three
