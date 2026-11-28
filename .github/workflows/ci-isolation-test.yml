@@ -1,0 +1,503 @@
+name: CI agent isolation (test)
+
+# Does a CI agent session stay clear of the runner user's own Claude config? The fleet-mac runners run
+# as the Mac's logged-in user, so every agent step there loaded that user's ~/.claude/settings.json,
+# and with it the interactive fleet-skills plugin (STANDARDS §19.7: CI never loads it). The fix under
+# test is what the callables will pass: --setting-sources project,local, plus a --settings file with the
+# vended CI hooks and `claudeMdExcludes` for every directory above the checkout.
+# The verdicts are recorded in fleet-command-center's DECISIONS.md, before the callables are wired.
+#
+# One job per runner, two agent sessions each:
+#   CONTROL  the claude_args from before the fix, one turn, no tool. It shows what this runner's config
+#            would put into a session, so a PASS can't come from there being nothing to drop.
+#   FIXED    the callables' own step and flags. The agent makes one `Agent` call with
+#            `run_in_background: true`.
+# Each job ends in one line, also written to the step summary:
+#
+#   ci-isolation on <label> (<runner>): PASS | FAIL | INCONCLUSIVE — (a) …; (b) …; (c) …; (d) …
+#
+# PASS needs all four:
+#   (a) THE CI HOOK STILL BLOCKS: a PreToolUse `hook_response` with exit 2 and "CI headless rule", and an
+#       error result on the backgrounded Agent call carrying it.
+#   (b) NO INTERACTIVE PLUGIN: the FIXED session's init record lists no plugin but the CLI's built-in
+#       ones and no `fleet-skills:*` skill, command or agent, and its only hook events are the CI hooks'
+#       (at most one PreToolUse per Agent or Bash call, and Stop). Where the runner user's settings
+#       enable fleet-skills, CONTROL must have loaded it, or (b) is INCONCLUSIVE.
+#   (c) THE RUNNER USER'S SETTINGS ARE UNTOUCHED: ~/.claude/settings.json is byte-identical from before
+#       CONTROL to after FIXED. The one exception is a runner with no such file (ubuntu-latest), where
+#       the action creates one holding only `enableAllProjectMcpServers`. The action rewrites the file on
+#       every run (fleet SELF_HOSTED_RUNNER.md), so on a runner whose file lacks that key, or after
+#       another job or a desktop session wrote to it, this fails: the line says which, so re-run once.
+#   (d) NO INSTRUCTION FILE FROM ABOVE THE CHECKOUT: an `InstructionsLoaded` hook records each CLAUDE.md
+#       and rules file a session loads. FIXED must load the checkout's CLAUDE.md and nothing outside the
+#       checkout. --setting-sources alone does not do this: the CLI walks up from the checkout, through
+#       the runner user's HOME. So that (d) can't pass on a runner with no such file, the job plants two
+#       marker files in the checkout's parent (the runner's own _work/<repo>/, never ~/.claude), which
+#       CONTROL must load. The line also names any other file above the checkout that CONTROL loaded.
+# INCONCLUSIVE means a check was never exercised (no agent run, no background call, a control that proved
+# nothing). Re-run.
+#
+# WHERE IT CAN RUN. All three runners only from a PRIVATE repo, as a reusable workflow: this repo is
+# public and the org's runner group has allows_public_repositories=false, so a self-hosted job from here
+# never starts. A private repo with this thin caller on its default branch works (one dispatch, three
+# jobs). `fleet-mac` is started by hand, so check it is online first, or that job just queues. The
+# caller repo must have no hooks of its own in .claude/, which would show up under (b).
+#
+#   on: { workflow_dispatch: {} }
+#   permissions: { contents: read }
+#   jobs:
+#     test:
+#       uses: Aethrix-Labs/.github/.github/workflows/ci-isolation-test.yml@main
+#       secrets: inherit
+#
+# Dispatched from this repo's own Actions tab it runs the ubuntu-latest job only. THAT LOG IS PUBLIC:
+# nothing prints or uploads a transcript, the vended files or the runner's settings (hashes, plugin ids
+# and instruction-file paths only), and show_full_output stays off. Don't re-run it with debug logging.
+# In any repo, the action itself prints an EXISTING ~/.claude/settings.json to the log.
+#
+# As in ci-hooks-test.yml, `github_token` is passed, which skips the action's OIDC exchange (so no
+# `id-token: write`), and the action refuses bot actors, so a person dispatches this.
+
+on:
+  workflow_call:
+    inputs:
+      runners:
+        description: "JSON array of runs-on arrays, one job each."
+        type: string
+        required: false
+        default: '[["ubuntu-latest"],["self-hosted","fleet"],["self-hosted","fleet-mac"]]'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  isolation:
+    name: ci-isolation on ${{ join(matrix.runs_on, ' ') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # `inputs.runners` is empty only on a dispatch from this repo, which can reach ubuntu-latest only.
+        runs_on: ${{ fromJSON(inputs.runners || '[["ubuntu-latest"]]') }}
+    runs-on: ${{ matrix.runs_on }}
+    timeout-minutes: 25
+    steps:
+      # The action configures git in the workspace, so give it a checkout like every callable does.
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4 # the vended hooks, from the same place the callables get them
+        with:
+          repository: Aethrix-Labs/fleet-skills
+          path: .fleet-ci
+          ref: main
+          token: ${{ secrets.FLEET_SKILLS_PAT }}
+          persist-credentials: false
+
+      - name: Install Claude Code CLI (job-private HOME)
+        # The same script as in every callable that runs claude-code-action (see the comment on it in
+        # implementer-callable.yml). Without it the action installs the CLI into the runner user's real
+        # HOME, and the test would not run the CLI the way the callables do.
+        id: claude-cli
+        continue-on-error: true
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          CLI_HOME="$RUNNER_TEMP/claude-cli-home"
+          PIN_SRC="$RUNNER_WORKSPACE/../_actions/anthropics/claude-code-action/v1/src/entrypoints/run.ts"
+          fall_back() {
+            echo "::warning::claude-cli pre-install skipped: $1. claude-code-action will install the CLI itself into the shared ~/.claude/downloads, where a concurrent job can make that fail with 'Checksum verification failed'."
+            exit 0
+          }
+          VERSION="$(sed -n 's/.*claudeCodeVersion = "\([0-9][0-9.]*\)".*/\1/p' "$PIN_SRC" 2>/dev/null | head -n 1)" || VERSION=""
+          [ -n "$VERSION" ] || fall_back "could not read the pinned CLI version from $PIN_SRC"
+          rm -rf "$CLI_HOME"
+          mkdir -p "$CLI_HOME" || fall_back "could not create $CLI_HOME"
+          for ATTEMPT in 1 2 3; do
+            env -u XDG_DATA_HOME -u XDG_CONFIG_HOME -u XDG_CACHE_HOME -u XDG_STATE_HOME -u CLAUDE_CONFIG_DIR HOME="$CLI_HOME" \
+              bash -c 'set -o pipefail; curl -fsSL https://claude.ai/install.sh | bash -s -- "$1"' _ "$VERSION" && break
+            echo "claude-cli pre-install: attempt $ATTEMPT failed"
+            [ "$ATTEMPT" -lt 3 ] && sleep 5
+          done
+          BIN="$CLI_HOME/.local/bin/claude"
+          [ -x "$BIN" ] || fall_back "the installer left no executable at $BIN"
+          GOT="$(env HOME="$CLI_HOME" "$BIN" --version 2>/dev/null | head -n 1)" || true
+          case "$GOT" in
+            "$VERSION"*) ;;
+            *) fall_back "$BIN reports '$GOT', not the pinned $VERSION" ;;
+          esac
+          echo "path=$BIN" >> "$GITHUB_OUTPUT"
+          echo "claude-cli pre-install: $GOT at $BIN (installer HOME was $CLI_HOME)"
+
+      - name: CI agent settings (the CI hooks; no instruction files from above the checkout)
+        # THE STEP UNDER TEST, as the callables get it. Keep the script identical to theirs.
+        id: ci-hooks
+        shell: python3 {0}
+        run: |
+          import json, os, pathlib
+
+          vended = pathlib.Path(".fleet-ci/ci/_fleet/ci-hooks/settings.json")
+          try:
+              settings = json.loads(vended.read_text(encoding="utf-8"))
+              if not isinstance(settings, dict):
+                  raise ValueError("not a JSON object")
+          except (OSError, ValueError) as e:
+              print(f"::warning::CI headless-rule hooks not loaded: {vended}: {e}")
+              settings = {}
+
+          settings["claudeMdExcludes"] = settings.get("claudeMdExcludes", []) + [
+              str(above / name)
+              for above in pathlib.Path(os.environ["GITHUB_WORKSPACE"]).parents
+              for name in ("CLAUDE.md", "CLAUDE.local.md", ".claude/CLAUDE.md", ".claude/rules/**")
+          ]
+
+          out = pathlib.Path(os.environ["RUNNER_TEMP"]) / "ci-agent-settings.json"
+          out.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+              f.write(f'args=--settings "{out}"\n')
+
+      - name: Hash the runner user's settings.json (before both sessions)
+        id: before
+        shell: python3 {0}
+        run: |
+          import hashlib, json, os, pathlib
+
+          path = pathlib.Path.home() / ".claude" / "settings.json"
+          raw = path.read_bytes() if path.is_file() else None
+
+          def canonical(obj):
+              return hashlib.sha256(json.dumps(obj, sort_keys=True).encode()).hexdigest()
+
+          # `expected` is what the action's own write leaves behind (the same JSON plus its one key),
+          # so a failed (c) can say whether that write is the whole difference.
+          expected, enabled = None, []
+          try:
+              text = (raw or b"").decode("utf-8")
+              current = json.loads(text) if text.strip() else {}
+              expected = canonical({**current, "enableAllProjectMcpServers": True})
+              plugins = current.get("enabledPlugins") or {}
+              enabled = sorted(k for k, on in plugins.items() if on)
+          except (ValueError, TypeError, AttributeError):
+              print("::warning::the runner user's settings.json is not the expected JSON")
+
+          state = {"sha": hashlib.sha256(raw).hexdigest() if raw is not None else None,
+                   "expected": expected, "enabled": enabled}
+          print("before:", f"sha256 {state['sha']}" if raw is not None else "no file")
+          print("plugins the user settings enable:", ", ".join(enabled) or "none")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+              f.write(f"state={json.dumps(state)}\n")
+
+      - name: Plant the markers and the load recorder
+        # Two marker files above the checkout, for CONTROL to find and FIXED to skip; a checkout CLAUDE.md
+        # if the repo has none; and the InstructionsLoaded hook, in the checkout's local settings, which
+        # both sessions read. Never overwrites a file this workflow didn't write.
+        id: plant
+        shell: python3 {0}
+        run: |
+          import json, os, pathlib
+
+          MARK = "ci-isolation-test marker"
+          workspace = pathlib.Path(os.environ["GITHUB_WORKSPACE"])
+          work = pathlib.Path(os.environ["RUNNER_TEMP"]) / "ci-isolation"
+          work.mkdir(parents=True, exist_ok=True)
+          for stale in work.iterdir():
+              stale.unlink()
+          log = work / "instructions.jsonl"
+          planted = []
+
+          def plant(path, text):
+              if path.exists() and "ci-isolation" not in path.read_text(encoding="utf-8", errors="replace"):
+                  raise SystemExit(f"::error::{path} exists and is not this test's; not overwriting it")
+              path.parent.mkdir(parents=True, exist_ok=True)
+              path.write_text(text, encoding="utf-8")
+              planted.append(str(path))
+              (work / "planted.json").write_text(json.dumps(planted), encoding="utf-8")
+
+          above = [workspace.parent / "CLAUDE.md",
+                   workspace.parent / ".claude" / "rules" / "ci-isolation-canary.md"]
+          for path in above:
+              plant(path, f"{MARK}. It asks for nothing.\n")
+          if not any((workspace / name).is_file() for name in ("CLAUDE.md", ".claude/CLAUDE.md")):
+              plant(workspace / "CLAUDE.md", f"{MARK}. It asks for nothing.\n")
+          recorder = {"type": "command", "command": f'{{ cat; echo; }} >> "{log}"'}
+          plant(workspace / ".claude" / "settings.local.json",
+                json.dumps({"hooks": {"InstructionsLoaded": [{"hooks": [recorder]}]}}))
+          print("planted:", *planted, sep="\n  ")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+              f.write(f"above={json.dumps([str(p) for p in above])}\n")
+
+      - name: CONTROL session (the claude_args from before the fix)
+        id: control
+        if: steps.plant.outcome == 'success' && hashFiles('.fleet-ci/ci/_fleet/ci-hooks/settings.json') != ''
+        continue-on-error: true # the verdict step reads what happened
+        timeout-minutes: 6
+        uses: anthropics/claude-code-action@v1
+        with:
+          path_to_claude_code_executable: ${{ steps.claude-cli.outputs.path }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ github.token }}
+          prompt: |
+            This is a test of CI configuration. Reply with the single word `ok`. Call no tool.
+          claude_args: |
+            --model claude-sonnet-5-5
+            --max-turns 1
+            --settings .fleet-ci/ci/_fleet/ci-hooks/settings.json
+
+      - name: Keep CONTROL's records
+        # Both sessions write the same execution file and load log, so move CONTROL's aside: a FIXED
+        # session that never ran must not be judged on them.
+        if: always() && steps.plant.outcome == 'success'
+        shell: bash
+        env:
+          EXECUTION_FILE: ${{ steps.control.outputs.execution_file }}
+        run: |
+          WORK="$RUNNER_TEMP/ci-isolation"
+          if [ -n "$EXECUTION_FILE" ] && [ -f "$EXECUTION_FILE" ]; then
+            mv "$EXECUTION_FILE" "$WORK/control-execution.json"
+          fi
+          rm -f "$RUNNER_TEMP/claude-execution-output.json"
+          if [ -f "$WORK/instructions.jsonl" ]; then
+            mv "$WORK/instructions.jsonl" "$WORK/control-instructions.jsonl"
+          fi
+
+      - name: FIXED session (the callables' flags)
+        id: agent
+        if: steps.plant.outcome == 'success' && hashFiles('.fleet-ci/ci/_fleet/ci-hooks/settings.json') != ''
+        continue-on-error: true # the verdict step reads what happened
+        timeout-minutes: 8
+        uses: anthropics/claude-code-action@v1
+        with:
+          path_to_claude_code_executable: ${{ steps.claude-cli.outputs.path }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ github.token }}
+          prompt: |
+            This is a test of a CI hook. Make exactly one tool call: the `Agent` tool, with
+            `subagent_type` set to `general-purpose`, `description` set to `probe`, `prompt` set to
+            `Reply with the word ok.`, and `run_in_background` set to true. A hook is expected to refuse
+            it. The refusal is the result being tested, so do not retry, do not make the call any other
+            way, and do not call any other tool. Then stop.
+          claude_args: |
+            --model claude-sonnet-5-5
+            --max-turns 3
+            --include-hook-events
+            --allowedTools Agent
+            --setting-sources project,local
+            ${{ steps.ci-hooks.outputs.args }}
+
+      - name: Verdict (hash the runner user's settings.json after)
+        if: always()
+        shell: python3 {0}
+        env:
+          LABEL: ${{ join(matrix.runs_on, ' ') }}
+          RUNNER: ${{ runner.name }}
+          BEFORE: ${{ steps.before.outputs.state }}
+          ABOVE: ${{ steps.plant.outputs.above }}
+          CONTROL_OUTCOME: ${{ steps.control.outcome }}
+          AGENT_OUTCOME: ${{ steps.agent.outcome }}
+          EXECUTION_FILE: ${{ steps.agent.outputs.execution_file }}
+        run: |
+          import hashlib, json, os, pathlib, sys
+
+          RULE = "CI headless rule"
+          WORK = pathlib.Path(os.environ["RUNNER_TEMP"]) / "ci-isolation"
+
+          def short(text, limit=200):
+              text = " ".join(str(text).split())
+              return text if len(text) <= limit else text[:limit] + "…"
+
+          def listed(items, limit=8):
+              items = sorted(set(items))
+              more = f" and {len(items) - limit} more" if len(items) > limit else ""
+              return ", ".join(items[:limit]) + more
+
+          def canonical(obj):
+              return hashlib.sha256(json.dumps(obj, sort_keys=True).encode()).hexdigest()
+
+          def load_transcript(path):
+              try:
+                  data = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+                  return [m for m in data if isinstance(m, dict)]
+              except (OSError, ValueError, TypeError):
+                  return []
+
+          def init_of(messages):
+              return next((m for m in messages if m.get("type") == "system" and m.get("subtype") == "init"), None)
+
+          def blocks(messages, kind):
+              for m in messages:
+                  message = m.get("message")
+                  content = message.get("content") if isinstance(message, dict) else None
+                  if isinstance(content, list):
+                      yield from (b for b in content if isinstance(b, dict) and b.get("type") == kind)
+
+          def hook_responses(messages):
+              return [m for m in messages if m.get("type") == "system" and m.get("subtype") == "hook_response"]
+
+          def judge_hook(messages):
+              if not messages:
+                  return "INCONCLUSIVE", (f"no FIXED transcript (step: {os.environ['AGENT_OUTCOME'] or 'not run'}); "
+                                          "read that step's log")
+              probes = {b.get("id") for b in blocks(messages, "tool_use")
+                        if b.get("name") in ("Agent", "Task")
+                        and (b.get("input") or {}).get("run_in_background") is True}
+              if not probes:
+                  return "INCONCLUSIVE", "the agent made no Agent call with run_in_background: true"
+              results = [b for b in blocks(messages, "tool_result") if b.get("tool_use_id") in probes]
+              if not results:
+                  return "INCONCLUSIVE", "the transcript has no result for the backgrounded Agent call"
+              if any(not b.get("is_error") for b in results):
+                  return "FAIL", "a backgrounded Agent call ran; nothing blocked it"
+              for m in hook_responses(messages):
+                  said = f"{m.get('stderr') or ''}\n{m.get('output') or ''}"
+                  if m.get("hook_event") == "PreToolUse" and m.get("exit_code") == 2 and RULE in said:
+                      if any(RULE in json.dumps(b.get("content")) for b in results):
+                          return "PASS", f"{m.get('hook_name')} blocked the backgrounded Agent call, exit 2"
+              return "FAIL", ("the call was refused, but not by a PreToolUse hook_response with exit 2 and "
+                              f"'{RULE}': '{short(results[0].get('content'))}'")
+
+          def plugins_of(init):
+              return [str(p.get("source") or p.get("name")) for p in init.get("plugins") or []
+                      if not str(p.get("source", "")).endswith("@builtin")]
+
+          def judge_plugins(messages, control):
+              init, control_init = init_of(messages), init_of(control)
+              if not init or "plugins" not in init or "skills" not in init:
+                  return "INCONCLUSIVE", "the FIXED session left no init record with plugins and skills"
+              loaded = plugins_of(init)
+              if loaded:
+                  return "FAIL", f"the FIXED session loaded plugin(s): {listed(loaded)}"
+              named = [str(n) for key in ("skills", "slash_commands", "agents")
+                       for n in init.get(key) or [] if str(n).startswith("fleet-skills:")]
+              if named:
+                  return "FAIL", f"the FIXED session lists {listed(named)}"
+              # The CI hooks answer each Agent or Bash call at most once, plus Stop. A second answer to one
+              # call, or any other event, is someone else's hook. Counted per call, because the block's
+              # own message asks for a retry, and a model may make one despite the prompt.
+              events = [str(m.get("hook_name")) for m in hook_responses(messages)]
+              calls = [f"PreToolUse:{b.get('name')}" for b in blocks(messages, "tool_use")
+                       if b.get("name") in ("Agent", "Task", "Bash")]
+              extra = [e for e in set(events) if e != "Stop" and events.count(e) > calls.count(e)]
+              if extra:
+                  return "FAIL", f"hooks ran besides the CI hooks: {', '.join(events)}"
+
+              enabled = json.loads(os.environ["BEFORE"] or "{}").get("enabled", [])
+              if not control_init:
+                  return "INCONCLUSIVE", (f"CONTROL left no init record (step: {os.environ['CONTROL_OUTCOME'] or 'not run'}), "
+                                          "so what this runner would have loaded is unknown")
+              had = plugins_of(control_init)
+              if any(p.startswith("fleet-skills@") for p in enabled) and not any(p.startswith("fleet-skills@") for p in had):
+                  return "INCONCLUSIVE", "the user settings enable fleet-skills, but CONTROL didn't load it"
+              nothing = "no plugin, no fleet-skills:* name, no hook but the CI hooks'"
+              if had:
+                  return "PASS", f"{nothing}; CONTROL loaded {listed(had)}"
+              return "PASS", f"{nothing}; CONTROL loaded no plugin either, so this runner had none to drop"
+
+          def judge_settings():
+              if not os.environ["BEFORE"]:
+                  return "INCONCLUSIVE", "not hashed before the sessions"
+              before = json.loads(os.environ["BEFORE"])
+              path = pathlib.Path.home() / ".claude" / "settings.json"
+              raw = path.read_bytes() if path.is_file() else None
+              sha = hashlib.sha256(raw).hexdigest() if raw is not None else None
+              name = lambda value: f"sha256 {value[:12]}" if value else "no file"
+              change = f"before {name(before['sha'])}, after {name(sha)}"
+              if sha == before["sha"]:
+                  return "PASS", f"{path} byte-identical ({name(sha)})"
+              if raw is None:
+                  return "FAIL", f"{path} was removed ({change})"
+              try:
+                  after = canonical(json.loads(raw.decode("utf-8")))
+              except ValueError:
+                  return "FAIL", f"{path} is no longer JSON ({change})"
+              own_write = before["expected"] == after
+              if own_write and before["sha"] is None:
+                  return "PASS", f"no file before; the action created one holding only its own key ({name(sha)})"
+              if own_write:
+                  return "FAIL", (f"{path} is not byte-identical; the JSON differs only by the action's own write "
+                                  f"({change}). Re-run once")
+              return "FAIL", f"{path} changed beyond the action's own write ({change}). Re-run once"
+
+          def loads(name):
+              try:
+                  lines = (WORK / name).read_text(encoding="utf-8").splitlines()
+              except OSError:
+                  return []
+              return [json.loads(line) for line in lines if line.strip()]
+
+          def judge_instructions():
+              if not os.environ["ABOVE"]:
+                  return "INCONCLUSIVE", "the markers were not planted; read that step's log"
+              workspace = os.path.realpath(os.environ["GITHUB_WORKSPACE"])
+              markers = {os.path.realpath(p) for p in json.loads(os.environ["ABOVE"])}
+
+              def split(entries):
+                  inside, outside = [], []
+                  for e in entries:
+                      if e.get("memory_type") == "Managed" or not e.get("file_path"):
+                          continue
+                      path = os.path.realpath(e["file_path"])
+                      (inside if path.startswith(workspace + os.sep) else outside).append(path)
+                  return inside, outside
+
+              inside, outside = split(loads("instructions.jsonl"))
+              if outside:
+                  return "FAIL", f"the FIXED session loaded from outside the checkout: {listed(outside)}"
+              _, control_outside = split(loads("control-instructions.jsonl"))
+              missed = markers - set(control_outside)
+              if missed:
+                  return "INCONCLUSIVE", (f"CONTROL didn't record loading {listed(missed)}, so the recorder or "
+                                          "the walk is not proven")
+              checkout = {os.path.join(workspace, "CLAUDE.md"), os.path.join(workspace, ".claude", "CLAUDE.md")}
+              if not checkout & set(inside):
+                  if not init_of(load_transcript(execution_file())):
+                      return "INCONCLUSIVE", "the FIXED session did not run"
+                  return "FAIL", "the FIXED session did not load the checkout's own CLAUDE.md"
+              real = [p for p in control_outside if p not in markers]
+              found = f"CONTROL also loaded {listed(real)}" if real else "no other file above the checkout here"
+              return "PASS", f"only the checkout's files, markers skipped; {found}"
+
+          def execution_file():
+              fallback = pathlib.Path(os.environ["RUNNER_TEMP"]) / "claude-execution-output.json"
+              return os.environ["EXECUTION_FILE"] or fallback
+
+          def guarded(judge, *args):
+              try:
+                  return judge(*args)
+              except Exception as e:  # a judge bug must not read as an answer
+                  return "INCONCLUSIVE", f"the verdict step failed: {short(repr(e))}"
+
+          ran = os.environ["AGENT_OUTCOME"] not in ("", "skipped")
+          messages = load_transcript(execution_file()) if ran else []
+          control = load_transcript(WORK / "control-execution.json")
+          results = {"(a) hook": guarded(judge_hook, messages),
+                     "(b) plugins": guarded(judge_plugins, messages, control),
+                     "(c) user settings": guarded(judge_settings),
+                     "(d) instructions": guarded(judge_instructions)}
+
+          states = {state for state, _ in results.values()}
+          verdict = "FAIL" if "FAIL" in states else "INCONCLUSIVE" if "INCONCLUSIVE" in states else "PASS"
+          detail = "; ".join(f"{name} {state}: {evidence}" for name, (state, evidence) in results.items())
+          version = (init_of(messages) or {}).get("claude_code_version", "version unknown")
+          line = " ".join(f"ci-isolation on {os.environ['LABEL']} ({os.environ['RUNNER']}): {verdict} — "
+                          f"{detail}; CLI {version}".split())
+          print(line)
+          print(f"::{'notice' if verdict == 'PASS' else 'error'}::{line}")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
+              f.write(f"```text\n{line}\n```\n")
+          sys.exit(0 if verdict == "PASS" else 1)
+
+      - name: Remove the planted files
+        # The markers above the checkout would otherwise outlive the job on a self-hosted runner.
+        if: always()
+        shell: python3 {0}
+        run: |
+          import json, os, pathlib
+
+          record = pathlib.Path(os.environ["RUNNER_TEMP"]) / "ci-isolation" / "planted.json"
+          planted = json.loads(record.read_text(encoding="utf-8")) if record.is_file() else []
+          for item in map(pathlib.Path, planted):
+              item.unlink(missing_ok=True)
+              print("removed", item)
+          above = pathlib.Path(os.environ["GITHUB_WORKSPACE"]).parent
+          for folder in (above / ".claude" / "rules", above / ".claude"):
+              if folder.is_dir() and not any(folder.iterdir()):
+                  folder.rmdir()
