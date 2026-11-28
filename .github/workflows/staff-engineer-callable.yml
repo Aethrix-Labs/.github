@@ -208,6 +208,7 @@ jobs:
             --effort ${{ inputs.effort }}
             --max-turns 60
             --allowedTools Read,Bash,Glob,Grep
+            --setting-sources project,local
             ${{ steps.ci-hooks.outputs.args }}
             # Read-only tool set: no Write/Edit (this agent edits no file). Bash is needed
             # for the skill's curl reads/writes against the hub.

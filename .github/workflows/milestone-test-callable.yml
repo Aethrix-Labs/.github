@@ -585,6 +585,7 @@ jobs:
             --effort medium
             --max-turns ${{ env.AGENT_MAX_TURNS }}
             --allowedTools Read,Bash,Write,Edit,Glob,Grep
+            --setting-sources project,local
             ${{ steps.ci-hooks.outputs.args }}
             # --max-turns 180 matches implementer-callable and lite-planner-callable. The
             # session shares the same commit tax (shakedown -> ci-commit ->

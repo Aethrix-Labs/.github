@@ -343,6 +343,7 @@ jobs:
             --effort ${{ inputs.doc_reconciliation_effort }}
             --max-turns ${{ env.DOC_RECONCILIATION_MAX_TURNS }}
             --allowedTools Read,Bash,Write,Edit,Glob,Grep
+            --setting-sources project,local
             ${{ steps.ci-hooks.outputs.args }}
 
       # Snapshot steps (one after each agent step): move this agent step's result object to its
@@ -420,6 +421,7 @@ jobs:
             --effort ${{ inputs.recommender_effort }}
             --max-turns ${{ env.RECOMMENDER_MAX_TURNS }}
             --allowedTools Read,Bash,Glob,Grep
+            --setting-sources project,local
             ${{ steps.ci-hooks.outputs.args }}
 
       # See the doc-reconciliation snapshot step's note.
@@ -487,6 +489,7 @@ jobs:
             --effort ${{ inputs.proposer_effort }}
             --max-turns ${{ env.PROPOSER_MAX_TURNS }}
             --allowedTools Read,Bash,Glob,Grep
+            --setting-sources project,local
             ${{ steps.ci-hooks.outputs.args }}
 
       # See the doc-reconciliation snapshot step's note. The proposer is the last agent step, so

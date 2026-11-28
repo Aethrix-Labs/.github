@@ -892,6 +892,7 @@ jobs:
             --effort ${{ inputs.effort }}
             --max-turns ${{ env.AGENT_MAX_TURNS }}
             --allowedTools Read,Bash,Write,Edit,Glob,Grep
+            --setting-sources project,local
             ${{ steps.ci-hooks.outputs.args }}
 
       - name: Send the implementer's run-completed and tick-report (report.mjs send)

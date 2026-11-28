@@ -351,6 +351,7 @@ jobs:
             --effort medium
             --max-turns 25
             --allowedTools Read,Bash,Write
+            --setting-sources project,local
             ${{ steps.ci-hooks.outputs.args }}
 
       - name: Finalize the semantic findings

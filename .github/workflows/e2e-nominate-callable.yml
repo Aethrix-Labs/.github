@@ -224,6 +224,7 @@ jobs:
             --effort high
             --max-turns ${{ env.AGENT_MAX_TURNS }}
             --allowedTools Read,Bash,Write,Edit,Glob,Grep
+            --setting-sources project,local
             ${{ steps.ci-hooks.outputs.args }}
             # --max-turns 120 is an unmeasured estimate: up to 10 judge dispatches, plus
             # nominating, plus ci-commit. Revisit once a completed run reports num_turns.
@@ -499,6 +500,7 @@ jobs:
             --effort medium
             --max-turns ${{ env.AGENT_MAX_TURNS }}
             --allowedTools Read,Bash,Write,Edit,Glob,Grep
+            --setting-sources project,local
             ${{ steps.ci-hooks.outputs.args }}
             # --max-turns 80 is an unmeasured estimate: per-spec grep for registrations and
             # helpers, playwright --list, two commits and the PR. Revisit once a completed run

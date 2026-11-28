@@ -182,6 +182,7 @@ jobs:
             --effort ${{ inputs.effort }}
             --max-turns ${{ env.AGENT_MAX_TURNS }}
             --allowedTools Read,Bash,Write,Edit,Glob,Grep
+            --setting-sources project,local
             ${{ steps.ci-hooks.outputs.args }}
             # --max-turns 180 matches implementer-callable. lite-planner shares the
             # same commit tax (plan-reviewer up to 3 passes -> ci-commit ->

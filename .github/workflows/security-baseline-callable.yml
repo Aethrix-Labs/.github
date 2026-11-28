@@ -502,6 +502,7 @@ jobs:
             --effort ${{ inputs.effort }}
             --max-turns ${{ env.SEMANTIC_MAX_TURNS }}
             --allowedTools Read,Bash,Write,Grep,Glob
+            --setting-sources project,local
             ${{ steps.ci-hooks.outputs.args }}
 
       - name: Finalize this leg's findings
