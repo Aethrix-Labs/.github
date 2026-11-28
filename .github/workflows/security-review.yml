@@ -353,6 +353,17 @@ jobs:
             --allowedTools Read,Bash,Write
             ${{ steps.ci-hooks.outputs.args }}
 
+      - name: Finalize the semantic findings
+        # Recomputes `summary` from `findings` before anything reads the counts, whether or not the session
+        # ran finalize.py itself (skill-suite-health S14). always(), because the PR body and queue steps
+        # below read the file even after a failed session. Not a gate: exit 1 means problems were listed
+        # and the file was still rewritten, so no exit code fails the job.
+        if: always() && steps.gate.outputs.run == 'true'
+        run: |
+          if [ -f semantic-findings.json ]; then
+            python3 .fleet-ci/ci/security-review/finalize.py semantic-findings.json --deterministic deterministic-findings.json || true
+          fi
+
       - name: Emit security-review queue entry (semantic failure)
         if: failure() && steps.semantic.outcome == 'failure' && steps.gate.outputs.run == 'true'
         env:

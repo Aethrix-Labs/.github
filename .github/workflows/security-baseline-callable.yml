@@ -504,6 +504,17 @@ jobs:
             --allowedTools Read,Bash,Write,Grep,Glob
             ${{ steps.ci-hooks.outputs.args }}
 
+      - name: Finalize this leg's findings
+        # Recomputes `summary` from `findings` and sets `coverage.complete` from the chunk's file list,
+        # whether or not the session ran finalize.py itself (skill-suite-health S14). Runs after a failed
+        # session too, since its partial file is still uploaded. Not a gate: exit 1 means problems were
+        # listed and the file was still rewritten, so no exit code fails the leg.
+        if: ${{ !cancelled() }}
+        run: |
+          if [ -f semantic-findings.json ]; then
+            python3 .fleet-ci/ci/security-review/finalize.py semantic-findings.json --deterministic deterministic-findings.json --chunk "$BASELINE_CHUNK" || true
+          fi
+
       - name: Snapshot this leg's result object (calibration)
         # claude-code-action writes its result object to one fixed path, $RUNNER_TEMP/claude-execution-output.json
         # (dev-watchdog-callable's THE OVERWRITE TRAP). One agent step per job means nothing here can overwrite it,
