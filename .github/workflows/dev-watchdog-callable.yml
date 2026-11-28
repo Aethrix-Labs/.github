@@ -166,6 +166,27 @@ jobs:
           python3 .fleet-ci/ci/dev-watchdog/analytics_reads_emit.py . --product-slug "$SLUG" \
             || echo "::warning::dev-watchdog: analytics_reads_emit.py did not run cleanly; owed analytics reads skipped this run"
 
+      # ---- security-review ruleset coverage (deterministic, no LLM), STANDARDS §17.14 ----
+      # Flags a repo the org ruleset does not cover (skills/dev-watchdog/SKILL.md "Ruleset
+      # coverage"). Gated on the master switch only and placed before Gate, so a pre-build
+      # product is checked too. The job token is enough: the script reads the rules on this
+      # repo's own main, not the org ruleset. Never fails the run, and `|| echo` covers a
+      # bundle that predates the script.
+      - name: Check security-review ruleset coverage
+        if: steps.flags.outputs.watchdog_enabled == 'true'
+        continue-on-error: true
+        timeout-minutes: 5
+        env:
+          GH_TOKEN: ${{ github.token }}
+          QUEUE_SERVICE_ROLE_KEY: ${{ secrets.QUEUE_SERVICE_ROLE_KEY }}
+          HUB_BASE_URL: ${{ inputs.hub_url || 'https://sethgibson.com' }}
+          PRODUCT_SLUG: ${{ inputs.product_slug }}
+          # GITHUB_REPOSITORY and GITHUB_REPOSITORY_ID come from the runner's own environment.
+        run: |
+          SLUG="${PRODUCT_SLUG:-$(basename "$GITHUB_REPOSITORY")}"
+          python3 .fleet-ci/ci/dev-watchdog/ruleset_check_emit.py --product-slug "$SLUG" \
+            || echo "::warning::dev-watchdog: ruleset_check_emit.py did not run cleanly; ruleset coverage not checked this run"
+
       # ---- Phase 0: cheap, deterministic local-docs gate (no LLM), STANDARDS §24.1 ----
       - name: Gate
         id: gate
