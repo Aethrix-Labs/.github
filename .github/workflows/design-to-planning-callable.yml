@@ -194,21 +194,40 @@ jobs:
           echo "path=$BIN" >> "$GITHUB_OUTPUT"
           echo "claude-cli pre-install: $GOT at $BIN (installer HOME was $CLI_HOME)"
 
-      - name: CI headless-rule hooks (--settings, only when vended)
-        # The fleet's CI hooks (STANDARDS §19.7 rule 2). Every agent step in this job adds `args` to its
-        # claude_args. The hooks are insurance, so a missing file adds nothing, with a ::warning::, and
-        # never fails the job. Never use the action's `settings` input instead: the action saves that into
-        # the runner user's settings, where it outlives the job. Same step in every callable that runs
-        # claude-code-action: change them together.
+      - name: CI agent settings (the CI hooks; no instruction files from above the checkout)
+        # Writes the one file every agent step in this job passes as --settings, beside its
+        # --setting-sources project,local (STANDARDS §19.7: CI never loads the interactive plugin).
+        # That flag drops the runner user's own settings, plugins and skills, but the CLI still walks
+        # UP from the checkout for CLAUDE.md and .claude/rules, and on a self-hosted runner the walk
+        # passes through that user's HOME. claudeMdExcludes stops it at the checkout. The hooks are
+        # the vended CI hooks (§19.7 rule 2): a missing or unreadable file drops them with a
+        # ::warning:: and never fails the job. Never use the action's `settings` input instead: the
+        # action saves that into the runner user's settings, where it outlives the job. Same step in
+        # every callable that runs claude-code-action: change them together.
         id: ci-hooks
-        shell: bash
+        shell: python3 {0}
         run: |
-          FILE=".fleet-ci/ci/_fleet/ci-hooks/settings.json"
-          if [ -f "$FILE" ]; then
-            echo "args=--settings $FILE" >> "$GITHUB_OUTPUT"
-          else
-            echo "::warning::CI headless-rule hooks not loaded: $FILE is missing"
-          fi
+          import json, os, pathlib
+
+          vended = pathlib.Path(".fleet-ci/ci/_fleet/ci-hooks/settings.json")
+          try:
+              settings = json.loads(vended.read_text(encoding="utf-8"))
+              if not isinstance(settings, dict):
+                  raise ValueError("not a JSON object")
+          except (OSError, ValueError) as e:
+              print(f"::warning::CI headless-rule hooks not loaded: {vended}: {e}")
+              settings = {}
+
+          settings["claudeMdExcludes"] = settings.get("claudeMdExcludes", []) + [
+              str(above / name)
+              for above in pathlib.Path(os.environ["GITHUB_WORKSPACE"]).parents
+              for name in ("CLAUDE.md", "CLAUDE.local.md", ".claude/CLAUDE.md", ".claude/rules/**")
+          ]
+
+          out = pathlib.Path(os.environ["RUNNER_TEMP"]) / "ci-agent-settings.json"
+          out.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+              f.write(f'args=--settings "{out}"\n')
 
       - name: Run design-to-planning agent
         id: agent
